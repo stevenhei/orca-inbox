@@ -4,6 +4,7 @@
 // Orca, network or private data. Drafts follow the worker's compare-and-set rule and live in
 // sessionStorage, so a reload after a source edit keeps them, as worker storage would.
 import { decisions, historyExample, clock, origins } from './build/fixtures/decisions.js'
+import { order } from './build/src/model.js'
 
 const clone = (v) => (v === undefined ? v : structuredClone(v))
 const ok = (value) => ({ ok: true, value })
@@ -68,7 +69,7 @@ export function createMockOrca({ ref, history = false }) {
   const listeners = {}
   const page = ({ scope, query, includeHistory, cursor }) => {
     const t = (query ?? '').toLocaleLowerCase()
-    const rows = [...db.values()].filter((d) => (scope.kind === 'all' ||
+    const rows = order([...db.values()]).filter((d) => (scope.kind === 'all' ||
       (d.origin.hostId === scope.workspace.hostId && d.origin.workspaceId === scope.workspace.workspaceId)) &&
       (includeHistory || d.answerState.state === 'awaiting-answer' || d.source?.kind === 'native-item') &&
       (!t || JSON.stringify(d).toLocaleLowerCase().includes(t)))

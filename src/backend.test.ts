@@ -6,7 +6,7 @@ import { orcaStorage } from './backend-storage.ts'
 import type { JsonValue, PanelRequestContext } from 'orca/worker'
 import type { AgentCaller, DeliveryTarget, InboxBoundary, InboxStorage, SendOutcome } from './backend.ts'
 import type { OwnerCaller } from './backend-protocol.ts'
-import type { Decision, Result, SubmitDecision, SubmitReply } from './contract.ts'
+import type { Annotation, Decision, Result, SubmitDecision, SubmitReply } from './contract.ts'
 import activate, { registerDesktopWorker, registerWorker } from './worker.ts'
 
 const owner: OwnerCaller = { kind: 'owner', id: 'owner', workspaces: decisions.map(d => d.origin), repos: ['library', 'studio'] }
@@ -91,7 +91,7 @@ function harness() {
   }
 }
 
-test('scopes by host and authorized participant, searches bilingual fields and history, and orders per local day', async () => {
+test('scopes by host and authorized participant, searches bilingual fields and history, and orders across time zones', async () => {
   const h = harness()
   for (const id of ['room-route', 'stage', 'layout', 'image-review', 'schedule']) await h.submit(id)
   const rows = async (query?: string, includeHistory = false) =>
@@ -122,7 +122,7 @@ test('scopes by host and authorized participant, searches bilingual fields and h
       .map(d => d.questionId).filter(id => id === 'tomorrow-utc' || id === 'priority')
   }
   assert.deepEqual(await relativeOrder('UTC'), ['priority', 'tomorrow-utc'])
-  assert.deepEqual(await relativeOrder('America/Los_Angeles'), ['tomorrow-utc', 'priority'])
+  assert.deepEqual(await relativeOrder('America/Los_Angeles'), ['priority', 'tomorrow-utc'])
 })
 
 test('persists submission idempotency, atomic racing owner answers, retry binding, and per-reply receipts', async () => {
@@ -922,6 +922,50 @@ test('the dashboard uses the authorized review editor contribution for Inbox dat
   surface = 'panel'
   assert.equal(code(await worker.request('listDecisionPage', { scope, includeHistory: true }, dashboard)), 'forbidden')
   await worker.deactivate()
+})
+
+test('Description notes require matching raw text and revision on draft save and reply', async () => {
+  const h = harness()
+  const d = question('schedule')
+  const pack = packageInput([d])
+  const q = pack.questions[0]
+  const description = '簡介 😀\r\n\r\n**Select this**'
+  const legacyId = 'no-description'
+  value(await h.backend.submitDecision(agentFor(d), { ...pack, questions: [
+    { ...q, description }, { ...q, questionId: legacyId }
+  ] }))
+  const quote = '**Select this**'
+  const start = description.indexOf(quote)
+  const note = {
+    kind: 'selection', text: 'Keep the selected wording',
+    anchor: { kind: 'question', revision: 1, field: 'description' },
+    start, end: start + quote.length, quote
+  } satisfies Annotation
+  const draft = (questionId: string, annotation: Annotation) => h.backend.saveDraft(owner, {
+    questionId, revision: 0, draft: { text: 'Answer in progress', annotations: [annotation] }
+  })
+  const submit = (questionId: string, annotation: Annotation) => h.backend.submitReply(owner, {
+    ...initial(questionId, 'description-answer'), annotations: [annotation]
+  })
+  const invalid: [string, Annotation][] = [
+    [q.questionId, { ...note, anchor: { ...note.anchor, revision: 2 } }],
+    [q.questionId, { ...note, quote: 'x'.repeat(quote.length) }],
+    [legacyId, note]
+  ]
+  for (const [questionId, annotation] of invalid) {
+    for (const result of [await draft(questionId, annotation), await submit(questionId, annotation)]) {
+      assert.ok(!result.ok && result.code === 'invalid')
+      assert.match(result.message, /selection does not match its source revision/)
+    }
+    assert.equal(value(await h.backend.getDraft(owner, { questionId })).revision, 0)
+  }
+  assert.deepEqual(value(await draft(q.questionId, note)).draft?.annotations, [note])
+  const restarted = h.restart()
+  assert.deepEqual(value(await restarted.getDraft(owner, q)).draft?.annotations, [note])
+  const reply = value(await restarted.submitReply(owner, {
+    ...initial(q.questionId, 'description-answer'), annotations: [note]
+  }))
+  assert.deepEqual(reply.annotations, [note])
 })
 
 test('ordered Markdown images preserve raw anchors and exact attachment grants across restart', async () => {

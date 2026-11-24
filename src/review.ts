@@ -69,7 +69,7 @@ dialog .note textarea{margin-top:4px}
 .step{border:1px solid var(--line);border-radius:6px;padding:3px 9px;color:var(--mute)}
 .step[aria-current=step]{color:var(--fg);border-color:var(--acc);font-weight:600}.step.bad[aria-current=step]{border-color:var(--bad)}
 .pkg{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
-#pop{position:fixed;display:none;z-index:5}
+#pop{position:fixed;display:none;z-index:950}
 dialog{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:10px;padding:14px;width:min(440px,92vw)}
 dialog::backdrop{background:color-mix(in srgb,#000 45%,transparent)}
 .rich p{margin:0 0 8px}.rich ul,.rich ol{margin:0 0 8px;padding-left:22px}.rich li{margin:2px 0}.rich a{color:var(--acc)}
@@ -152,7 +152,12 @@ body:has(.d-app){overflow:hidden}
 .d-app .d-rec-head{display:flex;justify-content:space-between;align-items:center}
 .d-app .d-rec .d-rec-label{font-size:12px;font-weight:650}
 .d-app .d-rec .d-rec-more{min-width:24px;height:24px;padding:0;border:0;background:none}
-.d-app .d-rec-head{gap:6px}.d-app .d-rec-head .d-spacer{flex:1}
+.d-app .d-rec-head{gap:4px 6px;flex-wrap:wrap}.d-app .d-rec-head .d-spacer{flex:1}
+/* Nothing in the card may widen it past the sheet (380px minimum): one shrinkable column. */
+.d-app .d-dock{grid-template-columns:minmax(0,1fr)}
+/* A narrow card (the 380px sheet): the hint takes its own line, Notes and Submit stay together on the right. */
+.d-app .d-dock{container-type:inline-size}
+@container (max-width:520px){.d-app .d-dock .d-dock-foot .d-hint{flex-basis:100%}.d-app .d-dock .d-dock-foot .d-notes-btn{margin-inline-start:auto}}
 .d-app .d-sheet-body h2.d-sec-h{font-size:13.5px;line-height:1.4;color:var(--fg);font-weight:650;margin:20px 0 6px;padding-top:12px;border-top:1px solid var(--line-soft);text-transform:none;letter-spacing:0}
 .d-app .d-meta>div{min-width:0}
 .d-app .d-images>summary{cursor:pointer;color:var(--muted);padding:4px 0}
@@ -194,7 +199,8 @@ body:has(.d-app){overflow:hidden}
 .d-app .d-srcline{align-items:center}
 .d-app .d-src-act{display:inline-flex;align-items:center;gap:2px;font-size:12px;min-height:26px;padding:0 8px;border:1px solid var(--line);border-radius:99px;background:var(--bg);color:var(--fg);text-decoration:none}
 .d-app .d-src-act:hover{background:var(--hover)}
-.d-app .d-use-rec{gap:6px 10px}.d-app .d-use-rec .d-hint{font-size:11.5px;color:var(--muted);flex:1 1 160px}
+.d-app .d-btn.d-sm{height:26px;padding:0 8px;font-size:12px}
+.d-app .d-rec-head .d-btn.d-sm{margin-inline-start:6px}
 .d-app .d-fig-open{all:unset;cursor:zoom-in;display:block;max-width:100%}.d-app .d-fig-open:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .d-zoom{position:fixed;inset:0;z-index:1000;height:100dvh;display:flex;flex-direction:column;background:color-mix(in oklab,var(--bg) 92%,#000)}
 .d-zoom .d-zoom-bar{display:flex;gap:6px;align-items:center;padding:6px 12px;border-bottom:1px solid var(--line)}
@@ -228,6 +234,9 @@ body:has(.d-app){overflow:hidden}
 .d-nc.d-nc-sheet{left:0;right:0;bottom:0;top:auto;width:auto;border-radius:10px 10px 0 0;max-height:70dvh;overflow:auto}
 .d-nc .d-nc-quote{margin:0;padding:4px 8px;border-inline-start:3px solid var(--note);background:var(--note-bg);font-size:12.5px;max-height:6em;overflow:auto;white-space:pre-wrap}
 .d-nc textarea{width:100%;resize:vertical;min-height:4.2em;background:var(--bg);border:1px solid var(--line);border-radius:var(--r);padding:6px 8px}
+.d-nc>*{flex-shrink:0}
+.d-nc .d-nc-thumb{display:block;max-width:100%;max-height:96px;margin:2px 0 0;border-radius:4px;align-self:flex-start}
+.d-app mark.d-n{cursor:pointer}
 .d-nc .d-nc-err{margin:0;color:var(--danger);font-size:12px}
 .d-nc .d-nc-foot{display:flex;gap:8px;align-items:center}.d-nc .d-nc-foot .d-hint{flex:1;font-size:11.5px;color:var(--muted)}
 .d-app .d-note-saved{font-size:12.5px;color:var(--muted)}.d-app .d-note-saved>span{flex:1 1 200px}
@@ -479,7 +488,11 @@ let a = 0 // primary snapshot index
 let b: number | null = null // optional second snapshot for side-by-side
 let target: 'left' | 'right' = 'right'
 const zoom = new Map<string, number>()
-type Quote = { field: 'background' | 'recommendation'; text: string; start: number; end: number }
+/** The question fields a text note can anchor to (raw UTF-16 offsets into that field's text). */
+type NoteField = 'background' | 'description' | 'recommendation'
+const NOTE_FIELDS: readonly NoteField[] = ['background', 'description', 'recommendation']
+const FIELD_LABEL: Record<NoteField, string> = { background: 'Background', description: 'Description', recommendation: 'Recommendation' }
+type Quote = { field: NoteField; text: string; start: number; end: number }
 let quote: Quote | null = null
 let focusNote: number | null = null
 
@@ -631,7 +644,7 @@ document.addEventListener('visibilitychange', () => { if (document.visibilitySta
 // ---- annotations --------------------------------------------------------------------------------
 function staleNote(n: Annotation, x: Decision): string | null {
   if (n.kind === 'selection' && n.anchor.kind === 'question') {
-    if (n.anchor.revision !== x.revision || x[n.anchor.field].slice(n.start, n.end) !== n.quote) return 'The text changed since this note was made. Remove it and select the text again.'
+    if (n.anchor.revision !== x.revision || (x[n.anchor.field] ?? '').slice(n.start, n.end) !== n.quote) return 'The text changed since this note was made. Remove it and select the text again.'
     return null
   }
   const ref = n.kind === 'image' ? n.evidence : n.anchor.kind === 'evidence' ? n.anchor.evidence : null
@@ -665,7 +678,7 @@ function noteShortcut(ev: KeyboardEvent, save: () => void) {
   if (ev.isComposing || composing) return
   save()
 }
-function openComposer(quoted: { field: 'background' | 'recommendation'; text: string; start: number; end: number } | null) {
+function openComposer(quoted: Quote | null) {
   fillComposer(quoted)
   if (!composer.open) composer.showModal()
 }
@@ -681,7 +694,7 @@ function fillComposer(quoted: typeof quote) {
   composer.replaceChildren(
     el('h3', { id: 'cmp-h', style: 'margin:0 0 6px' }, `Notes (${draft.annotations.length})`),
     ...(draft.annotations.length ? draft.annotations.map((n, i) => noteEditor(n, i, x, 'dialog'))
-      : [el('p', { class: 'meta' }, 'No notes yet. Select text in Background or Recommendation to add one.')]),
+      : [el('p', { class: 'meta' }, 'No notes yet. Select text in Background, Description or the Recommendation and choose Add note (Alt+N), or use ✎ on an image.')]),
     ...(quoted ? [el('h3', { style: 'margin:10px 0 4px' }, 'Add a note'), el('div', { class: 'raw' }, quoted.text), ta,
       el('div', { style: 'display:flex;justify-content:flex-end;margin-top:6px' }, el('button', { type: 'button', class: 'pri', onclick: add }, 'Add note'))] : []),
     el('div', { style: 'display:flex;gap:6px;justify-content:flex-end;margin-top:10px' },
@@ -698,27 +711,55 @@ document.addEventListener('selectionchange', () => {
   quote = null
   if (sel && sel.rangeCount && !sel.isCollapsed && d) {
     const r = sel.getRangeAt(0)
-    for (const f of ['background', 'recommendation'] as const) {
+    for (const f of NOTE_FIELDS) {
       const field = root.querySelector(`[data-field="${f}"]`)
       const span = field && rawRange(r, field)
       if (!span) continue
-      const text = d[f].slice(span[0], span[1])
+      const text = (d[f] ?? '').slice(span[0], span[1])
       if (text.trim()) quote = { field: f, text, start: span[0], end: span[1] }
       break
     }
   }
-  if (quote) {
-    const box = sel!.getRangeAt(0).getBoundingClientRect()
-    pop.style.cssText = `display:block;left:${box.left}px;top:${box.bottom + 6}px`
-  } else {
+  if (quote) placePop(sel!.getRangeAt(0))
+  else {
     pop.style.display = 'none'
     if (had) flushSoon()
   }
 })
+/**
+ * Shows "Add note" next to the selection, always inside the visible part of the pane that holds it
+ * (the scrolling sheet body above the reply card, or the reply card itself) and the viewport, so it
+ * can be seen and pressed for text at any edge, after scrolling and at any width.
+ */
+function placePop(r: Range) {
+  const box = r.getBoundingClientRect?.() ?? { top: 0, bottom: 0, left: 0 }
+  const node = r.commonAncestorContainer ?? r.startContainer
+  const host = (node.nodeType === 1 ? node as Element : node.parentElement)?.closest('[data-k="sheet-body"], .d-dock')
+  const hr = host?.getBoundingClientRect?.()
+  const top0 = Math.max(0, hr?.top ?? 0), bottom0 = Math.min(vh(), hr && hr.height ? hr.bottom : vh())
+  const left0 = Math.max(0, hr?.left ?? 0), right0 = Math.min(vw(), hr && hr.width ? hr.right : vw())
+  pop.style.cssText = 'display:block;visibility:hidden;left:0;top:0'
+  const w = pop.offsetWidth || 140, h = pop.offsetHeight || 30
+  let top = box.bottom + 6
+  if (top + h > bottom0 - 4) top = box.top - h - 6
+  top = Math.max(top0 + 4, Math.min(bottom0 - h - 4, top))
+  const left = Math.max(left0 + 4, Math.min(right0 - w - 4, box.left))
+  pop.style.cssText = `display:block;left:${Math.round(left)}px;top:${Math.round(top)}px`
+}
+// The pane scrolled under the selection: keep the button beside it, inside the visible pane.
+document.addEventListener('scroll', () => {
+  if (!quote || pop.style.display === 'none') return
+  const sel = getSelection(); if (sel && sel.rangeCount) placePop(sel.getRangeAt(0))
+}, true)
 document.addEventListener('keydown', (e) => {
   if (composer.open || (nc && nc.contains(e.target as Node))) return
   // e.code: on macOS Option+N is a dead key, so e.key is not "n" there.
-  if (e.altKey && (e.code === 'KeyN' || e.key.toLowerCase() === 'n')) { e.preventDefault(); if (quote) addQuoteNote() }
+  if (e.altKey && (e.code === 'KeyN' || e.key.toLowerCase() === 'n')) {
+    e.preventDefault()
+    if (quote) addQuoteNote()
+    // Nothing selected: say how a note is made instead of doing nothing.
+    else if (d && !nativeOf(d) && (ref.view === 'review' || (ref.view === 'dashboard' && dashSel))) say('Select text in Background, Description or the Recommendation first, then press Alt+N. For an image, use ✎ under it.')
+  }
   if (e.key === 'Escape' && !e.isComposing) {
     // Esc closes the innermost layer: the note popover, then the notes panel, then the dashboard sheet.
     if (pop.style.display !== 'none' && pop.style.display) { pop.style.display = 'none'; return }
@@ -1010,82 +1051,160 @@ function openZoom(e: Img, url: string, from: HTMLElement) {
 /** Viewport size (absent outside a browser, e.g. in the DOM tests). */
 const vw = () => (typeof innerWidth === 'number' ? innerWidth : 1280)
 const vh = () => (typeof innerHeight === 'number' ? innerHeight : 800)
-type NoteTarget = { kind: 'text'; q: Quote; rect: DOMRect | null } | { kind: 'image'; e: Img; caption: string; from: HTMLElement }
+/** `edit` re-opens a saved note (its index in the draft) with Save note / Delete instead of Add note. */
+type NoteTarget = ({ kind: 'text'; q: Quote; rect: DOMRect | null } | { kind: 'image'; e: Img; caption: string; from: HTMLElement }) & { edit?: number }
 let nc: HTMLElement | null = null
-let ncBack: { k: string | null; scroll: number } | null = null
+let ncBack: { k: string | null; mark?: number; scroll: number } | null = null
+/** Keeps the open composer's typed text as a note in the current draft; false when there is none. */
+let ncKeep: (() => boolean) | null = null
 let noteSaved: string | null = null
+let noteSavedTimer: ReturnType<typeof setTimeout> | null = null
+/** The quiet "Note saved" line clears itself after a few seconds. */
+const NOTE_SAVED_MS = 7000
+function showNoteSaved(questionId: string) {
+  noteSaved = questionId
+  if (noteSavedTimer) clearTimeout(noteSavedTimer)
+  noteSavedTimer = setTimeout(() => { noteSavedTimer = null; if (noteSaved === questionId) { noteSaved = null; requestRender() } }, NOTE_SAVED_MS)
+}
+/**
+ * Before the reader leaves a question (another row, the pager, Close): a note typed in the open
+ * composer is kept as a note in that question's draft, then the draft is flushed as usual. An
+ * empty composer is simply closed. Returns whether a note was kept, for the announcement.
+ */
+function keepPendingNote(): boolean {
+  const kept = ncKeep?.() ?? false
+  if (nc) { nc.remove(); nc = null; ncBack = null; ncKeep = null }
+  return kept
+}
 function closeNoteComposer(restore: boolean) {
   if (!nc) return
-  nc.remove(); nc = null
+  nc.remove(); nc = null; ncKeep = null
   const back = ncBack; ncBack = null
   render()
   if (restore && back) {
     const body = root.querySelector<HTMLElement>('[data-k="sheet-body"]'); if (body) body.scrollTop = back.scroll
-    root.querySelector<HTMLElement>(`[data-k="${CSS.escape(back.k ?? 'notes-open')}"]`)?.focus({ preventScroll: true })
+    // A saved text note returns focus to its highlighted text; otherwise to where the note started.
+    const mark = back.mark !== undefined ? root.querySelector<HTMLElement>(`mark[data-note-mark~="${back.mark}"]`) : null
+    ;(mark ?? root.querySelector<HTMLElement>(`[data-k="${CSS.escape(back.k ?? 'notes-open')}"]`))?.focus({ preventScroll: true })
   }
 }
 function openNoteComposer(t: NoteTarget) {
   const x = d
   if (!x || nativeOf(x)) return
-  if (nc) { nc.remove(); nc = null }
+  if (nc) { nc.remove(); nc = null; ncKeep = null }
   pop.style.display = 'none'
   const body = root.querySelector<HTMLElement>('[data-k="sheet-body"]')
   ncBack = { k: t.kind === 'image' ? t.from.getAttribute('data-k') : 'notes-open', scroll: body?.scrollTop ?? 0 }
-  const ta = el<HTMLTextAreaElement>('textarea', { rows: 3, 'aria-label': 'New note', placeholder: 'Your note. Ctrl+Enter adds it.', 'data-nc': '' })
+  const editing = t.edit !== undefined ? draft.annotations[t.edit] : undefined
+  const ta = el<HTMLTextAreaElement>('textarea', { rows: 3, 'aria-label': editing ? 'Edit note' : 'New note', placeholder: 'Your note. Ctrl+Enter adds it.', 'data-nc': '' })
+  if (editing) ta.value = editing.text
   const err = el('p', { class: 'd-nc-err', role: 'alert', hidden: true })
-  const addBtn = el<HTMLButtonElement>('button', { type: 'button', class: 'd-btn d-primary', 'data-k': 'nc-add' }, 'Add note')
+  const addLabel = editing ? 'Save note' : 'Add note'
+  const addBtn = el<HTMLButtonElement>('button', { type: 'button', class: 'd-btn d-primary', 'data-k': 'nc-add' }, addLabel)
+  const make = (text: string): Annotation => t.kind === 'text'
+    ? { kind: 'selection', anchor: { kind: 'question', field: t.q.field, revision: x.revision }, start: t.q.start, end: t.q.end, quote: t.q.text, text }
+    : { kind: 'image', evidence: { evidenceId: t.e.evidenceId, version: t.e.version }, text }
+  // On a question switch: keep the typed text in this question's own draft (never another's).
+  ncKeep = () => {
+    if (editing) { if (ta.value.trim() && d === x && draftFor === x.questionId && ta.value !== editing.text) { editing.text = ta.value; scheduleSave(); return true } return false }
+    if (!ta.value.trim() || d !== x || draftFor !== x.questionId || addBtn.getAttribute('aria-busy') === 'true') return false
+    draft.annotations.push(make(ta.value)); scheduleSave(); return true
+  }
   const add = async () => {
     if (addBtn.getAttribute('aria-busy') === 'true') return
     const text = ta.value
     if (!text.trim()) { err.textContent = 'Write the note first.'; err.hidden = false; ta.focus(); return }
     if (d !== x) { closeNoteComposer(false); return }
-    const n: Annotation = t.kind === 'text'
-      ? { kind: 'selection', anchor: { kind: 'question', field: t.q.field, revision: x.revision }, start: t.q.start, end: t.q.end, quote: t.q.text, text }
-      : { kind: 'image', evidence: { evidenceId: t.e.evidenceId, version: t.e.version }, text }
-    draft.annotations.push(n)
+    const before = editing?.text
+    const n = editing ?? make(text)
+    if (editing) editing.text = text; else draft.annotations.push(n)
     addBtn.setAttribute('aria-busy', 'true'); addBtn.textContent = 'Saving…'
     scheduleSave()
     const ok = await saveDraftNow()
     if (!nc) return
     if (!ok || draftFail) {
-      draft.annotations.splice(draft.annotations.indexOf(n), 1)
-      addBtn.removeAttribute('aria-busy'); addBtn.textContent = 'Add note'
+      if (editing) editing.text = before!; else draft.annotations.splice(draft.annotations.indexOf(n), 1)
+      addBtn.removeAttribute('aria-busy'); addBtn.textContent = addLabel
       err.textContent = `The note was not saved. ${draftFail ? failureText(draftFail) : 'Try again.'}`; err.hidden = false; ta.focus()
       return
     }
-    quote = null; notesOpen = false; noteSaved = x.questionId
+    quote = null; notesOpen = false; showNoteSaved(x.questionId)
+    if (ncBack && n.kind === 'selection') ncBack.mark = draft.annotations.indexOf(n)
     closeNoteComposer(true)
     say('Note saved with your draft. It is sent with your reply, not before.')
+  }
+  const del = async () => {
+    if (!editing || d !== x) return
+    const i = draft.annotations.indexOf(editing); if (i < 0) return
+    draft.annotations.splice(i, 1); scheduleSave()
+    const ok = await saveDraftNow()
+    if (!nc) return
+    if (!ok || draftFail) { draft.annotations.splice(i, 0, editing); err.textContent = `The note was not deleted. ${draftFail ? failureText(draftFail) : 'Try again.'}`; err.hidden = false; return }
+    if (ncBack) ncBack.k = 'notes-open'
+    closeNoteComposer(true); say('Note deleted')
   }
   addBtn.addEventListener('click', () => void add())
   ta.addEventListener('keydown', (ev) => noteShortcut(ev, () => void add()))
   ta.addEventListener('input', () => { err.hidden = true })
+  const shot = t.kind === 'image' ? snaps.get(t.e.attachmentId) : undefined
+  const thumb = shot?.state === 'ok' ? shot.url : null
   nc = el('section', { class: 'd-app d-nc', role: 'dialog', 'aria-modal': 'false', 'aria-labelledby': 'ncTitle', 'data-question': x.questionId },
-    el('div', { class: 'd-nc-head' }, el('b', { id: 'ncTitle' }, t.kind === 'text' ? 'Note on the selected text' : `Note on ${t.e.label}`)),
+    el('div', { class: 'd-nc-head' }, el('b', { id: 'ncTitle' }, `${editing ? 'Edit note' : 'Note'} on ${t.kind === 'text' ? 'the selected text' : t.e.label}`)),
+    ...(t.kind === 'image' && thumb ? [el('img', { class: 'd-nc-thumb', src: thumb, alt: '' })] : []),
     el('blockquote', { class: 'd-nc-quote' }, t.kind === 'text' ? (t.q.text.length > 240 ? `${t.q.text.slice(0, 240)}…` : t.q.text) : t.caption),
     ta, err,
-    el('div', { class: 'd-nc-foot' }, el('span', { class: 'd-hint' }, 'Saved with your draft · not sent'),
-      el('button', { type: 'button', class: 'd-btn d-ghost', 'data-k': 'nc-cancel', onclick: () => { closeNoteComposer(true); say('Note discarded') } }, 'Cancel'), addBtn))
+    el('div', { class: 'd-nc-foot' }, el('span', { class: 'd-hint' }, 'Saved with your draft · not sent · Ctrl/Cmd+Enter adds this note only · Esc cancels'),
+      ...(editing ? [el('button', { type: 'button', class: 'd-btn d-ghost', 'data-k': 'nc-delete', onclick: () => void del() }, 'Delete')] : []),
+      el('button', { type: 'button', class: 'd-btn d-ghost', 'data-k': 'nc-cancel', onclick: () => { closeNoteComposer(true); say(editing ? 'Edit cancelled' : 'Note discarded') } }, 'Cancel'), addBtn))
   nc.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape' && !ev.isComposing) { ev.preventDefault(); ev.stopPropagation(); closeNoteComposer(true); say('Note discarded') }
   })
   document.body.append(nc)
-  // Next to the anchor: below it, or above when there is no room; a bottom sheet on small screens.
-  const r = t.kind === 'text' ? t.rect : t.from.getBoundingClientRect?.()
-  if (vw() > 600 && r && nc.getBoundingClientRect) {
-    const w = Math.min(360, vw() - 16), h = nc.getBoundingClientRect().height || 200
-    const left = Math.max(8, Math.min(vw() - w - 8, r.left))
-    const top = r.bottom + 8 + h <= vh() - 8 ? r.bottom + 8 : Math.max(8, r.top - h - 8)
-    nc.style.cssText = `left:${Math.round(left)}px;top:${Math.round(top)}px;width:${w}px`
-  } else nc.classList.add('d-nc-sheet')
+  placeComposer(t)
   ta.focus()
 }
+/**
+ * Next to its anchor, inside the sheet's reading area and above the reply card, at every width: below
+ * the anchor, or above it when there is no room, else as low as fits. It never covers the reply card;
+ * when the area is shorter than the composer, the composer scrolls.
+ */
+function placeComposer(t: NoteTarget) {
+  if (!nc?.getBoundingClientRect) return
+  const r = t.kind === 'text' ? t.rect : t.from.getBoundingClientRect?.()
+  const box = (s: string) => { const b = root.querySelector(s)?.getBoundingClientRect?.(); return b && b.height ? b : null }
+  const area = box('[data-k="sheet-body"]'), dock = box('.d-dock')
+  const left0 = Math.max(0, area?.left ?? 0), right0 = Math.min(vw(), area?.right ?? vw())
+  const top0 = Math.max(0, area?.top ?? 0) + 4, bottom0 = Math.min(vh(), dock?.top ?? area?.bottom ?? vh()) - 8
+  const w = Math.max(200, Math.min(380, right0 - left0 - 16))
+  nc.style.cssText = `left:0;top:0;width:${w}px;max-height:${Math.max(120, Math.round(bottom0 - top0))}px;overflow:auto`
+  const h = nc.getBoundingClientRect().height || 200
+  let top = r ? r.bottom + 8 : bottom0 - h
+  if (top + h > bottom0) top = (r ? r.top : bottom0) - h - 8
+  if (top < top0) top = Math.max(top0, bottom0 - h)
+  const left = Math.max(left0 + 8, Math.min(right0 - w - 8, r?.left ?? left0 + 8))
+  nc.style.left = `${Math.round(left)}px`; nc.style.top = `${Math.round(top)}px`
+}
+/** A saved text note's highlight re-opens that note (click or Enter): Save note, Cancel, Delete. */
+function editMarkedNote(m: HTMLElement, click = false) {
+  const i = Number((m.getAttribute('data-note-mark') ?? '').split(' ')[0])
+  const n = draft.annotations[i]
+  if (!d || nativeOf(d) || !n || n.kind !== 'selection' || n.anchor.kind !== 'question') return
+  // A click that ends a text selection over the highlight selects text (to add another note); it does not edit.
+  const sel = getSelection(); if (click && sel && !sel.isCollapsed && sel.rangeCount && sel.getRangeAt(0).intersectsNode?.(m)) return
+  openNoteComposer({ kind: 'text', q: { field: n.anchor.field, text: n.quote, start: n.start, end: n.end }, rect: m.getBoundingClientRect?.() ?? null, edit: i })
+  if (ncBack) ncBack.mark = i
+}
+root.addEventListener('click', (ev) => { const m = (ev.target as Element | null)?.closest?.('mark.d-n'); if (m) editMarkedNote(m as HTMLElement, true) })
+root.addEventListener('keydown', (ev) => {
+  const m = (ev.target as Element | null)?.closest?.('mark.d-n')
+  if (m && (ev.key === 'Enter' || ev.key === ' ')) { ev.preventDefault(); editMarkedNote(m as HTMLElement) }
+})
 /** ✎ on an image placed in the narrative: the note composer for that image version. */
 function noteOnImage(e: Img, from: HTMLElement, caption: string) {
   openNoteComposer({ kind: 'image', e, caption, from })
 }
 /** Highlights each text note at its anchor (raw offsets), with the note as its tooltip. */
-function markNotes(box: Element, field: 'background' | 'recommendation') {
+function markNotes(box: Element, field: NoteField) {
   const notes = draft.annotations.flatMap((n, i) => n.kind === 'selection' && n.anchor.kind === 'question' && n.anchor.field === field ? [[n, i] as const] : [])
   if (!notes.length) return
   const texts: Text[] = []
@@ -1103,7 +1222,8 @@ function markNotes(box: Element, field: 'background' | 'recommendation') {
     for (let i = 0; i < pts.length - 1; i++) {
       const piece = textAt(t.data.slice(pts[i], pts[i + 1]), at + pts[i])
       const cover = hits.filter(([n]) => n.kind === 'selection' && n.start <= at + pts[i] && n.end >= at + pts[i + 1])
-      parts.push(cover.length ? el('mark', { class: 'd-n', 'data-note-mark': cover.map(([, j]) => j).join(' '), title: `Note: ${cover.map(([n]) => n.text).join(' · ')}` }, piece) : piece)
+      parts.push(cover.length ? el('mark', { class: 'd-n', tabindex: 0, role: 'button', 'data-note-mark': cover.map(([, j]) => j).join(' '),
+        'aria-label': `${piece.data} — note: ${cover.map(([n]) => n.text).join(' · ')}. Press Enter to edit.`, title: `Note: ${cover.map(([n]) => n.text).join(' · ')} (click to edit)` }, piece) : piece)
     }
     t.replaceWith(...parts)
   }
@@ -1121,7 +1241,7 @@ function sidebar(x: Decision) {
 function noteEditor(n: Annotation, i: number, x: Decision, where: 'side' | 'dialog') {
   const name = n.kind === 'image'
     ? `${x.evidence.find((e) => e.evidenceId === n.evidence.evidenceId)?.label ?? n.evidence.evidenceId} · v${n.evidence.version}`
-    : n.anchor.kind === 'question' ? (n.anchor.field === 'background' ? 'Background' : 'Recommendation') : 'Evidence'
+    : n.anchor.kind === 'question' ? FIELD_LABEL[n.anchor.field] : 'Evidence'
   const problem = noteProblem(n, x)
   const errId = `${where}-note-err-${i}`
   return el('div', { class: `note${problem ? ' stale' : ''}` },
@@ -1241,7 +1361,10 @@ function composeArea(x: Decision): HTMLElement[] {
       ...(notice.notes ? [' ', el('button', { type: 'button', 'data-k': 'review-notes', onclick: () => reviewNotes() }, 'Review notes')] : []))] : []),
     ...(draftFail ? [el('div', { class: 'callout warn', role: 'status' }, `Draft not saved. ${failureText(draftFail)} It is kept in this tab only.`)] : []),
     el('div', { class: 'd-dock-foot' },
-      el('span', { class: 'd-hint' }, 'Replies go only to the original chat. Ctrl+Enter sends.'),
+      // First use: say how a note is made; once there are notes, that they travel with the reply.
+      el('span', { class: 'd-hint', 'data-k': 'reply-hint' }, draft.annotations.length
+        ? 'Notes go with your reply, to the original chat only. Ctrl+Enter sends.'
+        : 'Select text, then Add note (Alt+N) to comment on it. Replies go only to the original chat.'),
       notesBtn, sendBtn)
   ]
 }
@@ -1306,9 +1429,15 @@ function sheetHead(x: Decision | null): HTMLElement {
     ...(x && x.decisionLink ? [el('button', { type: 'button', class: 'd-icon-btn', 'data-k': 'copy-link', 'aria-label': 'Copy decision link', title: 'Copy decision link', onclick: () => copy(x.decisionLink, 'Decision link') }, '⧉')] : []),
     ...(inDash ? [el('button', { type: 'button', class: 'd-icon-btn', 'data-k': 'sheet-close', 'aria-label': 'Close decision', title: 'Close (Esc)', onclick: () => closeDashSheet() }, '✕')] : []))
 }
-const sheet = (x: Decision | null, body: HTMLElement[], dock: HTMLElement | null) =>
-  el('section', { class: 'd-sheet', 'aria-labelledby': 'sheetTitle' }, sheetHead(x),
+/** The question the sheet was last drawn for: its open motion plays once per opened question, not
+ *  again on every re-render (typing, a saved note, an invalidation). */
+let sheetDrawnFor: string | null | undefined
+const sheet = (x: Decision | null, body: HTMLElement[], dock: HTMLElement | null) => {
+  const enter = (x?.questionId ?? null) !== sheetDrawnFor
+  sheetDrawnFor = x?.questionId ?? null
+  return el('section', { class: `d-sheet${enter ? ' d-sheet-enter' : ''}`, 'aria-labelledby': 'sheetTitle' }, sheetHead(x),
     el('div', { class: 'd-sheet-body', 'data-k': 'sheet-body', tabindex: -1 }, ...body), ...(dock ? [dock] : []))
+}
 
 /** "1 / 3" with labelled previous/next icon buttons, for the reply card. */
 function pagerNode(x: Decision): HTMLElement | null {
@@ -1327,22 +1456,23 @@ function pagerNode(x: Decision): HTMLElement | null {
 }
 /** The recommendation, shown once, in the reply card. */
 let recOpen = false
-const recNode = (x: Decision, attrs: K = {}, pager: HTMLElement | null = null) => {
+const recNode = (x: Decision, attrs: K = {}, pager: HTMLElement | null = null, action: HTMLElement | null = null) => {
   if (!x.recommendation.trim()) return null
   const long = x.recommendation.length > 140 || x.recommendation.split('\n').length > 3
   return el('div', { class: `d-rec${recOpen ? ' open' : ''}` },
-    el('div', { class: 'd-rec-head' }, el('span', { class: 'd-rec-label' }, 'Recommendation'), el('span', { class: 'd-spacer' }),
+    el('div', { class: 'd-rec-head' }, el('span', { class: 'd-rec-label' }, 'Recommendation'), ...(action ? [action] : []), el('span', { class: 'd-spacer' }),
       ...(long ? [el('button', { type: 'button', class: 'd-icon-btn d-rec-more', 'data-k': 'rec-toggle', 'aria-expanded': recOpen, 'aria-label': recOpen ? 'Show less of the recommendation' : 'Show the whole recommendation', title: recOpen ? 'Show less' : 'Show all',
         onclick: () => { recOpen = !recOpen; render() } }, recOpen ? '⌃' : '⌄')] : []), ...(pager ? [pager] : [])),
     rich(x.recommendation, attrs))
 }
 /** Pager on the right of the card's first row. */
 /** The card's top: the recommendation with the pager in its header, or the pager alone. */
-const dockTop = (x: Decision, attrs: K = {}, left: HTMLElement | null = null): HTMLElement[] => {
+const dockTop = (x: Decision, attrs: K = {}, left: HTMLElement | null = null, action: HTMLElement | null = null): HTMLElement[] => {
   const p = pagerNode(x)
-  const rec = recNode(x, attrs, p)
+  const rec = recNode(x, attrs, p, action)
   if (rec) return left ? [el('div', { class: 'd-dock-row d-dock-head' }, left), rec] : [rec]
-  return p || left ? [el('div', { class: 'd-dock-row d-dock-head' }, left ?? el('span'), ...(p ? [p] : []))] : []
+  const lead = left ?? action
+  return p || lead ? [el('div', { class: 'd-dock-row d-dock-head' }, lead ?? el('span'), ...(p ? [p] : []))] : []
 }
 /**
  * The canonical form of an allowed work-item URL, or null: https only, no credentials, and only
@@ -1484,7 +1614,7 @@ function renderReview(questionId: string) {
     el('h1', { id: 'sheetTitle', tabindex: -1 }, x.title),
     ...metaNode(x, STATE_LABEL[state], progressCard(x, state)),
     ...(due?.overdue ? [el('div', { class: 'callout', ...alertRole(`due:${due.text}`) }, `${due.text}.`)] : []),
-    ...sections(x, { 'data-field': 'background', style: 'user-select:text' }),
+    ...sections(x, { 'data-field': 'background', style: 'user-select:text' }, { 'data-field': 'description', style: 'user-select:text' }),
     ...imagesNode(x),
     ...(links.length ? [el('h2', { class: 'd-sec-h' }, 'Linked evidence'), el('p', { style: 'margin:0' }, ...links.map((l) => l.kind === 'link'
       ? el('a', { href: l.url, onclick: (ev: Event) => { ev.preventDefault(); void openLink(l.url) } }, `${l.label} · v${l.version} ↗  `) : ''))] : []),
@@ -1494,14 +1624,14 @@ function renderReview(questionId: string) {
       ...(x.blockedWork.length ? [['Blocks', x.blockedWork.join(', ')] as [string, string]] : []), ['Question ID', x.questionId]], packageNodes())
   ]
   const canReply = actionsOf(x).includes(awaiting ? 'reply' : 'follow-up')
+  const composing = awaiting && canReply && !heldInitial(x)
   const dock = el('section', { class: 'd-dock dock', 'aria-label': 'Reply' },
-    ...dockTop(x, { 'data-field': 'recommendation', style: 'user-select:text' }),
-    ...(awaiting && canReply && !heldInitial(x) ? [x.options.length
-      ? el('div', { role: 'radiogroup', 'aria-label': 'Options', class: 'd-opts' }, ...x.options.map((o) =>
+    ...dockTop(x, { 'data-field': 'recommendation', style: 'user-select:text' }, null, composing ? useRecButton(x) : null),
+    ...(composing && x.options.length ? [
+      el('div', { role: 'radiogroup', 'aria-label': 'Options', class: 'd-opts' }, ...x.options.map((o) =>
           el('label', { class: 'opt d-opt', title: o.detail ?? '' }, el<HTMLInputElement>('input', { type: 'radio', name: 'opt', 'data-k': `opt-${o.optionId}`, checked: draft.optionId === o.optionId, disabled: sending, onchange: () => { draft.optionId = o.optionId; scheduleSave(); render() } }),
-            el('span', {}, o.label, ...(o.detail ? [el('span', { class: 'meta' }, ` — ${o.detail}`)] : [])))))
-      : el('p', { class: 'meta', style: 'margin:0' }, 'No fixed options. Answer in text.')] : []),
-    ...(awaiting && canReply && !heldInitial(x) ? useRecNode(x) : []),
+            el('span', {}, o.label, ...(o.detail ? [el('span', { class: 'meta' }, ` — ${o.detail}`)] : [])))))] : []),
+    ...(composing ? useRecNode(x) : []),
     ...(noteSaved === x.questionId && draft.annotations.length ? [el('div', { class: 'd-dock-row d-note-saved', role: 'status' },
       el('span', {}, `Note saved with your draft (${draft.annotations.length}). Not sent yet: notes go with your reply.`),
       el('button', { type: 'button', class: 'd-btn d-ghost', 'data-k': 'notes-edit', onclick: () => {
@@ -1512,7 +1642,7 @@ function renderReview(questionId: string) {
     ...(canReply ? composeArea(x) : [el('p', { class: 'meta', style: 'margin:0' }, 'Replying here is not available for this decision right now.')]),
     notesPanel(x))
   readerHost.replaceChildren(sheet(x, body, dock))
-  for (const f of ['background', 'recommendation'] as const) { const box = readerHost.querySelector(`[data-field="${f}"]`); if (box) markNotes(box, f) }
+  for (const f of NOTE_FIELDS) { const box = readerHost.querySelector(`[data-field="${f}"]`); if (box) markNotes(box, f) }
   shownD = x
   if (focusNote !== null) { root.querySelector<HTMLInputElement>(`[data-note="${focusNote}"]`)?.focus(); focusNote = null }
 }
@@ -1524,18 +1654,32 @@ function renderReview(questionId: string) {
  */
 let recAsk: string | null = null
 let recUndo: { questionId: string; optionId?: string; text: string } | null = null
+const recOption = (x: Decision) => x.recommendedOptionId ? x.options.find((o) => o.optionId === x.recommendedOptionId) : undefined
+function applyRec(x: Decision) {
+  const opt = recOption(x), text = x.recommendation.trim()
+  if (d !== x || sending) return
+  recUndo = { questionId: x.questionId, optionId: draft.optionId, text: draft.text }
+  recAsk = null
+  if (opt) { draft.optionId = opt.optionId; draft.text = '' } else { draft.optionId = undefined; draft.text = text }
+  scheduleSave(); render(); say(`Proposed from the PM recommendation${opt ? `: ${opt.label}` : ''}. Nothing is sent until you submit.`)
+  root.querySelector<HTMLElement>('[data-k="rec-undo"]')?.focus()
+}
+/** The compact "Use PM recommendation" button in the recommendation's header (as in D). */
+function useRecButton(x: Decision): HTMLElement | null {
+  const opt = recOption(x)
+  if ((!opt && !x.recommendation.trim()) || recUndo?.questionId === x.questionId || recAsk === x.questionId) return null
+  const what = opt ? `Selects “${opt.label}”. Nothing is sent until you submit.` : 'Puts the recommendation in your reply. Nothing is sent until you submit.'
+  return el('button', { type: 'button', class: 'd-btn d-sm', 'data-k': 'use-rec', 'aria-disabled': sending, title: what,
+    'aria-label': opt ? `Use PM recommendation: select ${opt.label}` : 'Use PM recommendation: put it in your reply', onclick: () => {
+      if (sending || d !== x) return
+      if (draft.optionId || draft.text.trim()) { recAsk = x.questionId; render(); root.querySelector<HTMLElement>('[data-k="rec-keep"]')?.focus() }
+      else applyRec(x)
+    } }, '✓ Use PM recommendation')
+}
+/** The rows that follow "Use PM recommendation": the replace question, or the proposal with Undo. */
 function useRecNode(x: Decision): HTMLElement[] {
-  const opt = x.recommendedOptionId ? x.options.find((o) => o.optionId === x.recommendedOptionId) : undefined
-  const text = x.recommendation.trim()
-  if (!opt && !text) return []
-  const apply = () => {
-    if (d !== x || sending) return
-    recUndo = { questionId: x.questionId, optionId: draft.optionId, text: draft.text }
-    recAsk = null
-    if (opt) { draft.optionId = opt.optionId; draft.text = '' } else { draft.optionId = undefined; draft.text = text }
-    scheduleSave(); render(); say(`Proposed from the PM recommendation${opt ? `: ${opt.label}` : ''}. Nothing is sent until you submit.`)
-    root.querySelector<HTMLElement>('[data-k="rec-undo"]')?.focus()
-  }
+  const opt = recOption(x)
+  const apply = () => applyRec(x)
   if (recUndo?.questionId === x.questionId) {
     const u = recUndo
     return [el('div', { class: 'd-dock-row d-proposed', role: 'status' },
@@ -1552,28 +1696,21 @@ function useRecNode(x: Decision): HTMLElement[] {
       el('button', { type: 'button', class: 'd-btn', 'data-k': 'rec-keep', onclick: () => { recAsk = null; render(); root.querySelector<HTMLElement>('[data-k="use-rec"]')?.focus() } }, 'Keep my draft'),
       el('button', { type: 'button', class: 'd-btn d-primary', 'data-k': 'rec-replace', onclick: apply }, 'Replace draft'))]
   }
-  return [el('div', { class: 'd-dock-row d-use-rec' },
-    el('button', { type: 'button', class: 'd-btn', 'data-k': 'use-rec', 'aria-disabled': sending,
-      'aria-label': opt ? `Use PM recommendation: select ${opt.label}` : 'Use PM recommendation: put it in your reply', onclick: () => {
-        if (sending || d !== x) return
-        if (draft.optionId || draft.text.trim()) { recAsk = x.questionId; render(); root.querySelector<HTMLElement>('[data-k="rec-keep"]')?.focus() }
-        else apply()
-      } }, '✓ Use PM recommendation'),
-    el('span', { class: 'd-hint' }, opt ? `Selects “${opt.label}”. Nothing is sent until you submit.` : 'Puts the recommendation in your reply. Nothing is sent until you submit.'))]
+  return []
 }
 /**
  * Background (circumstances, motivation, evidence), then Description (what is proposed or decided),
  * each once, under its own heading, only when supplied. When the authored Markdown already opens
  * with that heading, ours is not added. Background keeps its raw text, so note anchors and inline
- * image offsets are unchanged; Description carries no anchors.
+ * image offsets are unchanged. On Chat decisions both carry note anchors (raw UTF-16 offsets into
+ * their own unchanged text); read-only Bot Items pass no anchor attributes.
  */
-type Described = Decision & { description?: string }
 const opensWith = (md: string, name: string) => new RegExp(`^\\s*#{1,6}\\s+${name}\\s*#*\\s*(\\n|$)`, 'i').test(md)
-function sections(x: Decision, bgAttrs: K): HTMLElement[] {
-  const desc = (x as Described).description ?? ''
+function sections(x: Decision, bgAttrs: K, descAttrs: K = {}): HTMLElement[] {
+  const desc = x.description ?? ''
   const out: HTMLElement[] = []
   if (x.background.trim() || (x.inlineImages ?? []).length) out.push(...(opensWith(x.background, 'Background') ? [] : [el('h2', { class: 'd-sec-h', id: 'secBackground' }, 'Background')]), rich(x.background, bgAttrs, x.inlineImages ?? [], x))
-  if (desc.trim()) out.push(...(opensWith(desc, 'Description') ? [] : [el('h2', { class: 'd-sec-h', id: 'secDescription' }, 'Description')]), rich(desc, { class: 'rich d-desc' }))
+  if (desc.trim()) out.push(...(opensWith(desc, 'Description') ? [] : [el('h2', { class: 'd-sec-h', id: 'secDescription' }, 'Description')]), rich(desc, { ...descAttrs, class: 'rich d-desc' }))
   return out
 }
 /** Same-package questions, each with its own state (paging itself lives in the reply card). */
@@ -1782,7 +1919,7 @@ type Tab = 'pending' | 'answered' | 'all'
 const dash = {
   // Workspace: `chosen` is the owner's explicit choice (kept for the life of this view); until then
   // the focused workspace applies. `inv` is the authorized inventory from workspace.options.
-  tab: 'pending' as Tab, chosen: undefined as Scope | undefined, inv: null as WorkspaceOptions | null, invFail: null as Failure | null, scopeLost: null as Failure | null, priority: '', status: '', group: 'urgency', term: '',
+  tab: 'pending' as Tab, chosen: undefined as Scope | undefined, inv: null as WorkspaceOptions | null, invFail: null as Failure | null, scopeLost: null as Failure | null, priority: '', status: '', group: 'priority', term: '',
   focus: undefined as Workspace | null | undefined, focusFail: null as Failure | null,
   rows: [] as Decision[], next: undefined as string | undefined, sources: [] as SourceStatus[], mail: undefined as { state: 'available' | 'unavailable'; message?: string } | undefined,
   loading: false as false | 'first' | 'more', fail: null as Failure | null, loaded: false, filtersOpen: false
@@ -1852,9 +1989,11 @@ async function refreshQueue() {
 }
 async function selectInDashboard(questionId: string) {
   if (dashSel === questionId) { render(); return }
+  const leaving = d
+  const kept = keepPendingNote()
   if (draftFor && draftFor !== questionId) await flushDraft()
+  if (kept && leaving) say(`Your unsaved note was kept with the draft of “${leaving.title}”. Not sent.`)
   draftFor = null; draft = emptyDraft(); draftRevision = null; draftFail = null; d = null; pkg = []; notice = null; notesOpen = false; recOpen = false; recAsk = null; noteSaved = null
-  if (nc) { nc.remove(); nc = null; ncBack = null }
   dashSel = questionId
   render()
   root.querySelector<HTMLElement>('#sheetTitle')?.focus({ preventScroll: true })
@@ -1863,11 +2002,12 @@ async function selectInDashboard(questionId: string) {
 function closeDashSheet() {
   if (!dashSel) return
   const id = dashSel
+  const kept = keepPendingNote()
   void flushDraft()
-  dashSel = null; notesOpen = false
+  dashSel = null; notesOpen = false; noteSaved = null; sheetDrawnFor = undefined
   render()
   shell?.list.querySelector<HTMLElement>(`[data-q="${CSS.escape(id)}"]`)?.focus()
-  say('Closed')
+  say(kept ? 'Closed. Your unsaved note was kept with the draft. Not sent.' : 'Closed')
 }
 
 // ---- list model ----
@@ -1877,6 +2017,8 @@ function inTab(x: Decision, tab: Tab) { return tab === 'all' || (tab === 'pendin
 function visibleRows(tab: Tab = dash.tab) {
   return dash.rows.filter((x) => inTab(x, tab) && (!dash.priority || x.priority === dash.priority) && (!dash.status || statusOf(x) === dash.status))
 }
+/** Priority band headings, as in D (they sort P0 to P3 by name). */
+const PRI_NAME: Record<Decision['priority'], string> = { P0: 'P0 — highest priority', P1: 'P1 — high', P2: 'P2 — normal', P3: 'P3 — low' }
 function grouped(rows: Decision[]): [string, Decision[]][] {
   const now = clock.now(), zone = clock.zone()
   const sorted = order(rows, now, zone)
@@ -1887,7 +2029,7 @@ function grouped(rows: Decision[]): [string, Decision[]][] {
     for (const x of sorted) add(names[group(x, now, zone)], x)
     return names.filter((k) => out.has(k)).map((k) => [k, out.get(k)!])
   }
-  for (const x of sorted) add(dash.group === 'priority' ? x.priority : dash.group === 'status' ? statusOf(x) : wsLabel(x), x)
+  for (const x of sorted) add(dash.group === 'priority' ? PRI_NAME[x.priority] : dash.group === 'status' ? statusOf(x) : wsLabel(x), x)
   return [...out.entries()].sort(([a], [b]) => (dash.group === 'status' ? 0 : a.localeCompare(b)))
 }
 
@@ -2024,7 +2166,9 @@ function buildShell() {
 }
 // ---- resizable sheet (wide only) ------------------------------------------------------------------
 // A separator between the table and the sheet: drag (pointer or touch), or focus it and use the arrow
-// keys (Shift for larger steps), Home/End for the limits, Enter or a double-click to reset. The table
+// keys (Shift for larger steps), Home for the minimum and End for the maximum width (the ARIA
+// separator pattern), Enter or a double-click to reset. Its value, minimum and maximum always
+// describe the sheet as drawn, also after the window is resized. The table
 // keeps at least SHEET_LIST_MIN pixels; below 900px the sheet is a full-screen modal instead.
 const SHEET_MIN = 380, SHEET_LIST_MIN = 460
 let sheetW: number | null = null
@@ -2035,10 +2179,12 @@ function setSheetW(w: number | null, announce = true) {
   applySheetW()
   if (announce) say(sheetW === null ? 'Decision panel width reset' : `Decision panel ${sheetW} pixels wide`)
 }
+/** The sheet's drawn width (falls back to the CSS default outside a laid-out browser). */
+const sheetNow = () => Math.round(sheetW ?? (shell?.sheet.getBoundingClientRect?.().width || sheetDefault()))
 function applySheetW() {
   if (!shell) return
   if (sheetW === null) shell.el.style.removeProperty('--sheet-w'); else shell.el.style.setProperty('--sheet-w', `${sheetW}px`)
-  const sep = shell.el.querySelector('.d-divider'); const now = sheetW ?? sheetDefault()
+  const sep = shell.el.querySelector('.d-divider'); const now = sheetNow()
   sep?.setAttribute('aria-valuenow', String(now)); sep?.setAttribute('aria-valuemin', String(SHEET_MIN)); sep?.setAttribute('aria-valuemax', String(Math.round(sheetMax())))
   sep?.setAttribute('aria-valuetext', `Decision panel ${now} pixels wide${sheetW === null ? ' (default)' : ''}`)
   shell.el.querySelectorAll('[data-k="sheet-reset"]').forEach((b) => b.toggleAttribute('hidden', sheetW === null))
@@ -2048,22 +2194,23 @@ function divider(): HTMLElement {
   let drag: { x: number; w: number } | null = null
   sep.addEventListener('pointerdown', (ev) => { ev.preventDefault(); drag = { x: ev.clientX, w: sheetW ?? (shell?.sheet.getBoundingClientRect().width || sheetDefault()) }; sep.setPointerCapture?.(ev.pointerId); sep.classList.add('d-dragging') })
   sep.addEventListener('pointermove', (ev) => { if (drag) setSheetW(drag.w + (drag.x - ev.clientX), false) })
-  const end = () => { if (drag) { drag = null; sep.classList.remove('d-dragging'); say(`Decision panel ${sheetW ?? sheetDefault()} pixels wide`) } }
+  const end = () => { if (drag) { drag = null; sep.classList.remove('d-dragging'); say(`Decision panel ${sheetNow()} pixels wide`) } }
   sep.addEventListener('pointerup', end); sep.addEventListener('pointercancel', end)
   sep.addEventListener('dblclick', () => setSheetW(null))
   sep.addEventListener('keydown', (ev) => {
-    const cur = sheetW ?? sheetDefault(), step = ev.shiftKey ? 80 : 24
+    const cur = sheetNow(), step = ev.shiftKey ? 96 : 24
     if (ev.key === 'ArrowLeft') setSheetW(cur + step)
     else if (ev.key === 'ArrowRight') setSheetW(cur - step)
-    else if (ev.key === 'Home') setSheetW(sheetMax())
-    else if (ev.key === 'End') setSheetW(SHEET_MIN)
+    else if (ev.key === 'Home') setSheetW(SHEET_MIN)
+    else if (ev.key === 'End') setSheetW(sheetMax())
     else if (ev.key === 'Enter') setSheetW(null)
     else return
     ev.preventDefault()
   })
   return sep
 }
-window.addEventListener?.('resize', () => { if (sheetW !== null) setSheetW(sheetW, false) })
+// A resize changes the default width and the maximum: re-clamp a custom width and refresh the values.
+window.addEventListener?.('resize', () => { if (sheetW !== null) setSheetW(sheetW, false); else applySheetW() })
 function renderDashboard() {
   if (!shell) buildShell()
   const s = shell!
@@ -2125,7 +2272,12 @@ async function bind() {
     return
   }
   if (ref.view === 'review') {
-    if (draftFor && draftFor !== ref.questionId) { await flushDraft(); draftFor = null; draft = emptyDraft(); draftRevision = null; draftFail = null; d = null; pkg = []; notice = null }
+    if (draftFor && draftFor !== ref.questionId) {
+      const leaving = d, kept = keepPendingNote()
+      await flushDraft()
+      if (kept && leaving) say(`Your unsaved note was kept with the draft of “${leaving.title}”. Not sent.`)
+      draftFor = null; draft = emptyDraft(); draftRevision = null; draftFail = null; d = null; pkg = []; notice = null; noteSaved = null
+    }
     render()
     await loadReview(ref.questionId)
   } else if (ref.view === 'settings') {

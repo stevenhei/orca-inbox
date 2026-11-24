@@ -105,14 +105,19 @@ export function group(d: Decision, now: number, zone: string): 0 | 1 | 2 {
 
 const rank: Record<Priority, number> = { P0: 0, P1: 1, P2: 2, P3: 3 }
 
-/** Group, then priority, then oldest first. Ties by question ID so the order is total. */
-export function order(list: readonly Decision[], now: number, zone: string): Decision[] {
+function deadlineTime(d: Decision): number {
+  const time = Date.parse(d.deadline ?? '')
+  return Number.isFinite(time) ? time : Infinity
+}
+
+/** Priority, earliest deadline, then oldest first. Undated rows follow dated rows in each priority. */
+export function order(list: readonly Decision[], _now?: number, _zone?: string): Decision[] {
   return [...list].sort(
     (a, b) =>
-      group(a, now, zone) - group(b, now, zone) ||
       rank[a.priority] - rank[b.priority] ||
+      deadlineTime(a) - deadlineTime(b) ||
       Date.parse(a.createdAt) - Date.parse(b.createdAt) ||
-      a.questionId.localeCompare(b.questionId)
+      (a.questionId < b.questionId ? -1 : a.questionId > b.questionId ? 1 : 0)
   )
 }
 

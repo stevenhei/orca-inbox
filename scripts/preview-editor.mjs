@@ -42,7 +42,7 @@ function build() {
   console.log(`[preview] built in ${Date.now() - t} ms`)
   return !errors
 }
-const page = (theme) => `<!doctype html><html lang="en" class="${theme}"><head><meta charset="utf-8">
+const page = (theme) => `<!doctype html><html lang="en" class="${theme}"><head><meta charset="utf-8"><link rel="icon" href="data:,">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Decision Inbox editor preview</title>
 <style>:root{--orca-foreground:${theme === 'light' ? '#1f2328' : '#d6dae0'};--orca-background:${theme === 'light' ? '#ffffff' : '#1e1f22'}}</style>
 <script type="module">
@@ -292,9 +292,9 @@ async function runShots(dir, wsUrl) {
     await evalJs(`(() => { const t = document.querySelector('[aria-label="New note"]'); t.value = 'count them'; t.dispatchEvent(new Event('input', { bubbles: true })) })()`)
     await s('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, modifiers: 2, text: '\r' })
     await s('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, modifiers: 2 }); await wait(700)
-    const after = await evalJs(`(() => { const dk = document.querySelector('.d-dock').getBoundingClientRect(); return { composer: !!document.querySelector('.d-nc'), panelHidden: document.querySelector('#notesPanel').hidden, mark: document.querySelector('mark.d-n')?.textContent, saved: document.querySelector('.d-note-saved')?.textContent, focus: document.activeElement?.getAttribute('data-k'), top: Math.round(document.querySelector('.d-sheet-body').scrollTop), was: Math.round(window.__top), state: document.querySelector('.d-state-pill').textContent, dockIn: dk.bottom <= innerHeight + 1 } })()`)
+    const after = await evalJs(`(() => { const dk = document.querySelector('.d-dock').getBoundingClientRect(); return { composer: !!document.querySelector('.d-nc'), panelHidden: document.querySelector('#notesPanel').hidden, mark: document.querySelector('mark.d-n')?.textContent, saved: document.querySelector('.d-note-saved')?.textContent, focus: document.activeElement?.matches('mark.d-n') ? 'mark' : document.activeElement?.getAttribute('data-k'), top: Math.round(document.querySelector('.d-sheet-body').scrollTop), was: Math.round(window.__top), state: document.querySelector('.d-state-pill').textContent, dockIn: dk.bottom <= innerHeight + 1 } })()`)
     files.push(await shot(`notes-${label}-saved`))
-    check(`note composer (${label}): Ctrl+Enter saves, composer and panel close, highlight + quiet confirmation, focus and scroll restored, nothing sent`, !after.composer && after.panelHidden && after.mark === 'seven views' && /Not sent yet/.test(after.saved ?? '') && after.focus === 'notes-open' && Math.abs(after.top - after.was) <= 2 && after.state === '● Awaiting answer' && after.dockIn, after)
+    check(`note composer (${label}): Ctrl+Enter saves, composer and panel close, highlight + quiet confirmation, focus on the highlighted text, scroll restored, nothing sent`, !after.composer && after.panelHidden && after.mark === 'seven views' && /Not sent yet/.test(after.saved ?? '') && after.focus === 'mark' && Math.abs(after.top - after.was) <= 2 && after.state === '● Awaiting answer' && after.dockIn, after)
     // Image note from ✎, cancel with Esc keeps nothing; then add.
     const notesBefore = await evalJs(`document.querySelector('[data-k="notes-open"]').textContent`)
     await evalJs(`(() => { const b = document.querySelector('[data-k="fig-note-model-3"]'); b.scrollIntoView({ block: 'center' }); b.click() })()`); await wait(300)
@@ -340,14 +340,14 @@ async function runShots(dir, wsUrl) {
   await key('ArrowLeft', 'ArrowLeft', 37); await key('ArrowLeft', 'ArrowLeft', 37); await wait(200)
   const k1 = await evalJs(`({ w: Math.round(document.querySelector('.d-sheet').getBoundingClientRect().width), now: +document.querySelector('[data-k="divider"]').getAttribute('aria-valuenow'), reset: !document.querySelector('[data-k="sheet-reset"]').hidden })`)
   check('divider: ArrowLeft widens the sheet by 24px steps, separator value and reset button follow', k1.w === w0 + 48 && k1.now === k1.w && k1.reset, { w0, k1 })
-  await key('Home', 'Home', 36); await wait(200)
+  await key('End', 'End', 35); await wait(200)
   const kMax = await evalJs(`(() => { const t = document.querySelector('.d-table-wrap').getBoundingClientRect(), d = document.querySelector('.d-dock').getBoundingClientRect(); return { table: Math.round(t.width), sheet: Math.round(document.querySelector('.d-sheet').getBoundingClientRect().width), dockIn: d.bottom <= innerHeight + 1, max: +document.querySelector('[data-k="divider"]').getAttribute('aria-valuemax') } })()`)
   files.push(await shot('divider-1280-max'))
-  check('divider: Home = maximum; the table keeps ≥ 420px and the reply card stays anchored', kMax.sheet === kMax.max && kMax.table >= 420 && kMax.dockIn, kMax)
-  await key('End', 'End', 35); await wait(200)
+  check('divider: End = maximum; the table keeps ≥ 420px and the reply card stays anchored', kMax.sheet === kMax.max && kMax.table >= 420 && kMax.dockIn, kMax)
+  await key('Home', 'Home', 36); await wait(200)
   const kMin = await evalJs(`({ sheet: Math.round(document.querySelector('.d-sheet').getBoundingClientRect().width), send: (() => { const b = document.querySelector('[data-k="send"]').getBoundingClientRect(); return b.right <= innerWidth && b.bottom <= innerHeight })() })`)
   files.push(await shot('divider-1280-min'))
-  check('divider: End = minimum (380px); reply controls still fit', kMin.sheet === 380 && kMin.send, kMin)
+  check('divider: Home = minimum (380px); reply controls still fit', kMin.sheet === 380 && kMin.send, kMin)
   // Pointer drag.
   const sep = await evalJs(`(() => { const r = document.querySelector('[data-k="divider"]').getBoundingClientRect(); return { x: Math.round(r.left), y: Math.round(r.top + r.height / 2) } })()`)
   await s('Input.dispatchMouseEvent', { type: 'mousePressed', x: sep.x, y: sep.y, button: 'left', clickCount: 1 })
@@ -358,9 +358,75 @@ async function runShots(dir, wsUrl) {
   await evalJs(`document.querySelector('[data-k="sheet-reset"]').click()`); await wait(200)
   const reset = await evalJs(`({ w: Math.round(document.querySelector('.d-sheet').getBoundingClientRect().width), hidden: document.querySelector('[data-k="sheet-reset"]').hidden })`)
   check('divider: Reset returns to the default width', reset.w === w0 && reset.hidden, { reset, w0 })
+  // Separator values follow the drawn sheet after a viewport change (no key press needed).
+  const sepVals = () => evalJs(`(() => { const s = document.querySelector('[data-k="divider"]'); return { now: +s.getAttribute('aria-valuenow'), min: +s.getAttribute('aria-valuemin'), max: +s.getAttribute('aria-valuemax'),
+    sheet: Math.round(document.querySelector('.d-sheet').getBoundingClientRect().width), maxReal: Math.round(document.querySelector('.d-workspace').getBoundingClientRect().width) - 460 } })()`)
+  await s('Emulation.setDeviceMetricsOverride', { width: 1603, height: 656, deviceScaleFactor: 1, mobile: false }); await wait(400)
+  const v1603 = await sepVals()
+  check('divider: after 1280 → 1603 the separator reports the drawn width and the new maximum', v1603.now === v1603.sheet && v1603.max === v1603.maxReal && v1603.min === 380, v1603)
+  await evalJs(`document.querySelector('[data-k="divider"]').focus()`); await key('End', 'End', 35); await wait(200)
+  await s('Emulation.setDeviceMetricsOverride', { width: 1280, height: 820, deviceScaleFactor: 1, mobile: false }); await wait(400)
+  const vBack = await sepVals()
+  check('divider: a custom width is re-clamped when the window shrinks; values match the drawn sheet', vBack.now === vBack.sheet && vBack.max === vBack.maxReal && vBack.now <= vBack.max, vBack)
+  await key('Enter', 'Enter', 13, '\r'); await wait(200)
   await s('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: false }); await wait(400)
   const nar = await evalJs(`({ sheet: Math.round(document.querySelector('.d-sheet').getBoundingClientRect().width), divider: getComputedStyle(document.querySelector('[data-k="divider"]')).display })`)
   check('divider: hidden at 390px; the sheet is full screen', nar.sheet === 390 && nar.divider === 'none', nar)
+  // Saved-note line clears itself; a typed note is kept when another question opens.
+  await open('?ref=dashboard', 1280, 820); await evalJs('sessionStorage.clear()'); await open('?ref=dashboard', 1280, 820)
+  await evalJs(`[...document.querySelectorAll('.qrow')].find((b) => b.textContent.includes('comparison baseline')).click()`); await wait(800)
+  const selText = (phrase) => evalJs(`(() => { const ph = ${JSON.stringify(phrase)}; const p = document.querySelector('[data-field="background"] p'); const t = [...p.childNodes].find((n) => n.nodeType === 3 && n.textContent.includes(ph)); t.parentElement.scrollIntoView({ block: 'center' }); const r = document.createRange(); const i = t.textContent.indexOf(ph); r.setStart(t, i); r.setEnd(t, i + ph.length); getSelection().removeAllRanges(); getSelection().addRange(r) })()`)
+  await selText('seven views'); await wait(200); await evalJs(`document.querySelector('#pop').click()`); await wait(200)
+  await evalJs(`(() => { const t = document.querySelector('[aria-label="New note"]'); t.value = 'auto clear'; t.dispatchEvent(new Event('input', { bubbles: true })) })()`)
+  await evalJs(`document.querySelector('[data-k="nc-add"]').click()`); await wait(600)
+  const s0 = await evalJs(`!!document.querySelector('.d-note-saved')`)
+  await evalJs(`document.activeElement?.blur()`); await wait(7400)
+  const s1 = await evalJs(`({ strip: !!document.querySelector('.d-note-saved'), notes: document.querySelector('[data-k="notes-open"]').textContent })`)
+  check('saved-note line clears itself after ~7 s; the note stays', s0 && !s1.strip && /Notes \(1\)/.test(s1.notes), { s0, s1 })
+  await selText('Each view'); await wait(200); await evalJs(`document.querySelector('#pop').click()`); await wait(200)
+  await evalJs(`(() => { const t = document.querySelector('[aria-label="New note"]'); t.value = 'typed, not added'; t.dispatchEvent(new Event('input', { bubbles: true })) })()`)
+  await evalJs(`[...document.querySelectorAll('.qrow')].find((b) => b.textContent.includes('rehearsal slot')).click()`); await wait(900)
+  const sw = await evalJs(`({ composer: !!document.querySelector('.d-nc'), title: document.querySelector('.d-sheet h1').textContent, said: [...document.querySelectorAll('[role=status][aria-live]')].map((e) => e.textContent).join(' | ') })`)
+  await evalJs(`[...document.querySelectorAll('.qrow')].find((b) => b.textContent.includes('comparison baseline')).click()`); await wait(900)
+  const back = await evalJs(`({ notes: document.querySelector('[data-k="notes-open"]').textContent, marks: [...document.querySelectorAll('mark.d-n')].map((m) => m.textContent) })`)
+  files.push(await shot('notes-1280-kept-after-switch'))
+  check('a typed note is kept with its own question when another question opens, and announced', !sw.composer && sw.title === 'Pick a rehearsal slot' && /unsaved note was kept/.test(sw.said) && /Notes \(2\)/.test(back.notes) && back.marks.includes('Each view'), { sw, back })
+  // Description notes by a real pointer at every layout: Add note is on top and inside the visible
+  // reading area (also over the narrow modal sheet), the composer stays above the reply card, and the
+  // card never overflows sideways.
+  for (const [w, h, label] of [[1603, 656, 'short-1603'], [820, 900, 'wide-820'], [390, 844, 'narrow-390']]) {
+    await open('?ref=dashboard', w, h); await evalJs('sessionStorage.clear()'); await open('?ref=dashboard', w, h)
+    await evalJs(`[...document.querySelectorAll('.qrow')].find((b) => b.textContent.includes('comparison baseline')).click()`); await wait(900)
+    const fit = await evalJs(`(() => { const dk = document.querySelector('.d-dock'), b = document.querySelector('[data-k="send"]').getBoundingClientRect(); return { scrollW: dk.scrollWidth, clientW: dk.clientWidth, sendRight: Math.round(b.right), sendBottom: Math.round(b.bottom) } })()`)
+    check(`reply card (${label}): no sideways overflow; Submit fully visible`, fit.scrollW <= fit.clientW + 1 && fit.sendRight <= w && fit.sendBottom <= h, fit)
+    await evalJs(`(() => { const p = document.querySelector('[data-field="description"] p'); p.scrollIntoView({ block: 'end' }); const t = [...p.childNodes].find((n) => n.nodeType === 3 && n.data.trim().length > 8); const r = document.createRange(); r.setStart(t, 0); r.setEnd(t, 8); getSelection().removeAllRanges(); getSelection().addRange(r) })()`); await wait(250)
+    const pp = await evalJs(`(() => { const p = document.querySelector('#pop'), b = p.getBoundingClientRect(), body = document.querySelector('.d-sheet-body').getBoundingClientRect(); const cx = b.left + b.width / 2, cy = b.top + b.height / 2; return { shown: getComputedStyle(p).display !== 'none', x: Math.round(cx), y: Math.round(cy), onTop: document.elementFromPoint(cx, cy) === p, inBody: b.top >= body.top && b.bottom <= body.bottom && b.left >= body.left && b.right <= body.right } })()`)
+    check(`Description note (${label}): Add note shows on top, inside the visible reading area`, pp.shown && pp.onTop && pp.inBody, pp)
+    await s('Input.dispatchMouseEvent', { type: 'mouseMoved', x: pp.x, y: pp.y })
+    await s('Input.dispatchMouseEvent', { type: 'mousePressed', x: pp.x, y: pp.y, button: 'left', clickCount: 1 })
+    await s('Input.dispatchMouseEvent', { type: 'mouseReleased', x: pp.x, y: pp.y, button: 'left', clickCount: 1 }); await wait(300)
+    const nc = await evalJs(`(() => { const n = document.querySelector('.d-nc'); if (!n) return null; const b = n.getBoundingClientRect(), dk = document.querySelector('.d-dock').getBoundingClientRect(), sh = document.querySelector('.d-sheet').getBoundingClientRect(); return { bottom: Math.round(b.bottom), dockTop: Math.round(dk.top), inSheet: b.left >= sh.left && b.right <= sh.right && b.top >= sh.top, focus: document.activeElement?.getAttribute('aria-label') } })()`)
+    files.push(await shot(`notes-desc-${label}-composer`))
+    check(`Description note (${label}): a pointer click opens the composer above the reply card, inside the sheet`, !!nc && nc.bottom <= nc.dockTop && nc.inSheet && nc.focus === 'New note', nc)
+    await evalJs(`(() => { const t = document.querySelector('[aria-label="New note"]'); t.value = 'desc ${label}'; t.dispatchEvent(new Event('input', { bubbles: true })); document.querySelector('[data-k="nc-add"]').click() })()`); await wait(700)
+    const done = await evalJs(`({ composer: !!document.querySelector('.d-nc'), mark: document.querySelector('[data-field="description"] mark.d-n')?.textContent, state: document.querySelector('.d-state-pill')?.textContent })`)
+    files.push(await shot(`notes-desc-${label}-saved`))
+    check(`Description note (${label}): saved, highlighted, composer closed, nothing sent`, !done.composer && !!done.mark && done.state === '● Awaiting answer', done)
+    // Keyboard: Tab-reachable highlight; a real Enter re-opens the same note for editing; Esc cancels.
+    await evalJs(`document.querySelector('[data-field="description"] mark.d-n').focus()`)
+    await s('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' })
+    await s('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 }); await wait(300)
+    const ed = await evalJs(`(() => { const t = document.querySelector('[aria-label="Edit note"]'); const n = document.querySelector('.d-nc'); const dk = document.querySelector('.d-dock').getBoundingClientRect(); return { value: t?.value, focused: document.activeElement === t, del: !!document.querySelector('[data-k="nc-delete"]'), clear: n ? n.getBoundingClientRect().bottom <= dk.top : false } })()`)
+    check(`Description note (${label}): Enter on the highlight re-opens it for editing above the card`, ed.value === `desc ${label}` && ed.focused && ed.del && ed.clear, ed)
+    await s('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 })
+    await s('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 }); await wait(200)
+  }
+  for (const [w, h] of [[390, 844], [1280, 820]]) for (const ref of ['preview-long', 'preview-narrative']) {
+    await open(`?ref=${ref}`, w, h)
+    const o = await evalJs(`(() => { const dk = document.querySelector('.d-dock'), b = document.querySelector('[data-k="send"]').getBoundingClientRect(), nx = document.querySelector('[data-k="q-next"]')?.getBoundingClientRect(); return { scrollW: dk.scrollWidth, clientW: dk.clientWidth, sendIn: b.right <= innerWidth && b.bottom <= innerHeight, nextIn: !nx || nx.right <= innerWidth } })()`)
+    files.push(await shot(`card-${ref}-${w}x${h}`))
+    check(`reply card (${ref} ${w}x${h}): no sideways overflow; pager and Submit visible`, o.scrollW <= o.clientW + 1 && o.sendIn && o.nextIn, o)
+  }
   // Native Item with two questions: paging in the read-only card.
   for (const [w, h, label] of SIZES) {
     await open('?ref=bot-item:preview:e1:0', w, h)

@@ -20,8 +20,26 @@ const base = { scope: 'all' as const, current: studio, term: '', history: false,
 const ids = (list: { questionId: string }[]) => list.map((d) => d.questionId)
 
 // ---- view-model ---------------------------------------------------------------------------------
-test('sort: P0 oldest first, then due-today and overdue by priority, then the rest', () => {
+test('sort: priority bands keep the shared fixture order', () => {
   assert.deepEqual(ids(order(decisions, NOW, 'UTC')), ['room-route', 'room-reset', 'stage', 'layout', 'image-review', 'schedule'])
+})
+
+test('sort: absolute deadlines precede undated rows within a priority, then age and stable ID', () => {
+  const seed = decisions[0]
+  const items: Decision[] = [
+    { ...seed, questionId: 'p3-overdue', priority: 'P3', deadline: '2000-01-01T00:00:00Z' },
+    { ...seed, questionId: 'p2-undated', priority: 'P2', deadline: undefined },
+    { ...seed, questionId: 'p2-same-b', priority: 'P2', deadline: '2030-06-15T02:00:00Z', createdAt: '2030-06-10T00:00:00Z' },
+    { ...seed, questionId: 'p2-newer', priority: 'P2', deadline: '2030-06-15T02:00:00Z', createdAt: '2030-06-11T00:00:00Z' },
+    { ...seed, questionId: 'p2-same-a', priority: 'P2', deadline: '2030-06-14T22:00:00-04:00', createdAt: '2030-06-10T00:00:00Z' },
+    { ...seed, questionId: 'p2-overdue', priority: 'P2', deadline: '2030-06-13T11:00:00Z' },
+    { ...seed, questionId: 'p1-future', priority: 'P1', deadline: '2040-06-14T15:00:00Z' },
+    { ...seed, questionId: 'p0-undated', priority: 'P0', deadline: undefined }
+  ]
+  const expected = ['p0-undated', 'p1-future', 'p2-overdue', 'p2-same-a', 'p2-same-b',
+    'p2-newer', 'p2-undated', 'p3-overdue']
+  assert.deepEqual(ids(order(items, NOW, 'UTC')), expected)
+  assert.deepEqual(ids(order(items, NOW, 'America/Los_Angeles')), expected)
 })
 
 test('This workspace is host + workspace: paired studio is not local studio', () => {
@@ -472,6 +490,44 @@ test('panel: a Chat decision is answered in the panel with a durable reply ID an
     const saves = st.saved as { draft: { replyId?: string } | null }[]
     assert.ok(saves.some((x) => x.draft?.replyId === sent.replyId), 'reply ID saved before the attempt')
     assert.ok(view.find({ text: /saved in Decision Inbox, but not delivered|Saved in Decision Inbox, but not delivered to the original chat\. Orca could not hand it to that chat\. Retry is not available here/ }))
+  })
+})
+
+test('panel: a note is added in the panel with the wide tab refused; exact words, repeated words and image anchors; nothing is sent', async () => {
+  const st = stores()
+  const base = decisions.find((d) => d.questionId === 'schedule')!
+  const sched = { ...base, description: 'Rooms A and B. Rooms A has light.', evidence: [{ evidenceId: 'plan', version: 2, label: 'Floor plan', kind: 'image-snapshot' as const, attachmentId: 'att-plan', width: 10, height: 10, alt: 'plan' }] }
+  await withPanel(worker(decisions.map((d) => d.questionId === 'schedule' ? sched : d), { ...st.requests, 'review.open': masked, submitReply: () => { throw new Error('nothing may be sent') } }), async (view) => {
+    await view.emit('workspace.changed', ctx('studio-local'))
+    await view.press({ label: 'Pick a rehearsal slot' })
+    await view.press({ text: 'Open wide review' })
+    assert.ok(view.find({ label: 'The wide tab did not open' }), 'the wide tab is refused')
+    await view.press({ text: 'Add note' })
+    await view.press({ text: 'Add note' })
+    assert.ok(view.find({ text: 'Choose what the note is about.' }), 'no target: refused, composer kept')
+    await view.select({ label: 'Note on' }, `description:0:${sched.description.length}`)
+    await view.type({ label: 'Exact words (optional)' }, 'Rooms A')
+    await view.select({ label: 'Which occurrence' }, '1')
+    await view.type({ label: 'Note' }, 'the second one')
+    await view.press({ text: 'Add note' }); await view.settled()
+    const n1 = (st.drafts.get('schedule')?.draft as { annotations: Record<string, unknown>[] }).annotations[0]
+    const at = sched.description.indexOf('Rooms A', 1)
+    assert.deepEqual(n1, { kind: 'selection', anchor: { kind: 'question', field: 'description', revision: sched.revision }, start: at, end: at + 7, quote: 'Rooms A', text: 'the second one' }, 'raw description offsets of the chosen occurrence')
+    assert.ok(!view.find({ label: 'Note on' }), 'the composer closes after saving')
+    assert.ok(view.find({ text: /Note saved with your draft \(1\)\. Not sent yet/ }))
+    assert.ok(!view.find({ text: /^1\. Description/ }), 'saved notes stay collapsed behind Notes (n)')
+    await view.press({ text: 'Add note' })
+    await view.select({ label: 'Note on' }, 'image:plan:2')
+    await view.type({ label: 'Note' }, 'north door')
+    await view.press({ text: 'Add note' }); await view.settled()
+    const notes = (st.drafts.get('schedule')?.draft as { annotations: Record<string, unknown>[] }).annotations
+    assert.deepEqual(notes[1], { kind: 'image', evidence: { evidenceId: 'plan', version: 2 }, text: 'north door' })
+    await view.press({ text: '← Back to list' })
+    await view.press({ label: 'Pick a rehearsal slot' })
+    assert.ok(view.find({ text: 'Notes (2)' }) && !view.find({ text: /^1\. Description/ }), 'collapsed with a count after reopening')
+    await view.press({ text: 'Notes (2)' })
+    assert.ok(view.find({ text: /^1\. Description: “Rooms A” — the second one$/ }) && view.find({ text: /^2\. Image: Floor plan · v2 — north door$/ }), 'notes are there after reopening')
+    assert.equal(requestsOf(view, 'submitReply').length, 0, 'nothing was sent')
   })
 })
 

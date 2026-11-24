@@ -1,7 +1,9 @@
 import { assert, hostError, mockHost, mount, mountWorker, test } from 'orca/testing'
 import type { Decision, Result } from './contract.ts'
+import type { DecisionPageInput } from './backend-protocol.ts'
 import { nativeDetail, nativePage } from './backend-orca.ts'
 import { registerDesktopWorker } from './worker.ts'
+import { workspaceValue } from './workspace-scope.ts'
 import * as panel from './panel.tsx'
 
 const localWorkspace = { hostId: 'local', workspaceId: 'identity:shared-workspace' }
@@ -271,6 +273,119 @@ test('workspace options expose the authorized host inventory, including empty an
     const unavailable = await options()
     assert.ok(!unavailable.ok && unavailable.code === 'unavailable')
     assert.ok(!JSON.stringify(unavailable).includes('private inventory denial'))
+  } finally {
+    await worker.deactivate()
+  }
+})
+
+test('registered paging distinguishes removed workspaces from authorized empty scopes with both sources active', async () => {
+  const workspace = { hostId: 'local', workspaceId: 'studio-worktree' }
+  const empty = { hostId: 'local', workspaceId: 'annex-worktree' }
+  const sessionId = '89626680-3dc3-4f2b-b4dc-c22909bd78ff'
+  const row = { hostId: 'local', kind: 'worktree', path: '/fixture', branch: null }
+  const studioRow = { ...row, id: workspace.workspaceId, name: 'Studio' }
+  const annexRow = { ...row, id: empty.workspaceId, name: 'Annex' }
+  const host = mockHost({ capabilities: ['storage:own', 'workspace:read'], results: {
+    'workspace.list': { truncated: false, workspaces: [studioRow] }
+  } })
+  let cliCalls = 0
+  let hintReads = 0
+  const worker = await mountWorker({ async default(orca) {
+    const backend = registerDesktopWorker(orca, {
+      hints: async () => { hintReads++; return [] },
+      removeHint: async () => {},
+      async cli(args) {
+        cliCalls++
+        if (args.join(' ') === 'bot list') return { bots: [{ id: 'studio-bot' }] }
+        if (args[0] === 'agent') return { agents: [{ kind: 'chat', hostId: 'local',
+          orcaSessionId: sessionId, worktreeId: workspace.workspaceId }] }
+        if (args[0] === 'worktree') return { worktrees: [{ id: workspace.workspaceId, hostId: 'local' }] }
+        if (args[2] === 'list') {
+          const items = Array.from({ length: 10 }, (_, i) => ({
+            uid: 'item-' + i, title: 'Native item ' + i, status: 'needs_you', createdAt: i + 1,
+            description: `ORCA-DECISION-META {"deadline":"2030-06-${19 - i}T00:00:00Z"}`,
+            chat: { kind: 'chat', id: sessionId },
+            question: { decisions: Array.from({ length: i === 9 ? 4 : 5 }, (_, j) => ({ question: `Native ask ${i}-${j}`, replies: [] })) }
+          }))
+          return { items: [...items, {
+            ...items[0], uid: 'old-p3', description: 'ORCA-DECISION-META {"priority":"P3","deadline":"2000-01-01T00:00:00Z"}',
+            question: { decisions: [{ question: 'Native overdue P3', replies: [] }] }
+          }] }
+        }
+        throw new Error('Unexpected source command.')
+      }
+    })
+    value(await backend.submitDecision({
+      kind: 'agent', id: sessionId, origin: { ...workspace, sessionId },
+      repo: 'studio', projectName: 'Studio', workspaceName: 'Studio', policyOwnerId: 'decision-inbox-local-desktop'
+    }, {
+      requestId: 'paging-test', packageId: 'paging-package', evidence: [], sourceLinks: [],
+      questions: [
+        { questionId: 'plugin-question', title: 'Plugin question', background: '',
+          recommendation: '', priority: 'P0', options: [], blockedWork: [] },
+        { questionId: 'undated-p2', title: 'Plugin undated P2', background: '',
+          recommendation: '', priority: 'P2', options: [], blockedWork: [] }
+      ]
+    }))
+  } }, { host })
+  const queue = { scope: { kind: 'workspace' as const, workspace }, includeHistory: false }
+  const list = (input = queue) => worker.request('listDecisionPage', input, caller)
+  try {
+    const previousInventory = value(await worker.request('workspace.options', undefined, caller))
+    assert.equal(previousInventory.workspaces[0].workspaceId, workspace.workspaceId)
+    const first = value(await list())
+    assert.equal(first.rows.length, 50)
+    assert.equal(first.rows[0].questionId, 'plugin-question')
+    assert.equal(first.rows[1].title, 'Native ask 9-0')
+    assert.equal(first.rows.at(-1)?.title, 'Native ask 0-4')
+    assert.ok(first.rows.slice(1).every(item => item.source?.kind === 'native-item' && item.priority === 'P2'))
+    assert.ok(first.nextCursor)
+    const continuation = { ...queue, cursor: first.nextCursor }
+    const second = value(await list(continuation))
+    assert.deepEqual(second.rows.map(item => [item.title, item.source?.kind]), [
+      ['Plugin undated P2', 'plugin'], ['Native overdue P3', 'native-item']
+    ])
+    assert.deepEqual(first.sources?.map(source => source.state), ['available', 'available'])
+
+    const pages: DecisionPageInput[] = []
+    const view = await mount(panel, { host: mockHost({ capabilities: ['storage:own', 'workspace:read'], requests: {
+      listDecisionPage: (input: DecisionPageInput) => {
+        pages.push(input)
+        return worker.request('listDecisionPage', input, caller)
+      },
+      'workspace.options': input => worker.request('workspace.options', input, caller),
+      'workspace.resolve': input => worker.request('workspace.resolve', input, caller)
+    } }) })
+    let sourceCalls: number[]
+    try {
+      await view.select({ label: 'Workspace' }, workspaceValue(workspace))
+      for (let i = 0; i < 10 && !view.find({ text: 'Load more' }); i++) await new Promise(resolve => setTimeout(resolve, 30))
+      assert.ok(view.find({ label: 'Plugin question' }))
+      assert.ok(view.find({ text: 'Load more' }))
+      sourceCalls = [cliCalls, hintReads]
+      host.respond('workspace.list', { truncated: false, workspaces: [annexRow] })
+      await view.press({ text: 'Load more' })
+      for (let i = 0; i < 10 && !view.find({ text: 'Show all workspaces' }); i++) await new Promise(resolve => setTimeout(resolve, 30))
+      assert.ok(view.find({ text: 'Show all workspaces' }))
+      assert.ok(!view.find({ label: 'Plugin question' }))
+      assert.deepEqual(pages.map(({ timeZone: _zone, ...input }) => input), [queue, continuation])
+    } finally {
+      await view.unmount()
+    }
+    for (const request of [queue, continuation]) {
+      const denied = await list(request)
+      assert.ok(!denied.ok && denied.code === 'forbidden')
+    }
+    assert.deepEqual([cliCalls, hintReads], sourceCalls)
+
+    host.respond('workspace.readContext', { workspaceId: empty.workspaceId, displayName: 'Annex', branch: '', terminals: [] })
+    assert.deepEqual(value(await worker.request('workspace.resolve', { workspaceId: empty.workspaceId }, caller)), empty)
+    assert.ok(!previousInventory.workspaces.some(choice => choice.workspaceId === empty.workspaceId))
+    const annex = value(await list({ ...queue, scope: { kind: 'workspace', workspace: empty } }))
+    assert.deepEqual(annex.rows, [])
+    assert.equal(annex.nextCursor, undefined)
+    assert.deepEqual(annex.sources?.map(source => source.state), ['available', 'partial'])
+    assert.match(annex.sources?.find(source => source.source === 'native-item')?.message ?? '', /attribution/)
   } finally {
     await worker.deactivate()
   }

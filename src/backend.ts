@@ -329,7 +329,7 @@ export class InboxBackend {
         (!filter || (d.source?.kind !== 'native-item' || d.source.workspaceAttributed) && sameWorkspace(filter, d.origin)) &&
         (input.includeHistory || isActionable(d)) && (!query || (input.includeHistory ? searchText(d)
           : searchText({ ...d, answerState: { state: 'awaiting-answer' } })).includes(query)))
-      return order(rows, this.now(), zone)
+      return order(rows)
     })
   }
 

@@ -1,6 +1,6 @@
 # Selected D: frontend and plugin contract
 
-This is the implementation plan for connecting the selected D design to Orca. The first change is the workspace picker. Keep the running plugin and its existing [domain types](../src/contract.ts), [worker requests](../src/backend-protocol.ts) and [delivery gates](v1-spec.md) as the baseline.
+The dashboard and narrow panel share the worker contract for the selected Variant D design. Keep the running plugin and its existing [domain types](../src/contract.ts), [worker requests](../src/backend-protocol.ts) and [delivery gates](v1-spec.md) as the baseline.
 
 ## Workspace selection
 
@@ -10,7 +10,7 @@ On entry, resolve the focused workspace and display its name. Focus can follow O
 
 | Worker operation | Contract |
 |---|---|
-| `workspace.options` (planned addition) | No input. Return `Result<{ workspaces: { hostId, workspaceId, name, hostLabel? }[], truncated?: boolean }>` using strings for IDs and labels. Derive choices from authorized inventory, including workspaces with zero decisions. Represent partial inventory explicitly. |
+| `workspace.options` | No input. Return `Result<{ workspaces: { hostId, workspaceId, name, hostLabel? }[], truncated?: boolean }>` using strings for IDs and labels. Derive choices from authorized inventory, including workspaces with zero decisions. Represent partial inventory explicitly. |
 | `workspace.resolve` (existing) | Map Orca's focused workspace ID to an unambiguous authorized host/workspace pair. |
 | `listDecisionPage` (existing) | Send the existing `scope` union: `{kind:'all'}` or `{kind:'workspace', workspace:{hostId, workspaceId}}`. A changed scope starts a new first-page query. Refresh and Load more retain that scope. Discard late results from the previous query. |
 
@@ -20,9 +20,9 @@ The worker enforces authorization and per-source visibility. Unattributed native
 
 | User action | Implementation boundary |
 |---|---|
-| Find a decision | The dashboard and sidebar use the same typed queue request. The worker owns scoped results, search, ordering, cursor and source coverage. Group headings, row density and the selected row belong to the view. A filter applied to loaded pages must disclose that limit until it is included in the worker query. |
+| Find a decision | The dashboard and sidebar use the same typed queue request. The worker owns scoped results, search, ordering, cursor and source coverage. The default dashboard groups by priority. Before paging, the worker orders the whole scoped queue by P0 through P3, earliest deadline within a priority, undated last, then oldest creation and stable question ID. The view draws headings and tracks the selected row. A filter applied to loaded pages must disclose that limit until it is included in the worker query. |
 | Inspect and page through a package | Select by stable question ID and call `getDecision`. The dashboard renders the resizable sheet, Background before Description, progress, inline evidence, source links and question pager. Host-owned sidebar components offer inline details and a wide-view entry. Both use the same record. |
-| Add notes or adopt a recommendation | The view manages focus, zoom, selection and the contextual composer. Save anchored notes and proposed answers through the existing question-scoped, revisioned draft operations. Recommendation changes a draft; explicit Submit records an answer. |
+| Add notes or adopt a recommendation | The view manages focus, zoom, selection and the contextual composer. The editor anchors selected text in Background, Description or Recommendation and supports notes on authorized images. The sidebar offers a paragraph or image picker and optional exact words. Both save through the same question-scoped, revisioned draft operation. Saving a note closes its composer and keeps the reply editable. Recommendation changes a draft; explicit Submit records an answer. |
 | Send or check an answer | Core handles first-answer conflicts, append-only follow-ups and reply IDs. The Orca adapter supplies actual actions and delivery evidence. Native Items point to Orca for answering. A saved Chat answer, accepted mail and a confirmed agent receipt remain separate states. |
 | Review an attachment | Render author-ordered Markdown and versioned inline placements. Request bytes through the worker's existing attachment grant. Commands render as copyable text. Retain a usable document when evidence is unavailable. |
 

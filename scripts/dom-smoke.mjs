@@ -456,7 +456,7 @@ if (scenario === 'review') {
   assert.ok(document.querySelector('.d-nc')); assert.match(document.querySelector('.d-nc').textContent, /Write the note first/); ok('an empty note keeps the composer open')
   await addNote('Same paper stock')
   assert.equal(document.querySelector('.d-nc'), null); assert.match(document.querySelector('.side').textContent, /Notes \(2\)/); assert.ok(document.querySelector('#notesPanel').hasAttribute('hidden'))
-  assert.equal(document.activeElement.getAttribute('data-k'), 'notes-open'); ok('Add saves the note, closes the composer and the Notes panel, focus returns')
+  assert.equal(document.activeElement, document.querySelector('mark.d-n')); assert.equal(document.activeElement.getAttribute('tabindex'), '0'); ok('Add saves the note, closes the composer and the Notes panel; focus returns to the highlighted text')
   assert.match(text(), /Note saved with your draft \(2\)\. Not sent yet/); assert.equal(document.querySelector('mark.d-n').textContent, 'Paper models'); ok('quiet saved confirmation; the note is highlighted at its anchor')
   assert.ok(!/Draft not saved/.test(text())); assert.equal(last('draft.save').draft.annotations.length, 2); ok('the note is saved with the draft')
   await click(document.querySelector('[data-k="notes-edit"]'))
@@ -758,6 +758,25 @@ if (scenario === 'review') {
   await click(find('.qrow .qt', 'Pick a rehearsal slot').parentElement)
   await key({ key: 'Escape' })
   assert.equal(document.querySelector('.d-sheet'), null); ok('Esc closes the sheet')
+  // Resize separator: Home = minimum, End = maximum (ARIA separator pattern); Shift+Arrow = 96px.
+  await click(find('.qrow .qt', 'Pick a rehearsal slot').parentElement)
+  const sep = document.querySelector('[data-k="divider"]')
+  const kd = (init) => { const e = new window.Event('keydown', { bubbles: true, cancelable: true }); Object.assign(e, init); sep.dispatchEvent(e) }
+  kd({ key: 'Home' }); assert.equal(sep.getAttribute('aria-valuenow'), sep.getAttribute('aria-valuemin')); assert.equal(sep.getAttribute('aria-valuenow'), '380')
+  kd({ key: 'End' }); assert.equal(sep.getAttribute('aria-valuenow'), sep.getAttribute('aria-valuemax')); ok('Home sets the minimum and End the maximum width')
+  kd({ key: 'Home' }); kd({ key: 'ArrowLeft', shiftKey: true }); assert.equal(sep.getAttribute('aria-valuenow'), '476'); ok('Shift+ArrowLeft widens by 96px')
+  kd({ key: 'Enter' }); assert.match(sep.getAttribute('aria-valuetext'), /\(default\)$/); ok('Enter resets to the default width')
+  // A typed but unsaved note is kept in its own question's draft when another question is opened.
+  select(range([...document.querySelectorAll('[data-field="background"] p')][0].firstChild, 0, 4))
+  await key({ altKey: true, key: 'n', code: 'KeyN' })
+  await setValue(byLabel('New note'), 'keep me', 'input')
+  await click(find('.qrow .qt', 'Compare seven paper model views').parentElement); await sleep(50)
+  const keptSave = callsOf('draft.save').filter((c) => c.questionId === 'schedule').at(-1)
+  assert.deepEqual(keptSave.draft.annotations.map((a) => a.text), ['keep me']); assert.equal(document.querySelector('.d-nc'), null)
+  assert.match(text(), /Your unsaved note was kept with the draft of “Pick a rehearsal slot”\. Not sent\./)
+  assert.ok(!callsOf('draft.save').some((c) => c.questionId === 'image-review' && c.draft?.annotations?.some((a) => a.text === 'keep me'))); ok('switching questions keeps the typed note in its own draft and says so')
+  await click(find('.qrow .qt', 'Pick a rehearsal slot').parentElement)
+  assert.match(document.querySelector('[data-k="notes-open"]').textContent, /Notes \(1\)/); ok('and it is there when the question is reopened')
 } else if (scenario === 'dashnarrow') {
   assert.equal(document.querySelector('.d-sheet'), null); assert.equal(document.querySelector('.d-list-side').hasAttribute('inert'), false); ok('narrow: list first, nothing auto-opened')
   await click(find('.qrow .qt', 'Pick a rehearsal slot').parentElement)
@@ -957,14 +976,33 @@ if (scenario === 'review') {
   const heads = all('.d-sheet-body h2, .d-sheet-body .rich-h').map((h) => h.textContent)
   assert.deepEqual(heads.filter((t) => /^(Description|Background)$/.test(t)), ['Background', 'Description']); ok('Background then Description, each once (authored headings kept, none duplicated)')
   assert.equal(all('.d-sheet-body h2.d-sec-h').filter((h) => /Description|Background/.test(h.textContent)).length, 0); ok('no extra section heading when the authored Markdown already has it')
-  assert.ok(document.querySelector('.d-desc') && !document.querySelector('.d-desc').hasAttribute('data-field')); ok('Description carries no note anchors')
+  assert.equal(document.querySelector('.d-desc')?.getAttribute('data-field'), 'description'); ok('Description is a note anchor field of its own')
   assert.ok(body.querySelector('.d-progress').compareDocumentPosition !== undefined && body.querySelector('h1').nextElementSibling.classList.contains('d-srcline')); ok('title, source line and state card stay separate above the sections')
   const raw = db.get('sections').background
   const t = [...document.querySelectorAll('[data-field="background"] p')].at(-1).firstChild
   select(range(t, 4, 14)); await key({ altKey: true, key: 'n', code: 'KeyN' }); await addNote('narrow'); await sleep(450)
   const n = last('draft.save').draft.annotations[0]
   assert.equal(n.quote, 'west aisle'); assert.equal(raw.slice(n.start, n.end), 'west aisle'); assert.equal(n.start, raw.indexOf('west aisle')); ok('background note offsets are raw offsets into the unchanged background')
+  assert.ok(document.querySelector('.d-note-saved')); document.activeElement?.blur?.(); await sleep(7300); await settle()
+  assert.equal(document.querySelector('.d-note-saved'), null); assert.match(document.querySelector('[data-k="notes-open"]').textContent, /Notes \(1\)/); ok('the quiet saved confirmation clears itself after 7 s; the note stays')
   assert.equal(all('[data-field="recommendation"]').length, 1); assert.ok(document.querySelector('.d-dock [data-field="recommendation"]')); ok('recommendation stays in the reply card')
+  // Description text: the same note flow, anchored to raw offsets in the unchanged description.
+  const rawDesc = db.get('sections').description
+  const dt = [...document.querySelectorAll('[data-field="description"] p')].map((p) => [...p.childNodes].find((c) => c.nodeType === 3 && c.data.trim().length > 6)).find(Boolean)
+  select(range(dt, 0, 6)); assert.equal(document.querySelector('#pop').style.display, 'block'); ok('selecting Description text shows Add note')
+  await key({ altKey: true, key: 'n', code: 'KeyN' }); await addNote('desc note'); await sleep(450)
+  const dn = last('draft.save').draft.annotations.find((a) => a.text === 'desc note')
+  assert.equal(dn.anchor.field, 'description'); assert.equal(rawDesc.slice(dn.start, dn.end), dn.quote); assert.equal(dn.quote, dt.data.slice(0, 6)); ok('a Description note stores raw description offsets and its quote')
+  assert.ok(document.querySelector('[data-field="description"] mark.d-n')); assert.match(document.querySelector('[data-k="notes-open"]').textContent, /Notes \(2\)/); ok('the Description note is highlighted and counted')
+  // A highlight re-opens its note: Enter edits it (Save note), Delete removes it; nothing is sent.
+  const dm = document.querySelector('[data-field="description"] mark.d-n')
+  const ent = new window.Event('keydown', { bubbles: true, cancelable: true }); Object.assign(ent, { key: 'Enter' }); dm.dispatchEvent(ent); await settle()
+  assert.ok(document.querySelector('.d-nc')); assert.equal(byLabel('Edit note').value, 'desc note'); assert.match(document.querySelector('.d-nc').textContent, /Edit note on the selected text/); ok('Enter on a highlight re-opens that note for editing')
+  await setValue(byLabel('Edit note'), 'desc note, edited', 'input'); await click(document.querySelector('[data-k="nc-add"]')); await sleep(450)
+  assert.equal(document.querySelector('.d-nc'), null); assert.deepEqual(last('draft.save').draft.annotations.map((a) => a.text), ['narrow', 'desc note, edited']); ok('Save note updates the same note in place')
+  await click(document.querySelector('[data-field="description"] mark.d-n')); await click(document.querySelector('[data-k="nc-delete"]')); await sleep(450)
+  assert.deepEqual(last('draft.save').draft.annotations.map((a) => a.text), ['narrow']); assert.equal(document.querySelector('[data-field="description"] mark.d-n'), null); ok('a click re-opens it too, and Delete removes only that note')
+  assert.equal(callsOf('submitReply').length, 0); ok('nothing is sent by notes')
 } else if (scenario === 'localonly') {
   await setValue(byLabel('Reply text'), 'Tuesday', 'input')
   await click(find('button', 'Submit reply'))

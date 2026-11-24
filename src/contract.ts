@@ -67,7 +67,7 @@ export type Annotation = { text: string } & (
   | { kind: 'image'; evidence: EvidenceRef }
   | { kind: 'selection'; anchor:
       | { kind: 'evidence'; evidence: EvidenceRef }
-      | { kind: 'question'; revision: number; field: 'background' | 'recommendation' }
+      | { kind: 'question'; revision: number; field: 'background' | 'description' | 'recommendation' }
     start: number; end: number; quote: string }
 )
 

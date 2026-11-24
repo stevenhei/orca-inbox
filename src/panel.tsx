@@ -7,6 +7,7 @@ import type { PanelContext } from 'orca'
 import type { Answer, Decision, Delivery, RecordedReply, SubmitReply, Workspace } from './contract.ts'
 import type { InboxSettings } from './backend-protocol.ts'
 import { autolinkForMarkdown } from './markdown-inline.ts'
+import { NOTE_FIELD_LABEL, makeNote, noteTargets, occurrences } from './note-anchors.ts'
 import { STATE_LABEL, actionsOf, deadlineLabel, replyState, isActionable, nativeNeedsYou, nativeOf, nativeStatusLabel, order, sameWorkspace, shownState, siblings, undeliveredReplies } from './model.ts'
 import { call, clock, draftIsEmpty, emptyDraft, failureText, formatInstant, newReplyId, reconcile, replies, sourcesOf, transportOf, type Draft, type Failure, type Requester, type SourceStatus } from './client.ts'
 import type { DecisionPage, WorkspaceOptions } from './backend-protocol.ts'
@@ -284,7 +285,37 @@ let saving: Promise<unknown> = Promise.resolve()
 
 function resetCompose(questionId: string) {
   set(cDraft, emptyDraft()); set(cMeta, { questionId, revision: null, loaded: false })
-  set(cFail, null); set(cNotice, null); set(cSending, false)
+  set(cFail, null); set(cNotice, null); set(cSending, false); set(pNote, null); set(pNoteSaved, false); set(pNotesList, false)
+}
+
+// ---- notes in the panel (no text selection here: pick a paragraph or image, optionally a phrase) --
+/** The open note composer in the panel, for one question; null when closed. */
+type PanelNote = { questionId: string; target: string; phrase: string; occurrence: number; text: string; error?: string; saving?: boolean }
+const pNote = atom<PanelNote | null>(null)
+const pNoteSaved = atom(false)
+/** The saved-notes list is collapsed behind Notes (n) unless the owner opens it. */
+const pNotesList = atom(false)
+function editNote(patch: Partial<PanelNote>) {
+  const cur = read(pNote); if (cur) set(pNote, { ...cur, error: undefined, ...patch })
+}
+/**
+ * Adds the note to this question's draft and saves it (compare-and-set) right away. On success the
+ * composer closes and a quiet line says it is saved, not sent; on failure the composer stays open
+ * with the text and the note is not kept.
+ */
+async function addPanelNote(d: Decision) {
+  const c = read(pNote); if (!c || c.saving || c.questionId !== d.questionId) return
+  const t = noteTargets(d).find((x) => x.value === c.target)
+  if (!t) return editNote({ error: 'Choose what the note is about.' })
+  const n = makeNote(d, t, c.text, c.phrase, c.occurrence)
+  if (typeof n === 'string') return editNote({ error: n })
+  editNote({ saving: true })
+  editDraft({ annotations: [...read(cDraft).annotations, n] })
+  const ok = await saveDraftNow()
+  if (read(cMeta).questionId !== d.questionId) return
+  if (ok) { set(pNote, null); set(pNoteSaved, true); set(pNotesList, false); return }
+  set(cDraft, { ...read(cDraft), annotations: read(cDraft).annotations.filter((a) => a !== n) })
+  editNote({ saving: false, error: `The note was not saved. ${read(cFail) ? failureText(read(cFail)!) : 'Try again.'}` })
 }
 async function loadDraft(mine: number, d: Decision) {
   if (read(cMeta).loaded && read(cMeta).questionId === d.questionId) return reconcileDraft(d)
@@ -732,6 +763,63 @@ function NativeFooter(props: { d: Decision }) {
   )
 }
 
+/**
+ * Notes in the panel: the same anchored notes as the wide review, saved with this question's draft
+ * and sent with the reply. Without text selection, the owner picks a paragraph (Background,
+ * Description or Recommendation, with exact raw offsets) or an image, and may narrow it to an exact
+ * phrase (its occurrence when repeated). Works when the wide tab cannot open.
+ */
+function PanelNotes(props: { d: Decision }) {
+  const { d } = props
+  const draft = read(cDraft); const c = read(pNote); const sending = read(cSending)
+  const open = c?.questionId === d.questionId ? c : null
+  const targets = open ? noteTargets(d) : []
+  const target = open ? targets.find((t) => t.value === open.target) : undefined
+  const hits = open && target?.kind === 'text' && open.phrase ? occurrences(target.text, open.phrase).length : 0
+  const name = (n: (typeof draft.annotations)[number]) => n.kind === 'image'
+    ? `Image: ${d.evidence.find((e) => e.evidenceId === n.evidence.evidenceId)?.label ?? n.evidence.evidenceId} · v${n.evidence.version}`
+    : n.anchor.kind === 'question' ? `${NOTE_FIELD_LABEL[n.anchor.field]}: “${n.quote.length > 48 ? `${n.quote.slice(0, 47)}…` : n.quote}”` : 'Evidence'
+  return (
+    <Stack gap="xs">
+      {read(pNotesList) && !open && draft.annotations.map((n, i) => (
+        <Row key={`${i}`} gap="xs" align="center" justify="between">
+          <Text size="xs">{`${i + 1}. ${name(n)} — ${n.text}`}</Text>
+          <Button size="sm" variant="ghost" disabled={sending} onPress={() => { set(pNoteSaved, false); editDraft({ annotations: read(cDraft).annotations.filter((x) => x !== n) }) }}>{`Remove note ${i + 1}`}</Button>
+        </Row>
+      ))}
+      {read(pNoteSaved) && draft.annotations.length > 0 && !open && <Text muted size="xs">{`Note saved with your draft (${draft.annotations.length}). Not sent yet: notes go with your reply.`}</Text>}
+      {open ? (
+        <Card title="Add a note" description="Notes are saved with your draft and sent with your reply, not before.">
+          <Select label="Note on" value={open.target || undefined} placeholder="Choose a paragraph or image…" options={targets.map((t) => ({ value: t.value, label: t.label }))}
+            onChange={(v) => editNote({ target: v, phrase: '', occurrence: 0 })} />
+          {target?.kind === 'text' && (
+            <Input label="Exact words (optional)" value={open.phrase} placeholder="Leave empty to note the whole paragraph" onChange={(v) => editNote({ phrase: v, occurrence: 0 })} />
+          )}
+          {hits > 1 && (
+            <Select label="Which occurrence" value={String(open.occurrence)} options={Array.from({ length: hits }, (_, i) => ({ value: String(i), label: `Occurrence ${i + 1} of ${hits}` }))}
+              onChange={(v) => editNote({ occurrence: Number(v) })} />
+          )}
+          <Textarea label="Note" rows={3} value={open.text} placeholder="Your note (Ctrl+Enter adds it)" invalid={!!open.error}
+            onChange={(v) => editNote({ text: v })} onSubmit={() => { void addPanelNote(d) }} />
+          {open.error && <Text size="xs" tone="danger">{open.error}</Text>}
+          <Row gap="xs" justify="end">
+            <Button size="sm" variant="ghost" onPress={() => set(pNote, null)}>Cancel</Button>
+            <Button size="sm" disabled={!!open.saving} onPress={() => { void addPanelNote(d) }}>{open.saving ? 'Saving…' : 'Add note'}</Button>
+          </Row>
+        </Card>
+      ) : (
+        <Row gap="xs" align="center" wrap>
+          <Button size="sm" variant="outline" disabled={sending} onPress={() => { set(pNoteSaved, false); set(pNotesList, false); set(pNote, { questionId: d.questionId, target: '', phrase: '', occurrence: 0, text: '' }) }}>Add note</Button>
+          {draft.annotations.length > 0 && (
+            <Button size="sm" variant="ghost" onPress={() => { set(pNoteSaved, false); set(pNotesList, !read(pNotesList)) }}>{`${read(pNotesList) ? 'Hide notes' : 'Notes'} (${draft.annotations.length})`}</Button>
+          )}
+          {draft.annotations.length === 0 && <Text muted size="xs">Comment on a paragraph, exact words or an image. The wide review also lets you select text.</Text>}
+        </Row>
+      )}
+    </Stack>
+  )
+}
+
 /** The reply area for a Chat decision: notices, options and the composer, always at the bottom. */
 function ChatFooter(props: { d: Decision }) {
   const { d } = props
@@ -774,7 +862,7 @@ function ChatFooter(props: { d: Decision }) {
             <Textarea label={answered ? 'Follow-up' : 'Reply text'} rows={3} value={draft.text} disabled={sending}
               placeholder={answered ? 'Follow-up to the agent (Ctrl+Enter to send)' : draft.optionId ? 'Optional detail with your option (Ctrl+Enter to submit)' : 'Free-text answer (Ctrl+Enter to submit)'}
               onChange={(v) => editDraft({ text: v })} onSubmit={() => { void send() }} />
-            {draft.annotations.length > 0 && <Text muted size="xs">{`${draft.annotations.length} note${draft.annotations.length > 1 ? 's' : ''} from the wide review will be sent with this reply.`}</Text>}
+            <PanelNotes d={d} />
             <Row gap="xs" align="center" justify="between">
               <Text muted size="xs">Replies go only to the original chat.</Text>
               <Button disabled={sending || !answer} onPress={send}>{sending ? 'Sending…' : answered ? 'Send follow-up' : 'Submit reply'}</Button>

@@ -162,13 +162,13 @@ export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
   }
 
   orca.panels.handle('listDecisionPage', (input, context) => withOwner(context, async caller => {
-    if (!local) return backend.listDecisionPage(caller, input)
     const selection = input?.scope
     const host = selection?.kind === 'workspace' ? selection.workspace?.hostId : undefined
     if (selection?.kind === 'workspace' && !caller.workspaces.some(workspace =>
       workspace.hostId === host && workspace.workspaceId === selection.workspace?.workspaceId)) {
       return result(() => { throw new InboxError('forbidden', 'Inbox workspace is missing or inaccessible.') })
     }
+    if (!local) return backend.listDecisionPage(caller, input)
     const remoteScope = Boolean(host && host !== 'local')
     const [pending, native] = await Promise.all([
       remoteScope ? false : input?.cursor ? hintsPending : syncHints(caller),

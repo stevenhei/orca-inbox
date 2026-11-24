@@ -163,7 +163,9 @@ export function annotations(value: unknown, allowEmptyText = false): Annotation[
     requireInput(quote.length === end - start, 'Selection quote and range differ.')
     const anchor = object(note.anchor)
     if (anchor.kind === 'evidence') return { kind: note.kind, text, start, end, quote, anchor: { kind: anchor.kind, evidence: evidenceRef(anchor.evidence) } }
-    requireInput(anchor.kind === 'question' && (anchor.field === 'background' || anchor.field === 'recommendation'), 'Invalid question text anchor.')
+    requireInput(anchor.kind === 'question' &&
+      (anchor.field === 'background' || anchor.field === 'description' || anchor.field === 'recommendation'),
+    'Invalid question text anchor.')
     return { kind: note.kind, text, start, end, quote,
       anchor: { kind: anchor.kind, revision: integer(anchor.revision, 'revision'), field: anchor.field } }
   })
@@ -185,7 +187,7 @@ export function validateNotes(notes: Annotation[], visible: Decision, evidenceTe
     const ref = note.kind === 'image' ? note.evidence : note.anchor.kind === 'evidence' ? note.anchor.evidence : undefined
     if (!ref && note.kind === 'selection' && note.anchor.kind === 'question') {
       requireInput(note.anchor.revision === visible.revision &&
-        visible[note.anchor.field].slice(note.start, note.end) === note.quote, 'Question selection does not match its source revision.')
+        visible[note.anchor.field]?.slice(note.start, note.end) === note.quote, 'Question selection does not match its source revision.')
       continue
     }
     requireInput(ref, 'Invalid evidence anchor.')
