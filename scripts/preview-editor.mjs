@@ -372,19 +372,23 @@ async function runShots(dir, wsUrl) {
   // Group by restores the grouped default. Below 900px a compact Sort select stands in for the headers.
   await open('?ref=dashboard&history=1', 1280, 820)
   await evalJs(`(() => { const s = document.querySelector('[data-k="ws-select"]'); s.value = 'all'; s.dispatchEvent(new Event('change', { bubbles: true })); document.querySelector('[data-k="tab-all"]').click() })()`); await wait(800)
-  const sortState = () => evalJs(`({ sort: [...document.querySelectorAll('thead th[aria-sort]')].map((t) => [t.textContent.replace(/[▲▼\s]/g, ''), t.getAttribute('aria-sort')]), groups: document.querySelectorAll('tr.d-group').length,
+  const sortState = () => evalJs(`({ sort: [...document.querySelectorAll('thead th[aria-sort]')].map((t) => [t.textContent.replace(/[▲▼\\s]/g, ''), t.getAttribute('aria-sort')]), groups: document.querySelectorAll('tr.d-group').length,
     titles: [...document.querySelectorAll('.qrow .qt')].map((t) => t.textContent), group: document.querySelector('[data-k="group-by"]').value, focus: document.activeElement?.getAttribute('data-k'),
     compact: getComputedStyle(document.querySelector('[data-k="sort-by"]').closest('label')).display })`)
   const srt0 = await sortState()
   const qh = await centre('[data-k="sort-question"]'); await pointer(qh.x, qh.y); await wait(800)
   const srt1 = await sortState()
-  const cmp = new Intl.Collator('zh-Hant', { sensitivity: 'base', numeric: true })
+  // The worker's own sequence for that sort (all pages), as the table must show it.
+  const workerTitles = (sort) => evalJs(`(async () => { const out = []; let cursor
+    do { const r = await orca.plugin.request('listDecisionPage', { scope: { kind: 'all' }, includeHistory: true, timeZone: 'UTC', ...(cursor ? { cursor } : {}), sort: ${JSON.stringify(sort)} }); out.push(...r.value.rows.map((d) => d.title)); cursor = r.value.nextCursor } while (cursor)
+    return out })()`)
+  const asc = await workerTitles({ column: 'question', direction: 'asc' }), desc = await workerTitles({ column: 'question', direction: 'desc' })
   check('sort: a pointer click on Question sorts ascending, flat, aria-sort set; no compact Sort control on desktop',
-    srt0.groups > 0 && !srt0.sort.length && srt0.compact === 'none' && JSON.stringify(srt1.sort) === '[["Question","ascending"]]' && srt1.groups === 0 && srt1.group === 'none' && JSON.stringify(srt1.titles) === JSON.stringify([...srt1.titles].sort(cmp.compare)) && srt1.titles.length === srt0.titles.length, { srt0, srt1 })
+    srt0.groups > 0 && !srt0.sort.length && srt0.compact === 'none' && JSON.stringify(srt1.sort) === '[["Question","ascending"]]' && srt1.groups === 0 && srt1.group === 'none' && JSON.stringify(srt1.titles) === JSON.stringify(asc.slice(0, srt1.titles.length)) && srt1.titles.length >= srt0.titles.length, { srt0, srt1, asc })
   files.push(await shot('sort-1280-question-asc'))
   await evalJs(`document.querySelector('[data-k="sort-question"]').focus()`); await key('Enter', 'Enter', 13, '\r'); await wait(800)
   const srt2 = await sortState()
-  check('sort: Enter on the focused header toggles to descending; focus stays on it', JSON.stringify(srt2.sort) === '[["Question","descending"]]' && JSON.stringify(srt2.titles) === JSON.stringify([...srt1.titles].reverse()) && srt2.focus === 'sort-question', srt2)
+  check('sort: Enter on the focused header toggles to descending; focus stays on it', JSON.stringify(srt2.sort) === '[["Question","descending"]]' && JSON.stringify(srt2.titles) === JSON.stringify(desc.slice(0, srt2.titles.length)) && srt2.focus === 'sort-question', { srt2, desc })
   await evalJs(`(() => { const s = document.querySelector('[data-k="group-by"]'); s.value = 'priority'; s.dispatchEvent(new Event('change', { bubbles: true })) })()`); await wait(800)
   const srt3 = await sortState()
   check('sort: choosing Group by priority restores the grouped default order', !srt3.sort.length && srt3.groups > 0 && srt3.group === 'priority' && JSON.stringify(srt3.titles) === JSON.stringify(srt0.titles), srt3)

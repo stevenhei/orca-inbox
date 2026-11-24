@@ -539,8 +539,6 @@ document.addEventListener('keydown', (e) => {
 
 // ---- reply --------------------------------------------------------------------------------------
 const answered = (x: Decision) => x.answerState.state === 'answered'
-/** The open decision is a Practice one: note and reply copy say "saved here", never "sent". */
-const practiceOpen = () => !!d && isPractice(d)
 /** The decision as last drawn. Sends act on what the owner saw, never on a newer reload. */
 let shownD: Decision | null = null
 /** An initial answer the owner wrote that lost to another accepted answer: kept, never sent. */
@@ -1067,7 +1065,6 @@ function composeArea(x: Decision): HTMLElement[] {
   ]
 }
 
-const STEPS: ShownState[] = ['awaiting-answer', 'submitted', 'agent-received', 'undelivered']
 /** Optional reader fields agreed with the BE worker (absent on older workers). */
 type RichDecision = Decision & {
   context?: string
@@ -1831,7 +1828,6 @@ function grouped(rows: Decision[]): [string, Decision[]][] {
   return [...out.entries()].sort(([a], [b]) => (dash.group === 'status' ? 0 : a.localeCompare(b)))
 }
 
-const SRC_NAME: Record<SourceStatus['source'], string> = { plugin: 'Chat decisions', 'native-item': 'Bot Items' }
 function rowNode(x: Decision, now: number): HTMLElement {
   const due = deadlineLabel(x, now)
   const sel = dashSel === x.questionId
