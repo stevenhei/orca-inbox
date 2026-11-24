@@ -3,7 +3,7 @@
   "id": "decision-inbox",
   "name": "Decision Inbox",
   "version": "0.1.0",
-  "description": "Development scaffold for owner decisions and reviews.",
+  "description": "Read authorized Bot Items and save answers to workspace Chat decisions.",
   "engines": { "orca": ">=1.4.248" },
   "execution": "trusted-worker",
   "pluginApi": 1,
@@ -18,6 +18,7 @@
   },
   "capabilities": [
     { "kind": "storage:own" },
-    { "kind": "workspace:read" }
+    { "kind": "workspace:read" },
+    { "kind": "workspace:write" }
   ]
 }

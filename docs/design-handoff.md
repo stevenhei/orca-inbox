@@ -4,17 +4,32 @@ Audience: the FE implementation and verification sessions. Scope and release gat
 
 ## What exists
 
-The FE design is a working prototype on top of the shared contract and fixtures. It replaces the scaffold `panel.tsx` and `review.ts` (originals in `.design-backup/`). It is **design code, not production code**:
+The FE is wired to the plugin worker through the shared contract and [backend-protocol.ts](../src/backend-protocol.ts). No UI module imports fixtures; tests inject them through controlled worker answers (a static check in the DOM tests enforces this). The design prototype is kept in `.design-backup/`.
 
 | Path | Role |
 | --- | --- |
 | [src/model.ts](../src/model.ts) | Pure view-model: scope identity, actionable rule, sort, search, deadline text. Keep and reuse; the worker can share it. |
-| [src/panel.tsx](../src/panel.tsx) | Narrow sidebar panel, Orca components only. Imports fixtures; replace with `listDecisions`. |
-| [src/review.ts](../src/review.ts) | Wide review tab and Inbox Settings in one isolated custom editor (plain DOM). Imports fixtures; replace with worker calls. |
-| [src/inbox.test.tsx](../src/inbox.test.tsx) | Orca-runner tests for model and panel. |
-| [scripts/dom-smoke.mjs](../scripts/dom-smoke.mjs) | DOM tests for the editor (linkedom), run by `npm run test:dom`. |
+| [src/client.ts](../src/client.ts) | Worker requests that always resolve to a `Result`, live clock and desktop zone, reply-ID minting, draft reconciliation. |
+| [src/panel.tsx](../src/panel.tsx) | Narrow sidebar panel, Orca components only, on bounded `listDecisionPage` pages. |
+| [src/review.ts](../src/review.ts) | Wide review tab and Inbox Settings in one isolated custom editor (plain DOM), on worker requests. |
+| [src/inbox.test.tsx](../src/inbox.test.tsx) | Orca-runner tests for the model and the panel against controlled worker answers. |
+| [scripts/dom-smoke.mjs](../scripts/dom-smoke.mjs) | DOM scenarios for the editor (linkedom) against a recording stand-in worker, run by `npm run test:dom`. |
 
-Everything marked `DESIGN-ONLY` or `Design preview` in the code (state forcing, "Preview: …" buttons, the focused-workspace selector) is scaffolding for design review. Delete it when wiring real data.
+## Sources (phased V1, owner-approved)
+
+One queue holds two sources. Every row and review names its source in text.
+
+| | Chat decision (`source.kind: 'plugin'`, or no source on legacy rows) | Bot Item (`source.kind: 'native-item'`) |
+| --- | --- | --- |
+| What it is | A plugin-owned decision from an ordinary workspace Chat. | A read-only copy of a native Orca Bot Item. |
+| Row badge | "Chat decision", plus the four-state badge. | "Bot Item · answer in Orca", plus Orca's status ("Needs you", "In progress", "Planned", "Done", "Canceled"; any other status as reported). |
+| Needs you | Awaiting answer, or any reply undelivered. | Orca status `needs-you`. |
+| Review | Full review; reply, follow-up and retry only when listed in `actions`. | Read-only: status with "as of" time, details, options as text, and "Where to answer: answer this in Orca's Bot Items: bot …, item …". No reply, notes, retry, resolve or deep link. |
+| Workspace | Always attributed (host + workspace). | When `workspaceAttributed` is false the row appears only in **All workspaces**, labelled "No workspace attribution". |
+
+Delivery for Chat decisions keeps two facts apart. **Mail submitted** (shown with time and message ID) means Orca accepted the message for the original chat (`submitted.transport`). **Agent received** needs a receipt matching the reply, question and exact origin. On a host without a supported plugin mail sender the worker saves the answer and returns it undelivered: the review says "saved in Decision Inbox, but not delivered to the original chat", keeps the reply ID, and offers Copy (Retry only when listed in `actions`).
+
+Each source reports its own availability (`sources[]` on a page). A source that is unavailable or partial gets its own warning callout saying what still works ("… below are not affected"); it never blanks the other source. An empty list with a degraded source says "Nothing found … from the sources that could be read" instead of "You are all caught up".
 
 Run everything: `npm test` (typecheck, `orca plugin test`, `orca plugin check`, DOM tests). Orca's test runner cannot import npm packages, so DOM tests are a separate script. **Never run `npm install` in this folder**: it creates `node_modules/.bin` symlinks, and Orca refuses to install a plugin that contains a symlink or an unsafe path ("the plugin contains an unsafe file path or symlink"). The DOM script installs linkedom and compiles the editor in a temporary directory instead, and deletes it afterwards. It compiles only `src/review.ts` and its imports, so unfinished backend files do not break it. `orca plugin test` needs the `~/resources` symlink workaround on Orca 1.4.271 (the CLI resolves test hooks under `$HOME`).
 
@@ -36,7 +51,7 @@ Proposed by design and **not explicitly confirmed** by the owner: the evidence l
 
 ## Narrow panel
 
-Top to bottom: title and "N need you" badge with the settings gear; scope toggle (a `Toolbar`, arrow keys move between the two buttons); search; Include history checkbox; optional offline callout; the list.
+Top to bottom: title and "N need you" badge with the settings gear; scope (`RadioGroup`, so the selected scope is exposed); search (sent to the worker, debounced); Include history; source and load notices; the list; **Load more** while pages remain. Invalidations refresh the loaded pages in place.
 
 Each row shows: question title; project and workspace; priority badge (P0 danger, P1 warning, others neutral); relative deadline badge (danger when overdue); a state badge when the state is not Awaiting answer; a package badge; and `Blocks: …` text. Row press opens the review for that `questionId`.
 
@@ -48,18 +63,19 @@ Sort: P0 first; then overdue or due the same UTC day; then everything else. Insi
 | Empty (This workspace) | `EmptyState` "Nothing needs you in this workspace" with a **Show all workspaces** button. |
 | Empty (All workspaces) | "You are all caught up." |
 | No search match | "No matches. Try another word, or turn on Include history." |
-| Offline | Warning `Callout` over the last saved list: replies stay as drafts and send on reconnect. |
+| Refresh failed | Warning `Callout` "Showing the last loaded list" with the reason, "Nothing is sent from this list", and **Retry loading**. |
+| Source unavailable / partial | Warning `Callout` per source ("Bot Items are unavailable", "Some Bot Items could not be read", "Chat decisions are unavailable") saying what still works. |
 | Open failed | Danger `Callout` "Could not open the review tab" with the error text. |
 
 ## Wide review
 
 Layout: content column plus the Notes sidebar. Order: meta line (project, workspace, host chip when not local, priority, deadline, blocked work); title; routing note (the reply goes to the original chat, wherever the owner is); overdue alert; same-package questions with their states; Background; Recommendation; Options; Evidence; Reply; delivery strip; Source links.
 
-**Evidence.** Seven images default to one large viewer with a thumbnail row. **Compare side by side** opens two viewers: click a thumbnail for the right pane, Shift-click for the left. Each viewer has zoom out, zoom in and reset, and its own note field. Placeholders keep the real width, height and alt text. A missing or expired snapshot shows "Snapshot expired or missing" with an **Ask the agent to re-attach** action. Linked evidence is a list of external links with versions.
+**Evidence.** Seven images default to one large viewer with a thumbnail row. **Compare side by side** opens two viewers: click a thumbnail for the right pane, Shift-click for the left. Each viewer has zoom out, zoom in and reset, and its own note field. Placeholders keep the real width, height and alt text. Snapshots load through `getSnapshot`: not found shows "Snapshot expired or missing", forbidden shows "You do not have access to this snapshot", unavailable offers **Try again**. There is no re-attach action (no such operation). The single viewer with optional compare is still a proposal, not owner-signed. Linked evidence is a list of external links with versions.
 
 **Notes.** Image notes carry `evidenceId` and `version`. Selecting text in Background offers **Add note (Alt+N)**; the note stores the quote and UTF-16 start and end offsets with the question `revision`, as the contract requires. In the wide layout the new note appears in the sidebar with its field focused. Below 800px a native `<dialog>` modal collects the text. Notes are sent with the reply in one operation.
 
-**Reply.** Radio options when the question has them, plus a text field. With an option the text is `detail`; without one it is a text answer. Submit with the button or Ctrl/Cmd+Enter. An empty reply is refused with a live-region message and does not change state.
+**Reply.** Radio options when the question has them, plus a text field. With an option the text is `detail`; without one it is a text answer. Submit with the button or Ctrl/Cmd+Enter. An empty reply is refused with a live-region message and does not change state. A send acts only on the decision as drawn: if another surface recorded an answer while the owner was writing, nothing is sent, the recorded answer and receipt are shown, and the owner's text and option stay as **Your unsent answer** with **Write a follow-up from this text**, **Copy** and **Discard**. A follow-up is never composed or sent automatically.
 
 **Delivery strip.** Four steps, the current one marked `aria-current="step"`: Awaiting answer, Submitted / awaiting confirmation, Agent received, Undelivered. Undelivered shows an alert with the reason, **Retry (same reply ID, same destination)** and **Copy reply**; the reply is kept.
 
@@ -93,15 +109,14 @@ Not covered, for FE verification: selection-offset capture against the real DOM;
 | ID | Assumption | Where |
 | --- | --- | --- |
 | A1 | The focused workspace comes from `workspace.changed`; the fixture hard-codes local `studio`. | panel |
-| A2 | The review tab is a `.orca-decision` reference file opened by the worker with `editor.open` (worker-only), requested from the panel as `plugin.request` named `review.open` (`{questionId}`) or `settings.open`. Both names are design placeholders. Cross-repo opening without moving workspace focus needs desktop proof. | panel, review |
+| A2 | The review tab is a `.orca-decision` reference file opened by the worker with `editor.open` (worker-only), requested from the panel as `plugin.request` named `review.open` (`{questionId}`) or `settings.open`. These names are now the shipped requests; the worker opens a minimal reference file in the focused local workspace. Cross-repo placement without moving workspace focus still needs desktop proof. | panel, review |
 | A3 | Private snapshot bytes reach the editor through the worker. The prototype draws placeholders from metadata. | review |
 | A4 | Only `--orca-foreground` and `--orca-background` are confirmed; all other colors are derived with `color-mix`. | review |
 | A5 | A reply routes to the original Chat, including on a paired host. This is a release gate. | review |
-| A6 | Drafts, follow-ups and settings persist through the worker. The prototype keeps them in memory. | review |
+| A6 | Drafts (with compare-and-set revisions), follow-ups and settings persist through the worker. Desktop restart behaviour is unproven. | review |
 
 ## Known gaps for implementation
 
-- The editor needs a worker request for each of: open review, load decision, submit reply, retry reply, and settings read and write. Request names above are placeholders.
 - The package reply flow is per question; there is no "answer the whole package" action.
-- Offline and loading states are forced by design-preview controls only; wire them to real connectivity.
+- Desktop-only checks: real Chinese IME, click timing after typing, scroll retention, the 800px dialog, compare stacking below 640px, macOS Option+N, whether `inbox.changed` reaches the isolated editor, `data:` image CSP, panel remount.
 - Plugin load on Orca 1.4.271 from the CLI is blocked on this runtime ("Plugin service is not available"); desktop load is by Settings → Plugins → Development folders.

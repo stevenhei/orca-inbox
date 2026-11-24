@@ -1,8 +1,8 @@
 // FE-side helpers shared by the panel and the review editor: the live clock and desktop zone,
 // typed worker requests that never throw, reply-ID minting, and draft reconciliation.
 // No Orca imports: the panel passes `plugin.request` from 'orca', the editor `orca.plugin.request`.
-import type { Decision, RecordedReply } from './contract.ts'
-import type { InboxUiRequests, ReplyDraft } from './backend-protocol.ts'
+import type { Decision, Delivery, RecordedReply } from './contract.ts'
+import type { DecisionPage, DraftRecord, InboxUiRequests, ReplyDraft, SourceAvailability } from './backend-protocol.ts'
 
 /**
  * The reviewing desktop's live clock and IANA zone. Production reads the real clock and zone;
@@ -13,9 +13,14 @@ export const clock = {
   zone: (): string => Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
 }
 
-export type FeRequests = InboxUiRequests
 /** Drafts carry the per-attempt reply ID so a retry after a timeout or restart reuses it. */
 export type Draft = ReplyDraft
+/** A stored draft and its compare-and-set revision (required on every save, clears included). */
+export type StoredDraft = DraftRecord
+/** One bounded, server-searched page of minimal rows, ordered in the reviewing desktop zone. */
+export type { DecisionPage }
+/** The worker requests the FE calls, as declared by the shared protocol. */
+export type FeRequests = InboxUiRequests
 
 export type Failure = { ok: false; code: 'invalid' | 'forbidden' | 'not-found' | 'conflict' | 'unavailable'; message: string }
 export type Requester = (name: string, input?: unknown, options?: { timeoutMs?: number }) => Promise<unknown>
@@ -75,16 +80,15 @@ export const replies = (d: Decision): RecordedReply[] =>
 /**
  * Brings a stored draft in line with the recorded decision.
  *  - `sent`: the draft's reply ID is already recorded; the draft is done and should be cleared.
- *  - `superseded`: an initial draft lost to another accepted answer; it becomes a follow-up draft
- *    with no reply ID (a new attempt) so the owner's text is kept, never sent silently.
+ *  - `superseded`: an initial draft lost to another accepted answer. The draft is kept unchanged
+ *    (still an initial answer, option included) and is never converted or sent automatically; the
+ *    owner decides whether to reuse its text as a follow-up.
  *  - `keep`: nothing changed.
  */
 export function reconcile(draft: Draft, d: Decision): { kind: 'keep' | 'sent' | 'superseded'; draft: Draft | null } {
   if (draft.replyId && replies(d).some((r) => r.replyId === draft.replyId)) return { kind: 'sent', draft: null }
   if (d.answerState.state === 'answered' && (draft.kind ?? 'initial') === 'initial' && !draftIsEmpty(draft)) {
-    // A follow-up is free text: drop the option and the old attempt's ID.
-    const { replyId: _id, optionId: _opt, ...rest } = draft
-    return { kind: 'superseded', draft: { ...rest, kind: 'follow-up' } }
+    return { kind: 'superseded', draft }
   }
   return { kind: 'keep', draft }
 }
@@ -95,3 +99,11 @@ export function formatInstant(iso: string, zone: string): string {
     timeZone: zone, year: 'numeric', month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', timeZoneName: 'short'
   }).format(Date.parse(iso))
 }
+
+/** How one source answered a page: the queue is merged, but each source fails independently. */
+export type SourceStatus = SourceAvailability
+/** Per-source availability of a page; absent on older workers, meaning no per-source report. */
+export const sourcesOf = (page: DecisionPage): SourceStatus[] => page.sources ?? []
+/** Mail custody for a submitted plugin reply, when the worker reports it. */
+export const transportOf = (delivery: Delivery): { messageId: string; acceptedAt: string } | null =>
+  delivery.state === 'submitted' && delivery.transport ? delivery.transport : null

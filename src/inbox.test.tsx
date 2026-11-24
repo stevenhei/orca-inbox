@@ -2,9 +2,10 @@ import { assert, hostError, mockHost, mount, test } from 'orca/testing'
 import type { MockRequests, TestPanel } from 'orca/testing'
 import * as panel from './panel'
 import { decisions, historyExample, clock as fixtureClock, origins } from '../fixtures/decisions'
-import { dayKey, group, order, receiptMatches, shownState, visible, workspaceKey } from './model'
+import { actionsOf, dayKey, deadlineLabel, group, isActionable, nativeStatusLabel, order, receiptMatches, searchText, shownState, visible, workspaceKey } from './model'
 import { clock, reconcile } from './client'
-import type { Decision, ListDecisions } from './contract'
+import type { Decision, ListDecisions, Result } from './contract'
+import type { DecisionPage, SourceAvailability } from './backend-protocol'
 
 // Fixtures, the fixed clock and UTC are injected here only; production reads the live clock and
 // the desktop zone (see the last test).
@@ -59,8 +60,9 @@ test('drafts reconcile with the recorded answer', () => {
   assert.ok(s.state === 'answered')
   if (s.state !== 'answered') return
   assert.deepEqual(reconcile({ text: 'x', replyId: s.initial.replyId, kind: 'initial', annotations: [] }, historyExample), { kind: 'sent', draft: null })
-  const lost = reconcile({ text: 'mine', optionId: 'list', replyId: 'reply-mine', kind: 'initial', annotations: [] }, historyExample)
-  assert.deepEqual(lost, { kind: 'superseded', draft: { text: 'mine', kind: 'follow-up', annotations: [] } })
+  const mine = { text: 'mine', optionId: 'list', replyId: 'reply-mine', kind: 'initial' as const, annotations: [] }
+  const lost = reconcile(mine, historyExample)
+  assert.deepEqual(lost, { kind: 'superseded', draft: mine }, 'kept as written: never converted to a follow-up automatically')
   const awaiting = decisions.find((d) => d.questionId === 'schedule')!
   assert.equal(reconcile({ text: 'mine', replyId: 'reply-mine', kind: 'initial', annotations: [] }, awaiting).kind, 'keep')
 })
@@ -82,14 +84,27 @@ const workspaces: Record<string, { hostId: string; workspaceId: string }> = {
 }
 const ctx = (workspaceId?: string) => ({ context: workspaceId === undefined ? null : { workspaceId, branch: 'main', displayName: workspaceId, terminals: [] } })
 const ok = <T,>(value: T) => ({ ok: true as const, value })
+type PageInput = ListDecisions & { cursor?: string; timeZone?: string }
 
-/** A worker that authorizes everything in the fixtures and filters by the requested scope. */
-function worker(list: Decision[] = decisions, extra: MockRequests = {}): MockRequests {
+/**
+ * A worker stand-in that authorizes everything in the fixtures and, like the real one, filters by
+ * scope, history (shared `isActionable`) and query server-side, orders in the requested zone and
+ * answers bounded pages of `size` rows with an opaque cursor.
+ */
+function worker(list: Decision[] = decisions, extra: MockRequests = {}, size = 50, sources?: SourceAvailability[]): MockRequests {
   return {
     'workspace.resolve': ({ workspaceId }: { workspaceId: string }) =>
       workspaces[workspaceId] ? ok(workspaces[workspaceId]) : { ok: false, code: 'not-found', message: 'Unknown workspace.' },
-    listDecisions: ({ scope }: ListDecisions) => ok(list.filter((d) => scope.kind === 'all' ||
-      (d.origin.hostId === scope.workspace.hostId && d.origin.workspaceId === scope.workspace.workspaceId))),
+    listDecisionPage: ({ scope, query, includeHistory, cursor, timeZone }: PageInput) => {
+      const t = (query ?? '').toLocaleLowerCase()
+      const all = order(list.filter((d) => (scope.kind === 'all' ||
+        (d.origin.hostId === scope.workspace.hostId && d.origin.workspaceId === scope.workspace.workspaceId)) &&
+        (includeHistory || isActionable(d)) && (!t || searchText(d).includes(t))), NOW, timeZone ?? 'UTC')
+      const start = cursor ? Number(cursor.slice(2)) : 0
+      const rows = all.slice(start, start + size)
+      const page = start + size < all.length ? { rows, nextCursor: `c:${start + size}` } : { rows }
+      return ok(sources ? { ...page, sources } : page)
+    },
     'review.open': () => ok(null),
     'settings.open': () => ok(null),
     ...extra
@@ -98,18 +113,21 @@ function worker(list: Decision[] = decisions, extra: MockRequests = {}): MockReq
 const requestsOf = (view: TestPanel, name: string) =>
   view.host.callsOf('plugin.request').filter((c) => (c as { name: string }).name === name).map((c) => (c as { input: unknown }).input)
 const titles = (view: TestPanel) => view.findAll({ type: 'ListItem' }).map((e) => e.label)
+const ALL_ORDER = ['Approve the reading room route', 'Approve the reading room reset window', 'Approve the first lantern trial',
+  'Choose the catalogue layout', 'Compare seven paper model views', 'Pick a rehearsal slot']
 
 async function withPanel(requests: MockRequests, fn: (view: TestPanel) => Promise<void>) {
   const view = await mount(panel, { host: mockHost({ requests, capabilities: ['workspace:read', 'storage:own'] }) })
   try { await fn(view); assert.deepEqual(view.errors, []) } finally { await view.unmount() }
 }
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 test('panel: This workspace resolves host + workspace through the worker and lists only it', () => withPanel(worker(), async (view) => {
   assert.ok(view.find({ label: 'Finding the focused workspace' }), 'waits for the focused workspace, no guess')
-  assert.equal(requestsOf(view, 'listDecisions').length, 0)
+  assert.equal(requestsOf(view, 'listDecisionPage').length, 0)
   await view.emit('workspace.changed', ctx('studio-local'))
   assert.deepEqual(requestsOf(view, 'workspace.resolve'), [{ workspaceId: 'studio-local' }])
-  assert.deepEqual(requestsOf(view, 'listDecisions').at(-1), { scope: { kind: 'workspace', workspace: studio }, includeHistory: true })
+  assert.deepEqual(requestsOf(view, 'listDecisionPage').at(-1), { scope: { kind: 'workspace', workspace: studio }, includeHistory: false, timeZone: 'UTC' })
   assert.deepEqual(titles(view), ['Compare seven paper model views', 'Pick a rehearsal slot'])
   assert.ok(!view.find({ label: 'Approve the first lantern trial' }), 'paired studio with the same workspace ID is excluded')
   assert.ok(view.find({ text: '2 need you' }))
@@ -117,60 +135,161 @@ test('panel: This workspace resolves host + workspace through the worker and lis
 
 test('panel: All workspaces survives focus changes; This workspace follows focus', () => withPanel(worker(), async (view) => {
   await view.emit('workspace.changed', ctx('studio-local'))
-  await view.press({ text: 'All workspaces' })
-  assert.deepEqual(requestsOf(view, 'listDecisions').at(-1), { scope: { kind: 'all' }, includeHistory: true })
-  assert.deepEqual(titles(view), ['Approve the reading room route', 'Approve the reading room reset window', 'Approve the first lantern trial',
-    'Choose the catalogue layout', 'Compare seven paper model views', 'Pick a rehearsal slot'])
+  await view.select({ label: 'Scope' }, 'all')
+  assert.deepEqual(requestsOf(view, 'listDecisionPage').at(-1), { scope: { kind: 'all' }, includeHistory: false, timeZone: 'UTC' })
+  assert.deepEqual(titles(view), ALL_ORDER)
   await view.emit('workspace.changed', ctx('library-local'))
   assert.equal(titles(view).length, 6, 'All workspaces stays selected after a focus change')
-  await view.press({ text: 'This workspace' })
+  await view.select({ label: 'Scope' }, 'workspace')
   assert.deepEqual(titles(view), ['Approve the reading room route', 'Approve the reading room reset window', 'Choose the catalogue layout'])
   assert.ok(view.find({ text: /Overdue 25h/ }), 'relative deadline from the injected clock')
-  assert.ok(view.findAll({ text: 'Package · 2 questions' }).length === 2, 'package badge on each question of the package')
+  assert.equal(view.findAll({ text: 'Package · 2 shown' }).length, 2, 'package badge says "shown" while history is filtered')
 }))
 
-test('panel: search and history filter within the selected scope', () => withPanel(worker(decisions.map((d) => d.questionId === 'layout' ? historyExample : d)), async (view) => {
+test('panel: bounded pages load more in server order without duplicates', () => withPanel(worker(decisions, {}, 4), async (view) => {
+  await view.select({ label: 'Scope' }, 'all')
+  assert.deepEqual(titles(view), ALL_ORDER.slice(0, 4))
+  assert.ok(view.find({ text: '4+ need you' }), 'count marked partial while more pages exist')
+  await view.press({ text: 'Load more' })
+  assert.deepEqual(requestsOf(view, 'listDecisionPage').at(-1), { scope: { kind: 'all' }, includeHistory: false, timeZone: 'UTC', cursor: 'c:4' })
+  assert.deepEqual(titles(view), ALL_ORDER)
+  assert.ok(!view.find({ text: 'Load more' }))
+  assert.ok(view.find({ text: '6 need you' }))
+}))
+
+test('panel: the scope control exposes its selected value (radio group)', () => withPanel(worker(), async (view) => {
+  await view.emit('workspace.changed', ctx('studio-local'))
+  assert.equal(view.find({ label: 'Scope' })?.type, 'RadioGroup')
+  assert.equal(view.valueOf({ label: 'Scope' }), 'workspace')
+  await view.select({ label: 'Scope' }, 'all')
+  assert.equal(view.valueOf({ label: 'Scope' }), 'all')
+}))
+
+test('panel: invalidations keep pages loaded with Load more and leave unchanged rows alone', () => withPanel(worker(decisions, {}, 4), async (view) => {
+  await view.select({ label: 'Scope' }, 'all')
+  await view.press({ text: 'Load more' })
+  assert.equal(titles(view).length, 6)
+  const before = requestsOf(view, 'listDecisionPage').length
+  // A burst of invalidations (draft saves while typing in a review) coalesces into one refresh.
+  await view.post('inbox.changed', {}); await view.post('inbox.changed', {}); await view.post('inbox.changed', {})
+  await wait(200); await view.settled()
+  assert.deepEqual(titles(view), ALL_ORDER, 'still every loaded row, in order')
+  assert.equal(requestsOf(view, 'listDecisionPage').length - before, 2, 'one refresh re-reading both loaded pages')
+  assert.ok(!view.find({ text: 'Load more' }))
+}))
+
+test('panel: while searching, the count says it covers matches only', () => withPanel(worker(), async (view) => {
+  await view.select({ label: 'Scope' }, 'all')
+  await view.type({ label: 'Search' }, 'reading room')
+  await wait(300); await view.settled()
+  assert.ok(view.find({ text: '2 matching need you' }))
+}))
+
+test('deadline: minutes past is overdue, not "Due in 0h"', () => {
+  const stage = decisions.find((d) => d.questionId === 'stage')!
+  assert.deepEqual(deadlineLabel({ ...stage, deadline: '2030-06-14T11:50:00Z' }, NOW), { text: 'Overdue under 1h', overdue: true })
+  assert.deepEqual(deadlineLabel({ ...stage, deadline: '2030-06-14T12:10:00Z' }, NOW), { text: 'Due in under 1h', overdue: false })
+  assert.deepEqual(deadlineLabel({ ...stage, deadline: '2030-06-13T11:00:00Z' }, NOW), { text: 'Overdue 25h', overdue: true })
+  assert.deepEqual(deadlineLabel({ ...stage, deadline: '2030-06-16T12:00:00Z' }, NOW), { text: 'Due in 2d', overdue: false })
+})
+
+test('panel: search and history are sent to the worker; rows are not re-searched locally', () => withPanel(worker(decisions.map((d) => d.questionId === 'layout' ? historyExample : d)), async (view) => {
   await view.emit('workspace.changed', ctx('library-local'))
   await view.type({ label: 'Search' }, 'matte sample')
+  await wait(300)
+  await view.settled()
+  assert.deepEqual(requestsOf(view, 'listDecisionPage').at(-1), { scope: { kind: 'workspace', workspace: workspaces['library-local'] }, query: 'matte sample', includeHistory: false, timeZone: 'UTC' })
   assert.ok(view.find({ label: 'No matches' }))
   await view.toggle({ label: 'Include history' })
+  assert.equal((requestsOf(view, 'listDecisionPage').at(-1) as PageInput).includeHistory, true)
   assert.deepEqual(titles(view), ['Choose the catalogue layout'])
   assert.ok(view.find({ text: 'Agent received' }))
 }))
+
+test('panel: rows from the worker are trusted, not re-filtered by search text', () => withPanel(worker(decisions, {
+  // A projected row has no searchable body text; the worker says it matched.
+  listDecisionPage: () => ok({ rows: [{ ...decisions[0], background: '', recommendation: '', options: [] }] })
+}), async (view) => {
+  await view.select({ label: 'Scope' }, 'all')
+  await view.type({ label: 'Search' }, 'Tuesday')
+  await wait(300)
+  await view.settled()
+  assert.deepEqual(titles(view), ['Pick a rehearsal slot'])
+}))
+
+test('panel: a failed follow-up keeps its question in the default queue', () => {
+  const s = historyExample.answerState
+  assert.ok(s.state === 'answered')
+  if (s.state !== 'answered') return
+  const failed: Decision = { ...historyExample, answerState: { ...s, followUps: [{ ...s.initial, replyId: 'layout-follow-1', kind: 'follow-up', answer: { kind: 'text', text: 'Check the list view.' }, delivery: { state: 'undelivered', reason: 'closed-origin' } }] } }
+  return withPanel(worker(decisions.map((d) => d.questionId === 'layout' ? failed : d)), async (view) => {
+    await view.emit('workspace.changed', ctx('library-local'))
+    assert.ok(titles(view).includes('Choose the catalogue layout'), 'shown with history off')
+    assert.ok(view.find({ text: 'Agent received' }), 'canonical initial state unchanged')
+    assert.ok(view.find({ text: 'Follow-up delivery failed' }), 'the failed follow-up is flagged without claiming a count')
+    assert.ok(view.find({ text: '3 need you' }))
+  })
+})
+
+test('panel: a late workspace.resolve answer cannot override a newer focus', async () => {
+  let release: () => void = () => {}
+  const slow = new Promise<void>((r) => { release = r })
+  await withPanel(worker(decisions, {
+    'workspace.resolve': async ({ workspaceId }: { workspaceId: string }) => {
+      if (workspaceId === 'studio-local') await slow
+      return ok(workspaces[workspaceId])
+    }
+  }), async (view) => {
+    // The harness settles outstanding requests inside each emit, so start both focus changes
+    // before releasing the slow (earlier) resolve; the timer is a backstop, never a deadlock.
+    const backstop = setTimeout(() => release(), 50)
+    const first = view.emit('workspace.changed', ctx('studio-local'))
+    const second = view.emit('workspace.changed', ctx('library-local'))
+    await wait(5)
+    release(); clearTimeout(backstop)
+    await Promise.all([first, second]); await view.settled()
+    const resolved = requestsOf(view, 'workspace.resolve')
+    assert.deepEqual(resolved, [{ workspaceId: 'studio-local' }, { workspaceId: 'library-local' }], 'the earlier focus answered last')
+    assert.deepEqual(titles(view), ['Approve the reading room route', 'Approve the reading room reset window', 'Choose the catalogue layout'])
+  })
+})
 
 test('panel: no focused workspace or an unresolvable host shows a state, never a guessed scope', () => withPanel(worker(), async (view) => {
   await view.emit('workspace.changed', ctx(undefined))
   assert.ok(view.find({ label: 'No workspace is focused' }))
   await view.emit('workspace.changed', ctx('ambiguous'))
   assert.ok(view.find({ label: 'Could not identify this workspace' }))
-  assert.equal(requestsOf(view, 'listDecisions').length, 0, 'nothing listed for an unresolved workspace')
+  assert.equal(requestsOf(view, 'listDecisionPage').length, 0, 'nothing listed for an unresolved workspace')
   await view.press({ text: 'Show all workspaces' })
   assert.equal(titles(view).length, 6)
 }))
 
 test('panel: worker failures show truthfully, with no fixture fallback', async () => {
-  await withPanel({ 'workspace.resolve': ok(studio), listDecisions: () => { throw hostError('unavailable', 'Worker stopped.') } }, async (view) => {
+  await withPanel({ 'workspace.resolve': ok(studio), listDecisionPage: () => { throw hostError('unavailable', 'Worker stopped.') } }, async (view) => {
     await view.emit('workspace.changed', ctx('studio-local'))
     assert.ok(view.find({ text: /The Decision Inbox is unavailable\. Worker stopped\./ }))
     assert.equal(titles(view).length, 0, 'no rows without worker data')
   })
-  await withPanel({ 'workspace.resolve': ok(studio), listDecisions: { ok: false, code: 'forbidden', message: 'Owner only.' } }, async (view) => {
+  await withPanel({ 'workspace.resolve': ok(studio), listDecisionPage: { ok: false, code: 'forbidden', message: 'Owner only.' } }, async (view) => {
     await view.emit('workspace.changed', ctx('studio-local'))
     assert.ok(view.find({ text: /You do not have access\. Owner only\./ }))
   })
   await withPanel({}, async (view) => {
-    await view.press({ text: 'All workspaces' })
-    assert.ok(view.find({ text: /does not provide “listDecisions”/ }), 'missing handler reported')
+    await view.select({ label: 'Scope' }, 'all')
+    assert.ok(view.find({ text: /does not provide “listDecisionPage”/ }), 'missing handler reported')
     assert.equal(titles(view).length, 0)
   })
 })
 
 test('panel: a failed refresh keeps and labels the last loaded list', async () => {
   let up = true
-  await withPanel(worker(decisions, { listDecisions: ({ scope }: ListDecisions) => up ? ok(decisions.filter((d) => scope.kind === 'all')) : { ok: false, code: 'unavailable', message: 'Disconnected.' } }), async (view) => {
-    await view.press({ text: 'All workspaces' })
+  const w = worker()
+  const page = w.listDecisionPage as (i: PageInput) => Result<DecisionPage>
+  await withPanel({ ...w, listDecisionPage: (i: PageInput): Result<DecisionPage> => up ? page(i) : { ok: false, code: 'unavailable', message: 'Disconnected.' } }, async (view) => {
+    await view.select({ label: 'Scope' }, 'all')
     up = false
     await view.post('inbox.changed', {})
+    await wait(200); await view.settled()
     assert.equal(titles(view).length, 6)
     assert.ok(view.find({ label: 'Showing the last loaded list' }))
     up = true
@@ -186,6 +305,7 @@ test('panel: inbox.changed refetches through the worker', async () => {
     assert.deepEqual(titles(view), ['Compare seven paper model views'])
     list.push(decisions.find((d) => d.questionId === 'schedule')!)
     await view.post('inbox.changed', {})
+    await wait(200); await view.settled() // invalidations coalesce for 150 ms
     assert.deepEqual(titles(view), ['Compare seven paper model views', 'Pick a rehearsal slot'])
   })
 })
@@ -210,6 +330,153 @@ test('panel: settings open through the worker and report failure', () => withPan
   assert.equal(requestsOf(view, 'settings.open').length, 1)
   assert.ok(view.find({ label: 'Could not open Inbox settings' }))
 }))
+
+
+// ---- sources: native Bot Items (read-only) and plugin-owned Chat decisions -------------------------
+// Test-only native rows built from the shared fixtures, using the documented source fields.
+const nativeRow = (over: Partial<Decision> & { status?: string; attributed?: boolean; id: string; title: string }): Decision => {
+  const { status = 'needs-you', attributed = true, id, title, ...rest } = over
+  return {
+    ...decisions.find((d) => d.questionId === 'schedule')!, questionId: id, title, packageId: `native-${id}`,
+    ...(attributed ? {} : { origin: { hostId: 'local', workspaceId: '', sessionId: '' }, projectName: '', workspaceName: '' }),
+    source: { kind: 'native-item', workspaceAttributed: attributed, botName: 'Release bot', itemLabel: '#12', itemStatus: status, observedAt: '2030-06-14T11:30:00Z' },
+    actions: [], ...rest
+  }
+}
+const nativeHere = nativeRow({ id: 'native-here', title: 'Ship the lantern build?' })
+const nativeNowhere = nativeRow({ id: 'native-nowhere', title: 'Rotate the signing key?', attributed: false })
+const nativeDone = nativeRow({ id: 'native-done', title: 'Archive old builds?', status: 'done' })
+const mixed = [...decisions, nativeHere, nativeNowhere, nativeDone]
+const allAvailable: SourceAvailability[] = [{ source: 'plugin', state: 'available' }, { source: 'native-item', state: 'available' }]
+
+test('model: native items are actionable only while Orca reports needs-you, and offer no actions', () => {
+  assert.equal(isActionable(nativeHere), true)
+  assert.equal(isActionable(nativeDone), false)
+  assert.deepEqual(actionsOf(nativeHere), [])
+  assert.deepEqual(actionsOf(decisions[0]), ['reply'], 'legacy plugin row without actions gets plugin defaults')
+  assert.equal(nativeStatusLabel('in-progress'), 'In progress')
+  assert.equal(nativeStatusLabel('blocked-on-ci'), 'blocked-on-ci', 'unrecognized status shown as reported')
+  assert.equal(nativeStatusLabel(undefined), 'Status not reported')
+  assert.deepEqual(ids(visible([nativeNowhere], { ...base, scope: 'workspace' })), [], 'no workspace attribution: never in a workspace scope')
+  assert.deepEqual(ids(visible([nativeNowhere], base)), ['native-nowhere'])
+})
+
+test('panel: one queue labels each source; unattributed Bot Items appear only in All workspaces', () => withPanel(worker(mixed, {}, 50, allAvailable), async (view) => {
+  await view.emit('workspace.changed', ctx('studio-local'))
+  assert.deepEqual(titles(view), ['Compare seven paper model views', 'Ship the lantern build?', 'Pick a rehearsal slot'])
+  assert.ok(view.find({ text: 'Bot Item · answer in Orca' }), 'native row says where it is answered')
+  assert.ok(view.findAll({ text: 'Chat decision' }).length === 2, 'plugin rows labelled')
+  assert.ok(view.find({ text: 'Needs you' }), 'native status from Orca')
+  assert.ok(!titles(view).includes('Rotate the signing key?'), 'unattributed item not in This workspace')
+  assert.ok(view.find({ text: '3 need you' }))
+  await view.select({ label: 'Scope' }, 'all')
+  assert.ok(titles(view).includes('Rotate the signing key?'))
+  assert.ok(view.find({ label: 'Rotate the signing key?' })?.props.description === 'Release bot · item #12 · No workspace attribution')
+  assert.ok(!titles(view).includes('Archive old builds?'), 'done native item is history')
+  assert.ok(!view.find({ label: /are unavailable|could not be read/ }), 'no notice when both sources are available')
+}))
+
+test('panel: Bot Items unavailable keeps Chat decisions and says what still works', () => withPanel(worker(decisions, {}, 50,
+  [{ source: 'plugin', state: 'available' }, { source: 'native-item', state: 'unavailable', message: 'No authorized Bot Items reader on this host.' }]), async (view) => {
+  await view.emit('workspace.changed', ctx('studio-local'))
+  assert.deepEqual(titles(view), ['Compare seven paper model views', 'Pick a rehearsal slot'], 'Chat decisions are not blanked')
+  assert.ok(view.find({ label: 'Bot Items are unavailable' }))
+  assert.ok(view.find({ text: /No authorized Bot Items reader on this host\. Check Bot Items in Orca directly\. Chat decisions below are not affected\./ }))
+}))
+
+test('panel: Chat decisions unavailable still shows read-only Bot Items', () => withPanel(worker([nativeHere], {}, 50,
+  [{ source: 'plugin', state: 'unavailable', message: 'Authenticated owner access is unavailable on this Orca host.' }, { source: 'native-item', state: 'available' }]), async (view) => {
+  await view.emit('workspace.changed', ctx('studio-local'))
+  assert.deepEqual(titles(view), ['Ship the lantern build?'])
+  assert.ok(view.find({ label: 'Chat decisions are unavailable' }))
+  assert.ok(view.find({ text: /cannot be answered here until this is fixed; existing drafts are kept\. Bot Items below are not affected\./ }))
+}))
+
+test('panel: partial Bot Items and an empty list say only what could be checked', () => withPanel(worker([], {}, 50,
+  [{ source: 'plugin', state: 'available' }, { source: 'native-item', state: 'partial', message: 'One bot could not be read.' }]), async (view) => {
+  await view.select({ label: 'Scope' }, 'all')
+  assert.ok(view.find({ label: 'Some Bot Items could not be read' }))
+  assert.ok(view.find({ label: 'Nothing found in all workspaces from the sources that could be read' }), 'no "all caught up" claim')
+  assert.ok(!view.find({ text: 'You are all caught up.' }))
+}))
+
+// ---- N1: refresh racing Load more (deterministic orderings) -----------------------------------------
+/** A paged worker whose next matching request is held until `release()`. */
+function heldWorker(size = 4) {
+  const w = worker(decisions, {}, size)
+  const page = w.listDecisionPage as (i: PageInput) => Result<DecisionPage>
+  let hold: ((i: PageInput) => boolean) | null = null
+  let release: () => void = () => {}
+  const requests: MockRequests = { ...w, listDecisionPage: (i: PageInput) => {
+    if (hold && hold(i)) { hold = null; return new Promise<Result<DecisionPage>>((r) => { release = () => r(page(i)) }) }
+    return page(i)
+  } }
+  return { requests, holdNext: (f: (i: PageInput) => boolean) => { hold = f }, release: () => release() }
+}
+
+test('panel: a refresh during Load more keeps the requested page and clears the loading state', async () => {
+  const h = heldWorker(2) // three pages, so Load more stays available afterwards
+  await withPanel(h.requests, async (view) => {
+    await view.select({ label: 'Scope' }, 'all')
+    h.holdNext((i) => !!i.cursor)
+    const more = view.press({ text: 'Load more' }) // in flight, held
+    await wait(10)
+    const inval = view.post('inbox.changed', {})
+    await wait(250) // the refresh runs and reads page 1 plus the page Load more asked for
+    h.release() // the superseded Load more answers last
+    await Promise.all([more, inval]); await view.settled()
+    assert.deepEqual(titles(view), ALL_ORDER.slice(0, 4), 'the requested page is not lost')
+    assert.ok(!view.find({ text: 'Loading more…' }), 'loading state cleared')
+    const btn = view.find({ text: 'Load more' })
+    assert.ok(btn && !btn.disabled, 'Load more is usable again')
+    await view.press({ text: 'Load more' })
+    assert.deepEqual(titles(view), ALL_ORDER)
+  })
+})
+
+test('panel: Load more during a refresh wins, then the refresh re-runs', async () => {
+  const h = heldWorker()
+  await withPanel(h.requests, async (view) => {
+    await view.select({ label: 'Scope' }, 'all')
+    h.holdNext((i) => !i.cursor) // the refresh's first page is held
+    const inval = view.post('inbox.changed', {})
+    await wait(200)
+    const more = view.press({ text: 'Load more' })
+    await wait(10)
+    h.release() // the superseded refresh answers last and must not overwrite
+    await Promise.all([inval, more]); await wait(250); await view.settled()
+    assert.deepEqual(titles(view), ALL_ORDER)
+    assert.ok(!view.find({ text: 'Loading more…' }))
+    const pages = requestsOf(view, 'listDecisionPage') as PageInput[]
+    assert.equal(pages.at(-1)?.cursor, 'c:4', 'the re-run refresh re-read both pages')
+  })
+})
+
+test('panel: a failing refresh that supersedes Retry loading leaves Retry available', async () => {
+  let up = true
+  const w = worker()
+  const page = w.listDecisionPage as (i: PageInput) => Result<DecisionPage>
+  let release: () => void = () => {}
+  let holdRetry = false
+  await withPanel({ ...w, listDecisionPage: (i: PageInput) => {
+    if (holdRetry) { holdRetry = false; return new Promise<Result<DecisionPage>>((r) => { release = () => r(page(i)) }) }
+    return up ? page(i) : { ok: false, code: 'unavailable', message: 'Disconnected.' }
+  } }, async (view) => {
+    await view.select({ label: 'Scope' }, 'all')
+    up = false
+    await view.post('inbox.changed', {}); await wait(200); await view.settled()
+    assert.ok(view.find({ text: 'Retry loading' }))
+    holdRetry = true
+    const retry = view.press({ text: 'Retry loading' })
+    await wait(10)
+    const inval = view.post('inbox.changed', {})
+    await wait(250)
+    release()
+    await Promise.all([retry, inval]); await view.settled()
+    assert.ok(view.find({ text: 'Retry loading' }), 'not stranded in a loading state')
+    assert.equal(titles(view).length, 6, 'last loaded list still shown')
+  })
+})
 
 test('production clock is the live clock and the desktop zone', () => {
   const t = live.now()

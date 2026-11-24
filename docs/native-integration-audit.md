@@ -1,6 +1,6 @@
-# Native Orca integration audit
+# Phase 2 native Orca integration audit
 
-The Inbox V1 release depends on Orca providing authenticated submission from ordinary workspace Chats, one authoritative owner-answer operation shared with native **Needs you**, and verifiable receipt of each reply in its original Chat. Desktop and paired-server acceptance is deferred by the owner. This audit used command discovery and source inspection.
+The original native parity plan depended on Orca providing authenticated submission from ordinary workspace Chats, one authoritative owner-answer operation shared with native **Needs you**, and verifiable receipt of each reply in its original Chat. Desktop and paired-server acceptance is deferred by the owner. This historical audit used command discovery and source inspection. See the [current phased V1 scope](v1-spec.md) for the two independent sources.
 
 ## Evidence and versions
 

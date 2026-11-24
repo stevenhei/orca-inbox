@@ -1,6 +1,6 @@
 // Pure view-model for the Decision Inbox. No Orca imports, so FE tests and the worker can share it.
 // Types come from the shared contract; nothing here invents new domain shapes.
-import type { Decision, Priority, RecordedReply, Workspace } from './contract.ts'
+import type { Decision, DecisionAction, DecisionSource, Priority, RecordedReply, Workspace } from './contract.ts'
 
 /** What the owner sees for a question. Four distinct states; never merged. */
 export type ShownState = 'awaiting-answer' | 'submitted' | 'agent-received' | 'undelivered'
@@ -33,10 +33,52 @@ export function shownState(d: Decision): ShownState {
   return d.answerState.state === 'awaiting-answer' ? 'awaiting-answer' : replyState(d.answerState.initial, d)
 }
 
-/** Design decision 1: only Awaiting answer and Undelivered need the owner. The rest is history. */
+/** Every recorded reply that was not delivered: the initial answer or any follow-up. */
+export const undeliveredReplies = (d: Decision): RecordedReply[] =>
+  d.answerState.state === 'answered'
+    ? [d.answerState.initial, ...d.answerState.followUps].filter((r) => r.delivery.state === 'undelivered')
+    : []
+
+// ---- sources -------------------------------------------------------------------------------------
+// One queue, two sources (agreed with the BE worker; optional on legacy rows):
+//  * plugin: a plugin-owned decision from an ordinary workspace Chat. The owner answers here
+//    (submitReply); the reply goes to that Chat by mail.
+//  * native-item: a read-only mirror of a native Orca Bot Item. It is answered in Orca's own Bot
+//    Items view; the Inbox has no owner write, deep link or resolve for it.
+export type { DecisionAction, DecisionSource } from './contract.ts'
+export type NativeSource = Extract<DecisionSource, { kind: 'native-item' }>
+
+/** Absent on legacy rows, which are plugin-owned. */
+export const sourceOf = (d: Decision): DecisionSource => d.source ?? { kind: 'plugin' }
+export const nativeOf = (d: Decision): NativeSource | null => { const s = sourceOf(d); return s.kind === 'native-item' ? s : null }
+
+const NATIVE_STATUS: Record<string, string> = { 'needs-you': 'Needs you', 'in-progress': 'In progress', planned: 'Planned', done: 'Done', canceled: 'Canceled' }
+/** Recognized native statuses get a label; any other status is shown as Orca reported it. */
+export const nativeStatusLabel = (status?: string) => (status ? NATIVE_STATUS[status] ?? status : 'Status not reported')
+
+/**
+ * The actions the worker supports for this row. Native items have none. Legacy plugin rows
+ * without the field get the plugin defaults for their state.
+ */
+export function actionsOf(d: Decision): DecisionAction[] {
+  if (nativeOf(d)) return []
+  const declared = d.actions
+  if (declared) return declared
+  if (d.answerState.state === 'awaiting-answer') return ['reply']
+  return ['follow-up', ...(undeliveredReplies(d).length ? ['retry' as const] : [])]
+}
+
+/**
+ * Design decision 1: Awaiting answer and Undelivered need the owner; the rest is history.
+ * A native Bot Item needs the owner while Orca reports it as needs-you (answered in Orca).
+ * Undelivered means any reply, so a failed follow-up keeps its question in the default queue
+ * even after the initial answer was received. The canonical (initial) state is unchanged.
+ * Shared with the worker, which applies the same rule to server-side filtering.
+ */
 export const isActionable = (d: Decision) => {
-  const s = shownState(d)
-  return s === 'awaiting-answer' || s === 'undelivered'
+  const native = nativeOf(d)
+  if (native) return native.itemStatus === 'needs-you'
+  return shownState(d) === 'awaiting-answer' || undeliveredReplies(d).length > 0
 }
 
 /** Scope identity is host + workspace: a paired host can reuse a workspace ID. */
@@ -85,7 +127,7 @@ export function visible(all: readonly Decision[], q: Query): Decision[] {
   const t = q.term.trim().toLocaleLowerCase()
   return order(
     all.filter((d) =>
-      (q.scope === 'all' || sameWorkspace(d.origin, q.current)) &&
+      (q.scope === 'all' || (nativeOf(d)?.workspaceAttributed !== false && sameWorkspace(d.origin, q.current))) &&
       (q.history || isActionable(d)) &&
       (!t || searchText(d).includes(t))),
     q.now,
@@ -96,9 +138,12 @@ export function visible(all: readonly Decision[], q: Query): Decision[] {
 /** "Overdue 21h", "Due in 3h", "Due in 2d". Full timestamp belongs to the wide review. */
 export function deadlineLabel(d: Decision, now: number): { text: string; overdue: boolean } | null {
   if (!d.deadline) return null
-  const h = Math.round((Date.parse(d.deadline) - now) / 3_600_000)
-  if (h < 0) return { text: `Overdue ${-h}h`, overdue: true }
-  return { text: h < 24 ? `Due in ${h}h` : `Due in ${Math.round(h / 24)}d`, overdue: false }
+  // Overdue follows the sign of the raw difference, so a deadline minutes ago is never "Due in 0h".
+  const ms = Date.parse(d.deadline) - now
+  const h = Math.round(Math.abs(ms) / 3_600_000)
+  const span = h < 1 ? 'under 1h' : `${h}h`
+  if (ms < 0) return { text: `Overdue ${span}`, overdue: true }
+  return { text: h < 24 ? `Due in ${span}` : `Due in ${Math.round(h / 24)}d`, overdue: false }
 }
 
 /** Questions that share a package (context and evidence), each still its own row and receipt. */

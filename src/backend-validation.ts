@@ -25,9 +25,9 @@ export function string(value: unknown, name: string, allowEmpty = false): string
   return value
 }
 
-export function id(value: unknown, name: string): string {
+export function id(value: unknown, name: string, maxLength = 256): string {
   const result = string(value, name)
-  requireInput(result.length <= 256 && !/[\u0000-\u001f\u007f]/u.test(result), `Invalid ${name}.`)
+  requireInput(result.length <= maxLength && !/[\u0000-\u001f\u007f]/u.test(result), `Invalid ${name}.`)
   return result
 }
 
@@ -97,10 +97,10 @@ function evidenceRef(value: unknown) {
   return { evidenceId: id(e.evidenceId, 'evidenceId'), version: integer(e.version, 'evidence version') }
 }
 
-export function annotations(value: unknown): Annotation[] {
+export function annotations(value: unknown, allowEmptyText = false): Annotation[] {
   return list(value, 'annotations').map((entry): Annotation => {
     const note = object(entry)
-    const text = string(note.text, 'annotation text')
+    const text = string(note.text, 'annotation text', allowEmptyText)
     if (note.kind === 'image') return { kind: note.kind, text, evidence: evidenceRef(note.evidence) }
     requireInput(note.kind === 'selection', 'Invalid annotation kind.')
     const start = integer(note.start, 'start', 0)

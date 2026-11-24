@@ -1,6 +1,16 @@
 # Orca Decision Inbox V1
 
-Local implementation scaffold for owner decisions and reviews in desktop Orca. The sidebar, worker, and file-backed review entries are placeholders. The shared contract and synthetic fixtures support parallel FE and BE work after the native spike and owner design decisions.
+Decision Inbox organizes authorized Orca Bot Items and plugin-owned decisions from ordinary workspace Chats. Read native Items in the merged queue and answer them in Orca. Save plugin-owned answers in the Inbox. Mail delivery requires a legitimate Orca plugin sender.
+
+## Use on an Orca desktop
+
+Load the folder as an approved trusted plugin using `orca plugin install .` and Orca's approval flow. Open its panel with `orca plugin open decision-inbox --panel inbox`. Review and settings tabs use reference files under `.orca-decision-inbox/` in the current local workspace. The references contain only a question ID or the settings selector. The worker uses the host-installed Orca CLI where available. For a local workspace Chat, follow the [agent skill](agent/decision-inbox/SKILL.md) and run:
+
+```sh
+node /path/to/orca-inbox/agent/decision-inbox/inbox.mjs submit INPUT.json
+```
+
+Put the emitted line in the Chat's visible assistant response, then open or refresh the desktop Inbox. On this release path only the local plugin can save the answer. On the inspected host the Inbox reports mail unavailable and saves the reply as undelivered. An Orca mail acceptance, when implemented on a supported surface, will leave the reply awaiting explicit acknowledgement.
 
 ## File map
 
@@ -8,7 +18,7 @@ Local implementation scaffold for owner decisions and reviews in desktop Orca. T
 | --- | --- |
 | [AGENTS.md](AGENTS.md) | Session ownership, role authority, and language |
 | [Approved V1 scope](docs/v1-spec.md) | Product behavior and release gate |
-| [Implementation handoff](docs/implementation-handoff.md) | Work order, upstream references, native spike, and acceptance matrix |
+| [Implementation handoff](docs/implementation-handoff.md) | Phase 1 operation, Phase 2 context, and acceptance matrix |
 | [orca-plugin.json](orca-plugin.json) | Sidebar, worker, and isolated custom editor contributions |
 | [Sidebar](src/panel.tsx), [worker](src/worker.ts), [review](src/review.ts) | Minimal Orca entry points |
 | [Shared contract](src/contract.ts) | Domain, operation shapes, origin, and delivery states |
@@ -32,6 +42,4 @@ orca plugin check . --json
 
 ## Current evidence
 
-Orca CLI 1.4.264 generated the local typings. TypeScript 5.9.3 type checking and manifest validation passed. The Orca Node runner passed two tests covering sidebar mount and shared fixture references. `orca plugin check` rendered the sidebar in its local harness and checked the editor entry with zero issues or warnings. The engine minimum `>=1.4.248` follows the installed isolated editor template and Components Gallery reference. Generated SDK typings live under the ignored `.orca/` directory.
-
-`orca plugin list --json` returned `runtime_error` with “Plugin service is not available on this runtime.” Desktop loading, cross-repo review, authenticated Chat submission, native Needs you state synchronization, durable reply handling, and original Chat receipt are unverified. The [handoff](docs/implementation-handoff.md) defines the minimum native proof required before release.
+The host-supplied Orca CLI 1.4.271 can read authorized Bot Items and ordinary Chat records. The PATH CLI 1.4.264 lacks Bot Item commands. The inspected headless runtime did not expose the plugin service or an approved plugin mail sender. The disposable ordinary-Chat transport control used a genuine Chat sender. Desktop and paired acceptance are pending. See the [handoff](docs/implementation-handoff.md) and [Phase 2 audit](docs/native-integration-audit.md).
