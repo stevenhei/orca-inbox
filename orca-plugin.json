@@ -1,0 +1,20 @@
+{
+  "manifestVersion": 2,
+  "id": "orca-decision-inbox",
+  "name": "Decision Inbox",
+  "version": "0.1.0",
+  "description": "Development scaffold for owner decisions and reviews.",
+  "engines": { "orca": ">=1.4.248" },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "panels": [
+      { "id": "inbox", "title": "Decision Inbox", "icon": "flag", "entry": "src/panel.tsx", "ui": "components" }
+    ],
+    "customEditors": [
+      { "id": "review", "title": "Decision Review", "extensions": [".orca-decision"], "entry": "src/review.ts", "frame": "isolated" }
+    ]
+  },
+  "capabilities": []
+}
