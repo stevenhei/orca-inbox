@@ -1,7 +1,8 @@
 import type { OrcaWorkerApi, PanelRequestContext } from 'orca/worker'
-import { jsonBytes, type AgentCaller, type InboxBackend, type InboxBoundary } from './backend.ts'
+import { decisionSourceMetadata, jsonBytes, type AgentCaller, type InboxBackend, type InboxBoundary } from './backend.ts'
 import type { OwnerCaller, SourceAvailability } from './backend-protocol.ts'
 import type { AcknowledgeReply, Decision, Priority, Workspace } from './contract.ts'
+import { clearLocalSnapshots, isLocalSnapshotId, readLocalSnapshot } from './local-snapshot.mjs'
 import { hintPattern } from './backend-local.mjs'
 import { InboxError, submission } from './backend-validation.ts'
 
@@ -33,13 +34,25 @@ export async function desktopOwner(orca: OrcaWorkerApi, context: PanelRequestCon
 export function localInboxBoundary(cli: Cli): InboxBoundary {
   return {
     async grantSubmission(caller, input) {
-      if (caller.origin.hostId !== 'local' || caller.policyOwnerId !== localOwner ||
-        input.evidence.some(item => item.kind === 'image-snapshot')) {
-        throw new InboxError('forbidden', 'This Chat path supports link evidence. Private snapshot upload is unavailable.')
+      if (caller.origin.hostId !== 'local' || caller.policyOwnerId !== localOwner) {
+        throw new InboxError('forbidden', 'Image intake requires the original local workspace Chat.')
       }
-      return { participantIds: [caller.id, localOwner], snapshots: [] }
+      const images = input.evidence.filter(item => item.kind === 'image-snapshot')
+      if (images.length > 8) throw new InboxError('invalid', 'At most eight local image files can be submitted together.')
+      try {
+        const snapshots = await Promise.all(images.map(async item => ({
+          attachmentId: item.attachmentId, readerIds: [caller.id, localOwner],
+          image: await readLocalSnapshot(caller.origin.sessionId, input.requestId, item)
+        })))
+        return { participantIds: [caller.id, localOwner], snapshots }
+      } catch {
+        throw new InboxError('unavailable', 'A staged local image is missing or invalid. Stage it again or use a source link.')
+      }
     },
-    async canReadSnapshot() { return false },
+    async canReadSnapshot(caller, { origin, evidence }) {
+      return origin.hostId === 'local' && isLocalSnapshotId(evidence.attachmentId) &&
+        (caller.kind === 'owner' ? caller.id === localOwner : caller.id === origin.sessionId)
+    },
     async send({ origin }) {
       // Orca 1.4.271 has no approved plugin sender. Verify the recorded destination
       // for useful status without calling mail with another principal's identity.
@@ -112,8 +125,14 @@ export async function processChatHint(cli: Cli, backend: InboxBackend, owner: Ow
     hostId: 'local', workspaceId: String(place.worktreeId), sessionId: session
   }, projectName: text(place.repo), workspaceName: text(place.workspace), repo: text(place.repo), policyOwnerId: localOwner }
   if (op === 'submit') {
-    if (submission(input).questions.some(q => q.questionId.startsWith(nativePrefix))) return false
-    return (await backend.submitDecision(caller, input)).ok
+    const request = submission(input)
+    if (request.questions.some(q => q.questionId.startsWith(nativePrefix))) return false
+    const accepted = await backend.submitDecision(caller, request)
+    if (!accepted.ok && accepted.message.startsWith('A staged local image is missing or invalid.')) {
+      throw new InboxError('unavailable', accepted.message)
+    }
+    if (accepted.ok) await clearLocalSnapshots(session, lookupId, request.evidence).catch(() => {})
+    return accepted.ok
   }
   // A transcript statement can confirm an actual submitted mail only. A locally
   // saved or failed reply cannot be promoted by a prewritten acknowledgement.
@@ -125,10 +144,9 @@ export async function processChatHint(cli: Cli, backend: InboxBackend, owner: Ow
   return (await backend.acknowledgeReply(caller, input)).ok
 }
 
-function metadata(description: string) {
-  const match = /^ORCA-DECISION-META (\{.{0,2048}\})$/m.exec(description)
+function metadata(json?: string) {
   let fields: RecordValue = {}
-  try { if (match) fields = record(JSON.parse(match[1])) } catch { /* Plain Items remain readable. */ }
+  try { if (json !== undefined) fields = record(JSON.parse(json)) } catch { /* Plain Items remain readable. */ }
   const priority: Priority = fields.priority === 'P0' || fields.priority === 'P1' || fields.priority === 'P3' ? fields.priority : 'P2'
   const deadline = text(fields.deadline, 128)
   return { priority, ...(deadline && /T.*(?:Z|[+-]\d{2}:\d{2})$/i.test(deadline) && Number.isFinite(Date.parse(deadline))
@@ -156,6 +174,37 @@ function safeUrl(value: unknown): string | undefined {
   } catch { /* Keep native references without inventing a URL. */ }
 }
 
+function nativeSections(markdown: string) {
+  const lines: string[] = []
+  let fence: string | undefined
+  let metadataJson: string | undefined
+  const headings: number[] = []
+  for (const line of markdown.split(/(?<=\n)/)) {
+    const delimiter = /^ {0,3}(`{3,}|~{3,})([^\r\n]*)/.exec(line)
+    if (delimiter) {
+      if (fence) {
+        if (delimiter[1][0] === fence[0] && delimiter[1].length >= fence.length && !delimiter[2].trim()) fence = undefined
+      } else if (delimiter[1][0] === '~' || !delimiter[2].includes('`')) {
+        fence = delimiter[1]
+      }
+    } else if (!fence) {
+      const marker = /^ORCA-DECISION-META (\{.{0,2048}\})\r?\n?$/.exec(line)
+      if (marker) {
+        metadataJson ??= marker[1]
+        continue
+      }
+      if (/^## Background[ \t]*\r?\n?$/i.test(line)) headings.push(lines.length)
+    }
+    lines.push(line)
+  }
+  const first = lines.findIndex(line => line.trim())
+  const start = /^## Description[ \t]*\r?\n?$/i.test(lines[first] ?? '') ? first + 1 : 0
+  const split = headings.length === 1 ? headings[0] : undefined
+  const description = lines.slice(start, split).join('')
+  const background = split === undefined ? '' : lines.slice(split + 1).join('')
+  return { ...(description.trim() ? { description } : {}), background, ...metadata(metadataJson) }
+}
+
 function itemRows({ host, botId, item }: NativeItem, origin?: Decision['origin'], events: RecordValue[] = []): Decision[] {
   const uid = text(item.uid, 97)
   const title = text(item.title)
@@ -169,7 +218,7 @@ function itemRows({ host, botId, item }: NativeItem, origin?: Decision['origin']
   const botName = text(record(item.owner).name, 256)
   const itemLabel = typeof item.number === 'number' && Number.isSafeInteger(item.number) ? '#' + item.number : uid
   const description = text(item.description, 16_384)
-  const background = description.replace(/^ORCA-DECISION-META \{.{0,2048}\}\r?(?:\n|$)/gm, '')
+  const sections = nativeSections(description)
   const askText = text(ask.text, 16_384)
   const current = events.find(entry => entry.id === event)
   const activity: NonNullable<Decision['activity']> = []
@@ -209,14 +258,16 @@ function itemRows({ host, botId, item }: NativeItem, origin?: Decision['origin']
   return questions.map((question, index) => {
     const options = array(question.replies).slice(0, 8)
     const questionTitle = text(question.question) || title
+    const recommended = options.flatMap((option, i) => option.recommended === true ? [i] : [])
     return {
       questionId: questionIds[index], packageId, requestId: packageId, revision: 1,
-      title: questionTitle, ...(questionTitle !== title ? { context: title } : {}), background,
+      title: questionTitle, ...(questionTitle !== title ? { context: title } : {}), ...sections,
       ...(activity.length ? { activity } : {}), ...(nativeLinks.length ? { nativeLinks } : {}),
       package: { index, size: questions.length, questionIds },
       recommendation: text(options.find(option => option.recommended === true)?.label),
+      ...(recommended.length === 1 && text(options[recommended[0]].label) ? { recommendedOptionId: String(recommended[0]) } : {}),
       options: options.map((option, i) => ({ optionId: String(i), label: text(option.label, 512), detail: text(option.detail, 2048) })),
-      ...metadata(description), origin: origin ?? { hostId: host.id, workspaceId: '', sessionId: '' },
+      origin: origin ?? { hostId: host.id, workspaceId: '', sessionId: '' },
       projectName: botName, workspaceName: '', createdAt: timestamp(item.createdAt) ?? new Date(0).toISOString(),
       access: { participantIds: [], attachmentReaderIds: {} }, decisionLink: '', sourceLinks: [...sourceLinks.values()], evidence: [],
       answerState: { state: 'awaiting-answer' }, actions: [],
@@ -443,5 +494,6 @@ export async function nativeDetail(cli: Cli, questionId: string, workspaces: rea
     listed.source.workspaceAttributed && record(itemRecord.chat).kind === 'chat' && record(itemRecord.chat).id === listed.origin.sessionId ? listed.origin : undefined,
     array(events)).find(d => d.questionId === listed.questionId)
   if (!row) throw new InboxError('not-found', 'Bot Item changed. Refresh the Inbox.')
-  return legacy ? { ...row, questionId } : row
+  return { ...row, ...(legacy ? { questionId } : {}),
+    ...decisionSourceMetadata(row.sourceLinks, row.origin.sessionId) }
 }

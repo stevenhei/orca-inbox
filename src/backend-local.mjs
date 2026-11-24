@@ -1,27 +1,63 @@
 import { execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { lstat, mkdir, open, opendir, realpath, rm, stat, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, open, opendir, realpath, rm, writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
+import { reapSubmissionLock, withSubmissionLock } from './submission-lock.mjs'
 
 export const hintDirectory = join(homedir(), '.orca-decision-inbox', 'hints')
 
 // Nonsensitive scope identifiers only. A filename never authenticates a Chat.
 export const hintPattern = /^(submit|ack)\.([0-9a-f-]{36})\.([a-zA-Z0-9_-]{1,128})$/
 
+export async function privateHintDirectory(create = false) {
+  if (create) await mkdir(hintDirectory, { recursive: true, mode: 0o700 })
+  const directory = await lstat(hintDirectory)
+  if (!directory.isDirectory() || (process.getuid && (directory.uid !== process.getuid() || (directory.mode & 0o077)))) {
+    throw new Error('Inbox staging directory must be private.')
+  }
+  return realpath(hintDirectory)
+}
+
+const stagedPattern = /^(submit\.[0-9a-f-]{36}\.[a-zA-Z0-9_-]{1,128})\.[0-9a-f]{64}(?:\.[0-3])?\.image(?:\.(?:pending|ready))?$/
+const expired = details => Date.now() - details.mtimeMs > 60 * 60 * 1000
+const lookupFile = path => lstat(path).catch(error => {
+  if (error.code !== 'ENOENT') throw error
+})
+
 export async function hints() {
   try {
-    const dir = await opendir(hintDirectory)
+    const root = await privateHintDirectory()
+    const dir = await opendir(root)
     const result = []
     let inspected = 0
     for await (const entry of dir) {
       if (++inspected > 256 || result.length === 8) break
-      if (!entry.isFile() || !hintPattern.test(entry.name)) continue
-      const details = await stat(join(hintDirectory, entry.name)).catch(() => undefined)
-      if (!details) continue
-      if (Date.now() - details.mtimeMs > 60 * 60 * 1000) await removeHint(entry.name)
-      else result.push(entry.name)
+      if (entry.isDirectory() && (entry.name.startsWith('.lock-candidate.') ||
+        (entry.name.startsWith('.lock.') && hintPattern.test(entry.name.slice('.lock.'.length))))) {
+        await reapSubmissionLock(root, entry.name)
+        continue
+      }
+      if (!entry.isFile()) continue
+      const stagedKey = stagedPattern.exec(entry.name)?.[1]
+      const key = stagedKey ?? (hintPattern.test(entry.name) ? entry.name : undefined)
+      if (!key) continue
+      const path = join(root, entry.name)
+      const details = await lookupFile(path)
+      if (!details?.isFile()) continue
+      if (!expired(details)) {
+        if (!stagedKey) result.push(key)
+        continue
+      }
+      const checked = await withSubmissionLock(root, key, 0, async () => {
+        const current = await lookupFile(path)
+        if (!current?.isFile()) return false
+        if (!expired(current)) return true
+        await rm(path, { force: true })
+        return false
+      })
+      if (!stagedKey && checked?.value) result.push(key)
     }
     return result
   } catch (error) {

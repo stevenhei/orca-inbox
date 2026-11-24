@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "decision-inbox",
   "name": "Decision Inbox",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Read authorized Bot Items and save answers to workspace Chat decisions.",
   "engines": { "orca": ">=1.4.248" },
   "execution": "trusted-worker",

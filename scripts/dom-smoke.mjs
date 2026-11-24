@@ -22,7 +22,7 @@ const LINKEDOM = '0.18.5'
 const TYPESCRIPT = '5.9.3'
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.join(here, '..')
-const SCENARIOS = ['review', 'quiet', 'ime', 'restart', 'ambiguous', 'inflight', 'durable', 'draftcas', 'winner', 'noreceipt', 'bind', 'followup', 'receipt', 'package', 'narrow', 'errors', 'offline', 'settings', 'settings2', 'native', 'mail', 'noactions', 'race', 'racebtn', 'localonly', 'reader', 'dashboard', 'dashnarrow', 'dashfocus']
+const SCENARIOS = ['review', 'quiet', 'ime', 'restart', 'ambiguous', 'inflight', 'durable', 'draftcas', 'winner', 'noreceipt', 'bind', 'followup', 'receipt', 'package', 'narrow', 'errors', 'offline', 'settings', 'settings2', 'native', 'mail', 'noactions', 'race', 'racebtn', 'localonly', 'reader', 'dashboard', 'dashnarrow', 'dashfocus', 'rich', 'sections']
 const scenario = process.argv[2]
 
 if (!scenario) {
@@ -47,7 +47,7 @@ if (!scenario) {
       extends: path.join(root, 'tsconfig.json'),
       compilerOptions: { noEmit: false, outDir: path.join(tmp, 'build'), rootDir: root, rewriteRelativeImportExtensions: true, allowImportingTsExtensions: false },
       // The fixtures compile for the tests only; the editor itself never imports them.
-      files: [path.join(root, 'src/review.ts'), path.join(root, 'fixtures/decisions.ts')],
+      files: [path.join(root, 'src/review.ts'), path.join(root, 'fixtures/decisions.ts'), path.join(root, 'fixtures/rich-context.ts')],
       include: []
     }))
     run('npm', ['exec', '--yes', '--package', `typescript@${TYPESCRIPT}`, '--', 'tsc', '-p', path.join(tmp, 'tsconfig.json')])
@@ -111,6 +111,25 @@ const errR = (code, message = '') => ({ ok: false, code, message })
 const hostError = (code, message = code) => Object.assign(new Error(message), { code, retryable: false })
 const clone = (v) => (v === undefined ? v : structuredClone(v))
 const db = new Map(fx.decisions.map((d) => [d.questionId, clone(d)]))
+// The BE's shared rich-context sample as the worker would return it: one authorized placement as
+// submitted, plus a denied one reduced to a position-only placeholder at the end.
+if (scenario === 'sections') {
+  // Authored headings that already match ours: no duplicate headings, raw background unchanged.
+  db.set('sections', { ...clone(fx.decisions.find((d) => d.questionId === 'schedule')), questionId: 'sections', packageId: 'sections',
+    description: '# Description\n\nApprove the **east entrance** route.', background: '## Background\n\nThe west aisle is narrow. The east entrance is quieter.', recommendation: 'Approve it.' })
+}
+if (scenario === 'rich') {
+  const { richContext } = await import(build('fixtures/rich-context.js'))
+  const q = richContext.questions[0]
+  db.set(q.questionId, { ...clone(fx.decisions.find((d) => d.questionId === 'schedule')), ...clone(q), packageId: richContext.packageId, requestId: richContext.requestId,
+    evidence: clone(richContext.evidence), sourceLinks: clone(richContext.sourceLinks), inlineImages: [...clone(q.inlineImages), { offset: q.background.length, unavailable: true }],
+    answerState: { state: 'awaiting-answer' }, actions: ['reply'], recommendedOptionId: 'valley',
+    workItemLinks: [{ kind: 'github-pr', label: 'example/paper#4', url: 'https://github.com/example/paper/pull/4' }, { kind: 'github-pr', label: 'dup', url: 'https://github.com/example/paper/pull/4' },
+      { kind: 'linear-issue', label: 'PAP-1', url: 'http://linear.app/example/issue/PAP-1' }, { kind: 'github-pr', label: 'case', url: 'https://GitHub.com/example/paper/pull/4/#x' },
+      { kind: 'github-issue', label: 'cred', url: 'https://u:p@github.com/example/paper/issues/9' }, { kind: 'github-issue', label: 'tree', url: 'https://github.com/example/paper/tree/main' },
+      { kind: 'linear-issue', label: 'PAP-2', url: 'https://linear.app/example/issue/PAP-2/fold-depth' }],
+    originalSessionId: 'orca_session_id:00000000-0000-4000-8000-000000000002' })
+}
 const drafts = new Map() // questionId -> { draft, revision }
 const calls = []
 const listeners = {}
@@ -165,7 +184,7 @@ const files = {
   settings: '{"view":"settings"}', settings2: '{"view":"settings"}', quiet: '{"questionId":"image-review"}', ime: '{"questionId":"schedule"}',
   native: '{"questionId":"native-x"}', mail: '{"questionId":"layout"}', noactions: '{"questionId":"schedule"}',
   reader: '{"questionId":"pkg-a-1"}', dashboard: '{"view":"dashboard"}', dashnarrow: '{"view":"dashboard"}', dashfocus: '{"view":"dashboard"}', race: '{"questionId":"schedule"}', racebtn: '{"questionId":"schedule"}', localonly: '{"questionId":"schedule"}',
-  ambiguous: '{"questionId":"schedule"}', inflight: '{"questionId":"schedule"}', noreceipt: '{"questionId":"schedule"}', narrow: '{"questionId":"image-review"}'
+  rich: '{"questionId":"rich-context-question"}', sections: '{"questionId":"sections"}', ambiguous: '{"questionId":"schedule"}', inflight: '{"questionId":"schedule"}', noreceipt: '{"questionId":"schedule"}', narrow: '{"questionId":"image-review"}'
 }
 const opened = []
 globalThis.orca = {
@@ -189,6 +208,9 @@ const click = async (e, init = {}) => {
   const ev = new window.Event('click', { bubbles: true }); Object.assign(ev, init)
   e.dispatchEvent(ev); await settle()
 }
+/** Writes a note in the open note composer and adds it. */
+const draft0 = () => last('draft.save').draft.annotations
+const addNote = async (t) => { await setValue(byLabel('New note'), t, 'input'); await click(document.querySelector('[data-k="nc-add"]')); await sleep(30); await settle() }
 const key = async (init) => { const ev = new window.Event('keydown', { bubbles: true }); Object.assign(ev, init); document.dispatchEvent(ev); await settle() }
 const byLabel = (l) => document.querySelector(`[aria-label="${l}"]`)
 const step = () => document.querySelector('.step[aria-current="step"]')?.textContent.trim()
@@ -386,6 +408,7 @@ await settle()
 if (scenario === 'review') {
   assert.equal(document.querySelector('h1').textContent, 'Compare seven paper model views'); ok('title from getDecision')
   assert.deepEqual(callsOf('getDecision'), [{ questionId: 'image-review' }]); ok('decision loaded by question ID from the worker')
+  assert.deepEqual(all('h2.d-sec-h').map((h) => h.textContent).filter((t) => /Description|Background/.test(t)), ['Background']); ok('legacy decision (no description): only Background, no empty Description heading')
   assert.equal(all('.film button').length, 7); ok('seven snapshot buttons')
   assert.equal(all('.view').length, 1); ok('single large viewer by default (provisional)')
   const img = document.querySelector('.view img')
@@ -415,10 +438,17 @@ if (scenario === 'review') {
   const bg = document.querySelector('[data-field="background"] p').firstChild
   select(range(bg, 0, 12))
   await key({ altKey: true, key: 'n' })
-  assert.match(document.querySelector('.side').textContent, /Notes \(2\)/); ok('Alt+N adds a note from the selection')
-  assert.equal(document.activeElement.getAttribute('data-note'), '1'); ok('focus moves to the new note field')
-  await sleep(450)
-  assert.ok(!/Draft not saved/.test(text())); assert.equal(last('draft.save').draft.annotations.length, 2); ok('a partial (empty) note is saved with the draft')
+  assert.match(document.querySelector('.d-nc').textContent, /Note on the selected text[^]*Paper models/); assert.equal(document.activeElement, byLabel('New note')); ok('Alt+N opens the note composer next to the selection, with the quote')
+  await click(document.querySelector('[data-k="nc-add"]'))
+  assert.ok(document.querySelector('.d-nc')); assert.match(document.querySelector('.d-nc').textContent, /Write the note first/); ok('an empty note keeps the composer open')
+  await addNote('Same paper stock')
+  assert.equal(document.querySelector('.d-nc'), null); assert.match(document.querySelector('.side').textContent, /Notes \(2\)/); assert.ok(document.querySelector('#notesPanel').hasAttribute('hidden'))
+  assert.equal(document.activeElement.getAttribute('data-k'), 'notes-open'); ok('Add saves the note, closes the composer and the Notes panel, focus returns')
+  assert.match(text(), /Note saved with your draft \(2\)\. Not sent yet/); assert.equal(document.querySelector('mark.d-n').textContent, 'Paper models'); ok('quiet saved confirmation; the note is highlighted at its anchor')
+  assert.ok(!/Draft not saved/.test(text())); assert.equal(last('draft.save').draft.annotations.length, 2); ok('the note is saved with the draft')
+  await click(document.querySelector('[data-k="notes-edit"]'))
+  assert.ok(!document.querySelector('#notesPanel').hasAttribute('hidden')); ok('Edit notes reopens the panel')
+  await setValue(byLabel('Note text 2'), '', 'input'); await sleep(450)
   assert.deepEqual(callsOf('draft.save').map((x) => x.revision), callsOf('draft.save').map((_, i) => i)); ok('every save carries the stored revision')
   await setValue(byLabel('Reply text'), 'draft', 'input')
   await click(find('button', 'Submit reply'))
@@ -444,7 +474,7 @@ if (scenario === 'review') {
   assert.match(text(), /Mail hand-off to the original chat is not reported yet; waiting for that chat to acknowledge it\./); ok('no mail hand-off or receipt is claimed')
   await sleep(10)
   assert.equal(last('draft.save').draft, null); ok('draft cleared after the reply is recorded')
-  assert.equal(all('.step').length, 4); ok('four distinct states listed')
+  assert.deepEqual(all('.d-milestones li').map((e) => e.textContent.replace(/ · .*/, '')), ['Opened', 'Answer saved', 'Next: Agent received appears only when the chat confirms.'].map((t) => t.replace(/ · .*/, ''))); assert.doesNotMatch(document.querySelector('.d-milestones').textContent, /Agent received ·|Submitted to Orca mail/); ok('state card lists only recorded milestones and one next step')
 } else if (scenario === 'restart') {
   assert.equal(document.querySelector('input[type=radio][checked]')?.getAttribute('data-k') ?? all('input[type=radio]').find((r) => r.checked)?.getAttribute('data-k'), 'opt-tue'); ok('persisted option restored')
   assert.equal(byLabel('Reply text').value, 'Tuesday works'); ok('persisted text restored')
@@ -575,16 +605,18 @@ if (scenario === 'review') {
   assert.match(text(), /Could not open that question\. The Decision Inbox is unavailable\. No supported editor seam\./); ok('open failure reported')
   await click(findStart('a', 'Reading room plan · v2'))
   assert.deepEqual(opened, ['https://example.invalid/evidence/floor-plan']); ok('linked evidence opens externally with its version')
-  await click(find('button', 'Copy decision link'))
-  assert.deepEqual(copied, ['https://example.invalid/inbox/room-route']); ok('decision link copied')
+  assert.equal(document.querySelector('[data-k="copy-link"]').getAttribute('aria-label'), 'Copy decision link')
+  await click(document.querySelector('[data-k="copy-link"]'))
+  assert.deepEqual(copied, ['https://example.invalid/inbox/room-route']); ok('decision link copied (labelled icon control)')
   // L7: a triple-click ends at the start of the next element; the quote is clipped to the field.
   const bgNode = document.querySelector('[data-field="background"] p').firstChild
   const full = fx.decisions.find((x) => x.questionId === 'room-route').background
-  select(range(bgNode, 0, 0, { endAfter: true, endContainer: document.querySelectorAll('h2')[2] }))
+  select(range(bgNode, 0, 0, { endAfter: true, endContainer: document.querySelector('[data-field="background"]').nextElementSibling }))
   // L6: macOS Option+N reports a dead key; the physical key code still matches.
   await key({ altKey: true, key: 'Dead', code: 'KeyN' })
-  assert.match(document.querySelector('.side').textContent, /Notes \(1\)/); ok('Alt+N by key code (macOS dead key) adds the note')
-  await setValue(byLabel('Note text 1'), 'Whole paragraph', 'input'); await sleep(450)
+  assert.ok(document.querySelector('.d-nc')); ok('Alt+N by key code (macOS dead key) opens the composer')
+  await addNote('Whole paragraph'); await sleep(450)
+  assert.match(document.querySelector('.side').textContent, /Notes \(1\)/)
   const n = last('draft.save').draft.annotations[0]
   assert.equal(n.quote, full); assert.deepEqual([n.start, n.end], [0, full.length]); ok('triple-click selection quotes the whole field with exact offsets')
   assert.ok(document.querySelector('.vp') === null || !document.querySelector('.vp').getAttribute('style')); ok('viewer layout uses classes, not an inline column count')
@@ -602,11 +634,11 @@ if (scenario === 'review') {
   await click(find('button', 'Done'))
   assert.ok(!dlg.hasAttribute('open'))
   // Add a note from a selection at narrow width.
-  const bg = document.querySelector('[data-field="background"] p').firstChild
-  select(range(bg, 13, 16))
+  // "Paper models" is already highlighted (a <mark>), so the plain text after it starts at raw offset 12.
+  const bg = [...document.querySelector('[data-field="background"] p').childNodes].find((n) => n.nodeType === 3)
+  select(range(bg, 1, 4))
   await key({ altKey: true, key: 'n', code: 'KeyN' })
-  assert.ok(dlg.hasAttribute('open')); await setValue(byLabel('New note'), 'Check angles', 'input')
-  await click(find('button', 'Add note')); await click(find('button', 'Done'))
+  assert.ok(document.querySelector('.d-nc') && !dlg.hasAttribute('open')); await addNote('Check angles')
   selection = { rangeCount: 0, isCollapsed: true }; document.dispatchEvent(new window.Event('selectionchange')); await settle()
   await click(find('button', 'Submit reply'))
   assert.deepEqual(last('submitReply').annotations.map((x) => [x.quote, x.text]), [['Paper models', 'Same paper stock'], ['use', 'Check angles']]); ok('sent with the fixed and the new note')
@@ -631,12 +663,13 @@ if (scenario === 'review') {
   assert.equal(document.querySelector('h1').textContent, 'Ship the lantern build?'); ok('native item title')
   assert.match(text(), /Bot Item · read-only/); assert.match(text(), /No workspace attribution/); ok('source and missing workspace attribution are labelled')
   const dock = document.querySelector('.dock')
-  assert.match(dock.textContent, /^Answer in Orca's Bot Items: bot “Release bot”, item #12/); assert.match(dock.textContent, /Read-only copy: Decision Inbox cannot answer, resolve or open this Item for you\./); ok('docked footer says where to answer, without a deep link or a write')
+  assert.match(dock.textContent, /Answer in Orca's Bot Items: bot “Release bot”, item #12/); assert.match(dock.textContent, /Read-only copy: Decision Inbox cannot answer, resolve or open this Item for you\./); ok('docked footer says where to answer, without a deep link or a write')
   assert.match(text(), /Status in OrcaNeeds you · as of 14 Jun 2030, 11:30 UTC/); ok('status as Orca reported it, with time (in Details)')
   assert.deepEqual(all('.dock li').map((e) => e.textContent), ['Ship it', 'Hold — Wait for the next build']); ok('options listed once, in the footer')
   assert.equal(text().split('Ship it').length - 1, 1); ok('no duplicated options')
-  assert.ok(document.querySelector('h1').compareDocumentPosition(dock) & 4); ok('question before the footer')
-  assert.equal(all('input, textarea, select').length, 0); assert.equal(find('button', 'Submit reply'), undefined); ok('no reply, note or option controls')
+  assert.ok(document.querySelector('.d-sheet-body').contains(document.querySelector('h1')) && !dock.closest('.d-sheet-body') && dock.parentElement === document.querySelector('.d-sheet')); ok('question in the scrolling body; read-only card below it')
+  assert.ok(find('button', 'Copy location')); ok('Copy location offered (no deep link)')
+  assert.equal(all('input, textarea, select').length, 0); assert.equal(find('button', 'Submit reply'), undefined); assert.equal(document.querySelector('[data-k="use-rec"]'), null); ok('no reply, note, option or Use-recommendation controls')
   assert.equal(document.querySelector('.strip'), null); assert.equal(document.querySelector('aside'), null); ok('no plugin delivery strip or notes sidebar')
   assert.equal(all('a').length, 1); assert.equal(all('a')[0].textContent.trim(), 'Synthetic project record ↗'); ok('no fabricated link to the item')
   await key({ ctrlKey: true, key: 'Enter' })
@@ -663,9 +696,11 @@ if (scenario === 'review') {
   const rows = () => all('.qrow').map((b) => b.querySelector('.qt').textContent)
   assert.deepEqual(rows(), ['Compare seven paper model views', 'Pick a rehearsal slot']); ok('This workspace queue, most urgent first')
   assert.deepEqual(last('listDecisionPage').scope, { kind: 'workspace', workspace: { hostId: 'local', workspaceId: 'studio' } }); ok('scoped by host + workspace')
-  assert.equal(document.querySelector('.rpane h1').textContent, 'Compare seven paper model views'); ok('wide: first decision opens beside the queue')
+  assert.equal(document.querySelector('.d-sheet'), null); assert.deepEqual(all('[role=tab]').map((t) => [t.textContent, t.getAttribute('aria-selected')]), [['Pending2', 'true'], ['Answered0', 'false'], ['All2', 'false']]); ok('Pending / Answered / All tabs with counts; no sheet until a row is chosen')
+  assert.ok(document.querySelector('.d-tabs-row [data-k="ws-select"]')); assert.equal(document.querySelector('.d-tabs-row').lastElementChild.querySelector('select').getAttribute('data-k'), 'ws-select'); ok('workspace selector is the last item of the tabs row')
+  assert.ok(!all('tr.d-row').some((r) => /Question\s*\d+\s*(\/|of)\s*\d+/.test(r.textContent))); ok('no "Question x/N" in table rows')
   await click(find('.qrow .qt', 'Pick a rehearsal slot').parentElement)
-  assert.equal(document.querySelector('.rpane h1').textContent, 'Pick a rehearsal slot'); assert.equal(document.querySelector('.qrow[aria-current="true"] .qt').textContent, 'Pick a rehearsal slot'); ok('selecting a row opens it in this tab')
+  assert.equal(document.querySelector('.d-sheet h1').textContent, 'Pick a rehearsal slot'); assert.ok(document.querySelector('tr.d-row[data-sel]')); assert.equal(document.querySelector('.d-sheet').getAttribute('aria-modal'), 'false'); assert.equal(document.querySelector('.qrow[aria-current="true"] .qt').textContent, 'Pick a rehearsal slot'); ok('selecting a row opens it in this tab')
   await setValue(byLabel('Reply text'), 'Tuesday morning', 'input')
   await click(find('.qrow .qt', 'Compare seven paper model views').parentElement)
   const iSave = calls.findIndex((c) => c.name === 'draft.save' && c.input.questionId === 'schedule' && c.input.draft?.text === 'Tuesday morning')
@@ -679,7 +714,7 @@ if (scenario === 'review') {
   await settle()
   await click(find('.qrow .qt', 'Pick a rehearsal slot').parentElement)
   globalThis.__releaseImage(); await slow; await settle()
-  assert.equal(document.querySelector('.rpane h1').textContent, 'Pick a rehearsal slot'); ok('a late answer never replaces the selected decision')
+  assert.equal(document.querySelector('.d-sheet h1').textContent, 'Pick a rehearsal slot'); ok('a late answer never replaces the selected decision')
   // Search keeps focus while the list repaints; scope changes.
   const search = byLabel('Search decisions'); search.focus()
   await setValue(search, 'layout', 'input'); await sleep(300); await settle()
@@ -692,8 +727,9 @@ if (scenario === 'review') {
   releaseOld(); await settle()
   assert.deepEqual(rows(), ['Compare seven paper model views', 'Pick a rehearsal slot']); ok('a stale search answer is dropped')
   delete handlers.listDecisionPage
-  const allRadio = all('input[name="dash-scope"]').find((r) => r.getAttribute('value') === 'all')
-  allRadio.dispatchEvent(new window.Event('change', { bubbles: true })); await settle()
+  const wsSel = document.querySelector('[data-k="ws-select"]')
+  for (const o of wsSel.querySelectorAll('option')) o.toggleAttribute('selected', o.getAttribute('value') === 'all')
+  wsSel.dispatchEvent(new window.Event('change', { bubbles: true })); await settle()
   assert.deepEqual(last('listDecisionPage').scope, { kind: 'all' }); assert.ok(rows().includes('Approve the first lantern trial')); ok('All workspaces scope')
   // Keyboard: arrow keys move between rows.
   const first = all('.qrow')[0]; first.focus()
@@ -706,14 +742,20 @@ if (scenario === 'review') {
   await changed()
   assert.match(text(), /Bot Items are unavailable\. No authorized Bot Items reader\. Chat decisions below are not affected\./); ok('source availability shown')
   assert.equal(text().split('Answers are saved in Decision Inbox').length - 1, 1); ok('mail notice once')
-  assert.match(document.head.textContent, /@media\(max-width:800px\)\{\.dash-grid\{grid-template-columns:minmax\(0,1fr\)\}/); ok('narrow layout rule present')
-} else if (scenario === 'dashnarrow') {
-  assert.equal(document.querySelector('.dash-grid').getAttribute('data-mode'), 'queue'); assert.equal(document.querySelector('.rpane h1'), null); ok('narrow: queue first, nothing auto-opened')
+  assert.match(document.head.textContent, /@media \(max-width: 899px\) \{\.d-app \.d-workspace\.d-has-sheet \{ grid-template-columns: minmax\(0, 1fr\); \} \.d-app \.d-sheet \{ position: fixed; inset: 0;/); ok('narrow sheet rule present')
+  // Esc closes the sheet and focus returns to the row.
   await click(find('.qrow .qt', 'Pick a rehearsal slot').parentElement)
-  assert.equal(document.querySelector('.dash-grid').getAttribute('data-mode'), 'reader'); assert.equal(document.querySelector('.rpane h1').textContent, 'Pick a rehearsal slot'); ok('narrow: one surface, the reader')
+  await key({ key: 'Escape' })
+  assert.equal(document.querySelector('.d-sheet'), null); ok('Esc closes the sheet')
+} else if (scenario === 'dashnarrow') {
+  assert.equal(document.querySelector('.d-sheet'), null); assert.equal(document.querySelector('.d-list-side').hasAttribute('inert'), false); ok('narrow: list first, nothing auto-opened')
+  await click(find('.qrow .qt', 'Pick a rehearsal slot').parentElement)
+  assert.equal(document.querySelector('.d-sheet h1').textContent, 'Pick a rehearsal slot'); assert.equal(document.querySelector('.d-sheet').getAttribute('role'), 'dialog'); assert.equal(document.querySelector('.d-sheet').getAttribute('aria-modal'), 'true')
+  assert.ok(document.querySelector('.d-list-side').hasAttribute('inert')); ok('narrow: a modal sheet over an inert list')
   await setValue(byLabel('Reply text'), 'Thursday', 'input')
-  await click(find('button', '← Back to queue'))
-  assert.equal(document.querySelector('.dash-grid').getAttribute('data-mode'), 'queue'); ok('Back returns to the queue')
+  assert.equal(document.querySelector('[data-k="sheet-back"]').getAttribute('aria-label'), 'Back to the decision list')
+  await click(document.querySelector('[data-k="sheet-back"]'))
+  assert.equal(document.querySelector('.d-sheet'), null); assert.equal(document.querySelector('.d-list-side').hasAttribute('inert'), false); ok('Back returns to the list')
   await sleep(10)
   assert.ok(calls.some((c) => c.name === 'draft.save' && c.input.draft?.text === 'Thursday')); ok('draft saved on Back')
   await click(find('.qrow .qt', 'Pick a rehearsal slot').parentElement)
@@ -725,14 +767,16 @@ if (scenario === 'review') {
   assert.equal(callsOf('listDecisionPage').filter((c) => !c.query).every((c) => c.scope.kind === 'all'), true)
   assert.ok(callsOf('listDecisionPage').some((c) => !c.query && c.scope.kind === 'all')); ok('All workspaces only on the explicit action')
   await click(find('.qrow .qt', 'Approve the first lantern trial').parentElement)
-  assert.match(document.querySelector('.rpane').textContent, /Could not load decision "stage"\. The Decision Inbox is unavailable\. Bot reads are unavailable for this bot\./); assert.ok(find('button', 'Try again')); ok('read failure: says so, with Try again')
+  assert.match(document.querySelector('.d-sheet-slot').textContent, /Could not load decision "stage"\. The Decision Inbox is unavailable\. Bot reads are unavailable for this bot\./); assert.ok(find('button', 'Try again')); ok('read failure: says so, with Try again')
   await click(find('.qrow .qt', 'Choose the catalogue layout').parentElement)
-  assert.match(document.querySelector('.rpane').textContent, /You do not have access to decision "layout"/); ok('no access is distinct')
+  assert.match(document.querySelector('.d-sheet-slot').textContent, /You do not have access to decision "layout"/); ok('no access is distinct')
   await click(find('.qrow .qt', 'Pick a rehearsal slot').parentElement)
-  assert.match(document.querySelector('.rpane').textContent, /Decision "schedule" was not found/); ok('missing record is distinct')
+  assert.match(document.querySelector('.d-sheet-slot').textContent, /Decision "schedule" was not found/); ok('missing record is distinct')
 } else if (scenario === 'reader') {
   assert.equal(document.querySelector('h1').textContent, '第一題：是否發佈？'); ok('active question first')
-  assert.match(document.querySelector('.pager').textContent, /^Question 1 \/ 2/); ok('Question 1 / 2')
+  assert.equal(document.querySelector('.pager span').textContent, '1 / 2'); assert.equal(document.querySelector('.pager span').getAttribute('aria-label'), 'Question 1 of 2'); assert.ok(document.querySelector('.d-dock .pager')); ok('pager 1 / 2 in the reply card')
+  assert.equal(all('[data-field="recommendation"]').length, 1); assert.ok(document.querySelector('.d-dock [data-field="recommendation"]')); ok('recommendation shown once, in the reply card')
+  assert.ok(all('.pager button').every((b) => b.getAttribute('aria-label'))); ok('icon pager buttons are labelled')
   const bgField = document.querySelector('[data-field="background"]')
   assert.equal(bgField.querySelector('strong').textContent, '請決定是否發佈第 42 版。'); ok('bold rendered')
   assert.equal(bgField.querySelector('a').getAttribute('href'), 'https://example.invalid/run/42'); assert.equal(bgField.querySelector('a').textContent, '執行紀錄'); ok('link rendered, http(s) only')
@@ -748,31 +792,123 @@ if (scenario === 'review') {
   const d1p = [...bgField.querySelectorAll('p')].at(-1)
   assert.deepEqual([...d1p.querySelectorAll('a')].map((a) => [a.getAttribute('href'), a.textContent]), [['https://example.invalid/x', 'https://example.invalid/x'], ['http://[::1]:8080/a', 'http://[::1]:8080/a']])
   assert.deepEqual([...d1p.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent), ['see [', '] here, ', 'https://ok.invalid', ' ', '(javascript:alert(1))', ' and ', '.']); ok('unmatched ], non-http label and IPv6: anchors and plain text exact')
-  const toggle = document.querySelector('[data-k="dock-toggle"]')
-  assert.equal(toggle.getAttribute('aria-expanded'), 'false'); assert.equal(byLabel('Reply text').getAttribute('rows'), '2'); ok('dock starts compact')
-  await click(toggle)
-  assert.equal(document.querySelector('[data-k="dock-toggle"]').getAttribute('aria-expanded'), 'true'); assert.ok(document.querySelector('.dock').classList.contains('open')); assert.equal(byLabel('Reply text').getAttribute('rows'), '6'); ok('Expand reply opens the full composer')
-  await click(document.querySelector('[data-k="dock-toggle"]'))
-  assert.equal(byLabel('Reply text').getAttribute('rows'), '2'); ok('and collapses again')
+  assert.equal(byLabel('Reply text').getAttribute('rows'), '3'); ok('reply box: three rows in the card')
   // A selection inside bold maps to the exact raw offsets.
   const raw = db.get('pkg-a-1').background
-  const node = document.querySelector('[data-field="background"] strong').firstChild // re-read: the toggles re-rendered
+  const node = document.querySelector('[data-field="background"] strong').firstChild
   select(range(node, 0, 4))
   await key({ altKey: true, key: 'n', code: 'KeyN' })
-  await setValue(byLabel('Note text 1'), 'check', 'input'); await sleep(450)
+  await addNote('check'); await sleep(450)
   const n = last('draft.save').draft.annotations[0]
   assert.equal(n.quote, raw.slice(n.start, n.end)); assert.equal(n.quote, '請決定是'); assert.equal(n.start, raw.indexOf('請決定')); ok('note anchors map through formatting to exact UTF-16 offsets')
   const dock = document.querySelector('.dock')
   assert.ok(dock && dock.querySelector('[aria-label="Reply text"]') && dock.querySelector('input[type=radio]')); ok('options and composer are in the docked reply area')
-  assert.ok(document.querySelector('[data-field="recommendation"]').compareDocumentPosition(dock) & 4); ok('the dock follows the (long) question')
-  assert.match(document.head.textContent, /\.dock\{position:sticky;bottom:0/); ok('the dock is sticky at the bottom of the reader')
+  assert.ok(!dock.closest('.d-sheet-body') && dock.parentElement === document.querySelector('.d-sheet')); ok('the reply card sits below the scrolling body')
+  assert.match(document.head.textContent, /\.d-app \.d-sheet-body \{ flex: 1; min-height: 0; overflow-y: auto;/); ok('the body scrolls on its own above the card')
   await setValue(byLabel('Reply text'), '下週二發佈', 'input')
-  await click(find('button', 'Next ›')); await settle()
-  assert.equal(document.querySelector('h1').textContent, '第二題：何時發佈？'); assert.match(document.querySelector('.pager').textContent, /^Question 2 \/ 2/); ok('Next pages to question 2')
+  await click(document.querySelector('[data-k="q-next"]')); await settle()
+  assert.equal(document.querySelector('h1').textContent, '第二題：何時發佈？'); assert.equal(document.querySelector('.pager span').textContent, '2 / 2'); ok('Next pages to question 2')
   assert.equal(byLabel('Reply text').value, ''); ok('question 2 has its own draft')
-  await click(find('button', '‹ Previous')); await settle()
+  await click(document.querySelector('[data-k="q-prev"]')); await settle()
   assert.equal(byLabel('Reply text').value, '下週二發佈'); ok('paging back restores question 1 draft')
   assert.equal(drafts.get('pkg-a-1').draft.text, '下週二發佈'); ok('draft persisted under its own question ID')
+  // Free-text recommendation (no recommended option ID): added below the owner's text, never replacing it, never sent.
+  const rec = db.get('pkg-a-1').recommendation.trim()
+  assert.ok(rec && !db.get('pkg-a-1').recommendedOptionId)
+  await click(document.querySelector('[data-k="use-rec"]')); await click(document.querySelector('[data-k="rec-replace"]')); await sleep(450)
+  assert.equal(byLabel('Reply text').value, rec); assert.equal(drafts.get('pkg-a-1').draft.optionId ?? null, null); assert.equal(callsOf('submitReply').length, 0); ok('free-text recommendation fills the reply after confirmation; no guessed option; nothing sent')
+  await click(document.querySelector('[data-k="q-next"]')); await settle()
+  assert.equal(document.querySelector('.d-proposed'), null); assert.equal(byLabel('Reply text').value, ''); ok('the proposal stays with its own question when paging')
+} else if (scenario === 'rich') {
+  const q = db.get('rich-context-question'); const raw = q.background
+  const bg = document.querySelector('[data-field="background"]')
+  assert.deepEqual(all('.rich-h').map((h) => [h.tagName, h.textContent]), [['H3', 'Paper model review'], ['H4', 'Example command']]); ok('agent headings rendered as headings')
+  assert.equal(bg.querySelector('a').getAttribute('href'), 'https://example.test/sample'); ok('source link rendered')
+  const figs = all('[data-field="background"] figure')
+  assert.equal(figs.length, 2); ok('one placed image and one placeholder')
+  assert.equal(figs[0].querySelector('img').getAttribute('alt'), 'Two paper folds side by side'); assert.match(figs[0].querySelector('img').getAttribute('src'), /^data:image\/png;base64,/)
+  assert.equal(figs[0].querySelector('img').getAttribute('width'), '800'); assert.equal(figs[0].querySelector('figcaption span').textContent, 'Left: valley fold. Right: mountain fold.'); ok('image with alt, size and its plain-text caption')
+  assert.deepEqual(callsOf('getSnapshot'), [{ questionId: 'rich-context-question', attachmentId: 'fixture-fold-v2' }]); ok('bytes only through the authorized getSnapshot for the exact version')
+  assert.equal(figs[0].nextElementSibling.textContent, 'Example command'); assert.equal(raw.slice(q.inlineImages[0].offset).split('\n')[0], '## Example command'); ok('image placed at its raw UTF-16 offset')
+  assert.ok(figs[1].classList.contains('unavailable')); assert.equal(figs[1].textContent, 'Image unavailable'); assert.equal(figs[1].querySelector('img'), null); ok('denied placement: placeholder only, no caption or metadata')
+  const pre = document.querySelector('.codeblock pre')
+  assert.equal(pre.textContent, 'printf "%s\\n" "paper sample"\n'); assert.equal(document.querySelectorAll('.codeblock script, .codeblock a').length, 0); ok('fenced command shown as inert text')
+  await click(document.querySelector('.code-copy'))
+  assert.deepEqual(copied, ['printf "%s\\n" "paper sample"']); assert.equal(callsOf('getDecision').length, 1); ok('Copy copies the exact command; nothing runs')
+  const codeText = pre.querySelector('code').firstChild
+  select(range(codeText, 0, 6))
+  await key({ altKey: true, key: 'n', code: 'KeyN' })
+  // A failed save keeps the composer open with the text.
+  handlers['draft.save'] = () => errR('unavailable', 'Storage is offline.')
+  await addNote('why printf?')
+  assert.ok(document.querySelector('.d-nc')); assert.equal(byLabel('New note').value, 'why printf?'); assert.match(document.querySelector('.d-nc').textContent, /The note was not saved/); assert.equal(document.querySelectorAll('mark.d-n').length, 0); ok('a failed save keeps the composer open with the text')
+  delete handlers['draft.save']
+  await click(document.querySelector('[data-k="nc-add"]')); await sleep(30); await settle(); await sleep(450)
+  assert.equal(document.querySelector('.d-nc'), null)
+  const n = last('draft.save').draft.annotations[0]
+  assert.equal(n.quote, 'printf'); assert.equal(raw.slice(n.start, n.end), 'printf'); ok('a note in the code block anchors to exact raw offsets')
+  await click(document.querySelector('[data-k="fig-note-fold-sample"]'))
+  assert.match(document.querySelector('.d-nc').textContent, /Note on Fold sample[^]*Left: valley fold/); ok('✎ on an image opens the composer with its caption')
+  await addNote('compare depth'); await sleep(450)
+  assert.equal(document.activeElement.getAttribute('data-k'), 'fig-note-fold-sample'); ok('focus returns to the image note control')
+  assert.deepEqual(last('draft.save').draft.annotations.map((a) => a.kind), ['selection', 'image']); assert.deepEqual(last('draft.save').draft.annotations[1].evidence, { evidenceId: 'fold-sample', version: 2 }); ok('image note keyed to the evidence version')
+  assert.equal(all('[data-field="recommendation"]').length, 1); assert.ok(document.querySelector('.d-dock [data-field="recommendation"]')); ok('recommendation once, in the reply card')
+  // Owner annotation 6: source actions (https, deduplicated) and Copy session ID; no focus claim.
+  const acts = all('.d-src-act')
+  assert.deepEqual(acts.map((a) => a.getAttribute('aria-label')), ['Open GitHub pull request example/paper#4', 'Open Linear issue PAP-2', 'Copy session ID of the original chat']); ok('work-item links: allow-listed https GitHub/Linear only, deduplicated, labelled')
+  assert.equal(acts[0].getAttribute('rel'), 'noopener noreferrer')
+  await click(acts[0]); assert.deepEqual(opened, ['https://github.com/example/paper/pull/4']); ok('opens through the external-open API on click')
+  copied.length = 0; await click(document.querySelector('[data-k="copy-session"]'))
+  assert.deepEqual(copied, ['orca_session_id:00000000-0000-4000-8000-000000000002']); assert.doesNotMatch(text(), /Focus session|Open session/); ok('Copy session ID; no unverified focus action')
+  // Owner annotation 3: progress always visible (no disclosure).
+  const prog = document.querySelector('.d-progress')
+  assert.ok(prog && !prog.closest('details')); assert.equal(step(), '● Awaiting answer'); assert.match(prog.textContent, /No answer saved yet\./); assert.match(prog.textContent, /Opened · 1\d Jun 2030/)
+  assert.ok(prog.previousElementSibling.classList.contains('d-srcline') && prog.nextElementSibling.classList.contains('d-meta')); ok('progress card always visible with the current state and milestones')
+  // Owner annotation 5: an existing draft is protected; Replace selects the exact recommended option; Undo restores.
+  await setValue(byLabel('Reply text'), 'my own words', 'input')
+  await click(document.querySelector('[data-k="use-rec"]'))
+  assert.match(document.querySelector('.d-confirm').textContent, /Replace your draft/); assert.equal(document.activeElement?.getAttribute?.('data-k') ?? 'rec-keep', 'rec-keep')
+  await click(document.querySelector('[data-k="rec-keep"]'))
+  assert.equal(byLabel('Reply text').value, 'my own words'); assert.equal(document.querySelector('.d-confirm'), null); ok('Keep my draft leaves the draft untouched')
+  await click(document.querySelector('[data-k="use-rec"]')); await click(document.querySelector('[data-k="rec-replace"]')); await sleep(450)
+  assert.ok(document.querySelector('[data-k="opt-valley"]').hasAttribute('checked') || document.querySelector('[data-k="opt-valley"]').checked); assert.equal(byLabel('Reply text').value, ''); assert.equal(callsOf('submitReply').length, 0)
+  assert.equal(last('draft.save').draft.optionId, 'valley'); assert.equal(last('draft.save').questionId, 'rich-context-question'); assert.match(document.querySelector('.d-proposed').textContent, /Proposed from the PM recommendation: Valley fold/); ok('Replace draft selects the recommended option by ID and sends nothing')
+  await click(document.querySelector('[data-k="rec-undo"]')); await sleep(450)
+  assert.equal(byLabel('Reply text').value, 'my own words'); assert.equal(last('draft.save').draft.optionId ?? null, null); ok('Undo restores the previous draft')
+  // Owner annotation 2: Ctrl/Cmd+Enter in the composer adds the note only; IME and empty are safe; Esc cancels.
+  const before = callsOf('submitReply').length, notesBefore = draft0().length
+  select(range(document.querySelector('[data-field="background"] a').firstChild, 0, 6))
+  await key({ altKey: true, key: 'n', code: 'KeyN' })
+  const kd = async (init) => { const ev = new window.Event('keydown', { bubbles: true, cancelable: true }); Object.assign(ev, init); byLabel('New note').dispatchEvent(ev); await sleep(30); await settle() }
+  await kd({ key: 'Enter', ctrlKey: true }); assert.ok(document.querySelector('.d-nc')); assert.match(document.querySelector('.d-nc').textContent, /Write the note first/)
+  await setValue(byLabel('New note'), '來源', 'input')
+  await kd({ key: 'Enter', metaKey: true, isComposing: true }); assert.ok(document.querySelector('.d-nc'))
+  await kd({ key: 'Enter', ctrlKey: true }); await sleep(450)
+  assert.equal(document.querySelector('.d-nc'), null); assert.equal(draft0().length, notesBefore + 1); assert.equal(callsOf('submitReply').length, before); ok('Ctrl/Cmd+Enter adds the note only (empty and IME composition ignored); the decision is not submitted')
+  select(range(document.querySelector('[data-field="background"] a mark').firstChild, 0, 6)); await key({ altKey: true, key: 'n', code: 'KeyN' })
+  await setValue(byLabel('New note'), 'discard me', 'input')
+  await kd({ key: 'Escape' }); assert.equal(document.querySelector('.d-nc'), null); assert.equal(draft0().length, notesBefore + 1); assert.ok(document.querySelector('.d-sheet')); ok('Esc dismisses the composer and adds nothing')
+  // Owner annotation 4: the image opens in a viewport-level viewer; Esc closes it and focus returns.
+  await click(document.querySelector('[data-k="fig-open-fold-sample"]'))
+  const z = document.querySelector('.d-zoom')
+  assert.ok(z && z.parentElement === document.body && !z.closest('.d-sheet')); assert.equal(z.getAttribute('aria-modal'), 'true'); assert.ok(document.querySelector('.d-solo').hasAttribute('inert')); ok('image viewer is outside the sheet, modal, with the page inert')
+  await click(z.querySelector('[data-zk="in"]')); assert.equal(z.querySelector('.d-zoom-level').textContent, '150%')
+  await click(z.querySelector('[data-zk="fit"]')); assert.equal(z.querySelector('.d-zoom-level').textContent, 'Fit'); ok('zoom in and fit')
+  const esc = new window.Event('keydown', { bubbles: true, cancelable: true }); Object.assign(esc, { key: 'Escape' }); document.dispatchEvent(esc); await settle()
+  assert.equal(document.querySelector('.d-zoom'), null); assert.ok(!document.querySelector('.d-solo').hasAttribute('inert')); assert.ok(document.querySelector('.d-sheet')); ok('Esc closes only the viewer')
+} else if (scenario === 'sections') {
+  const body = document.querySelector('.d-sheet-body')
+  const heads = all('.d-sheet-body h2, .d-sheet-body .rich-h').map((h) => h.textContent)
+  assert.deepEqual(heads.filter((t) => /^(Description|Background)$/.test(t)), ['Background', 'Description']); ok('Background then Description, each once (authored headings kept, none duplicated)')
+  assert.equal(all('.d-sheet-body h2.d-sec-h').filter((h) => /Description|Background/.test(h.textContent)).length, 0); ok('no extra section heading when the authored Markdown already has it')
+  assert.ok(document.querySelector('.d-desc') && !document.querySelector('.d-desc').hasAttribute('data-field')); ok('Description carries no note anchors')
+  assert.ok(body.querySelector('.d-progress').compareDocumentPosition !== undefined && body.querySelector('h1').nextElementSibling.classList.contains('d-srcline')); ok('title, source line and state card stay separate above the sections')
+  const raw = db.get('sections').background
+  const t = [...document.querySelectorAll('[data-field="background"] p')].at(-1).firstChild
+  select(range(t, 4, 14)); await key({ altKey: true, key: 'n', code: 'KeyN' }); await addNote('narrow'); await sleep(450)
+  const n = last('draft.save').draft.annotations[0]
+  assert.equal(n.quote, 'west aisle'); assert.equal(raw.slice(n.start, n.end), 'west aisle'); assert.equal(n.start, raw.indexOf('west aisle')); ok('background note offsets are raw offsets into the unchanged background')
+  assert.equal(all('[data-field="recommendation"]').length, 1); assert.ok(document.querySelector('.d-dock [data-field="recommendation"]')); ok('recommendation stays in the reply card')
 } else if (scenario === 'localonly') {
   await setValue(byLabel('Reply text'), 'Tuesday', 'input')
   await click(find('button', 'Submit reply'))

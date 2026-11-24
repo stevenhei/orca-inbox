@@ -659,7 +659,6 @@ function QuestionBody(props: { d: Decision }) {
         {due && <Badge tone={due.overdue ? 'danger' : 'warning'}>{due.text}</Badge>}
       </Row>
       <Section title="Background" text={d.background} />
-      <Section title="Recommendation" text={d.recommendation} />
       {d.blockedWork.length > 0 && <Section title="Blocks" text={d.blockedWork.map((x) => `- ${x}`).join('\n')} />}
       {!n && d.evidence.length > 0 && <Text muted size="xs">{`${d.evidence.length} evidence item${d.evidence.length > 1 ? 's' : ''} (${d.evidence.map((e) => e.label).join(', ')}): open the wide review to view them.`}</Text>}
       {thread.length > 0 && (
@@ -785,7 +784,6 @@ function DecisionView(props: { title: string }) {
           <Button size="sm" variant="ghost" onPress={back}>← Back to list</Button>
           <Button size="sm" variant="outline" icon="open-external" disabled={read(wide)?.state === 'opening'} onPress={openWide}>Open wide review</Button>
         </Row>
-        {d && <Pager d={d} />}
         <WideNotice what="the decision" />
       </Box>
       <Box grow scroll="y" minHeight={0} gap="sm">
@@ -802,7 +800,10 @@ function DecisionView(props: { title: string }) {
         {d && <QuestionBody d={d} />}
       </Box>
       {d && (
-        <Box shrink={false} border padding="sm" radius="md" background="card">
+        // Variant D's reply card: question paging and the recommendation (shown once) above the reply.
+        <Box shrink={false} border padding="sm" radius="md" background="card" maxHeight="58%" scroll="y" gap="sm">
+          <Pager d={d} />
+          <Section title="Recommendation" text={d.recommendation} />
           {nativeOf(d) ? <NativeFooter d={d} /> : <ChatFooter d={d} />}
         </Box>
       )}

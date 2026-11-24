@@ -133,17 +133,22 @@ export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
   const local = boundary.localSources
   let intake: Promise<boolean> | undefined
   let hintsPending = false
+  let attachmentPending = false
   const syncHints = (caller: OwnerCaller) => {
     if (!local) return Promise.resolve(false)
     return intake ??= (async () => {
       let pending = false
+      attachmentPending = false
       try {
         const names = await local.hints()
         await Promise.all(names.map(async name => {
           try {
             if (await processChatHint(local.cli, backend, caller, name)) await local.removeHint(name)
             else pending = true
-          } catch { pending = true }
+          } catch (error) {
+            pending = true
+            if (error instanceof InboxError && error.message.startsWith('A staged local image is missing or invalid.')) attachmentPending = true
+          }
         }))
       } catch { pending = true }
       hintsPending = pending
@@ -167,6 +172,7 @@ export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
     const page = await backend.listDecisionPage(caller, input, native.rows)
     const remoteGap = 'Paired Chat submissions cannot be read yet. The local lookup hint is not exposed by Orca’s paired CLI.'
     const coverage = [pending ? 'Some Chat submissions are waiting for verification.' : '',
+      !remoteScope && attachmentPending ? 'A staged local image is missing or invalid. Stage it again or use a source link.' : '',
       native.hasPairedCoverage || (!host && caller.workspaces.some(workspace => workspace.hostId !== 'local')) ? remoteGap : ''
     ].filter(Boolean)
     const plugin: SourceAvailability = remoteScope

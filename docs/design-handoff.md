@@ -1,6 +1,6 @@
 # Design handoff: Decision Inbox V1 (FE)
 
-Audience: the FE implementation and verification sessions. Scope and release gate stay in [v1-spec.md](v1-spec.md); ownership and the acceptance matrix stay in [implementation-handoff.md](implementation-handoff.md). This file records the interaction decisions the owner made in the FE design session, how each state looks, and what the working prototype already does.
+Audience: the FE implementation and verification sessions. Scope and release gate stay in [v1-spec.md](v1-spec.md); ownership and the acceptance matrix stay in [implementation-handoff.md](implementation-handoff.md). This file records the interaction decisions the owner made in the FE design session, how each state looks, and what the shipped FE does. The owner selected **Variant D** (design lab `orca-inbox-design-lab/variant-d`, production briefs `PRODUCTION-BRIEF.md` and `PRODUCTION-BRIEF-REV3.md`); it is implemented in the wide editor (dashboard and single review). There is no open variant selection. To see it in a browser, use the [editor preview](editor-preview.md).
 
 ## What exists
 
@@ -11,9 +11,11 @@ The FE is wired to the plugin worker through the shared contract and [backend-pr
 | [src/model.ts](../src/model.ts) | Pure view-model: scope identity, actionable rule, sort, search, deadline text. Keep and reuse; the worker can share it. |
 | [src/client.ts](../src/client.ts) | Worker requests that always resolve to a `Result`, live clock and desktop zone, reply-ID minting, draft reconciliation. |
 | [src/panel.tsx](../src/panel.tsx) | Narrow sidebar panel, Orca components only, on bounded `listDecisionPage` pages. |
-| [src/review.ts](../src/review.ts) | Wide review tab and Inbox Settings in one isolated custom editor (plain DOM), on worker requests. |
+| [src/review.ts](../src/review.ts) | Wide editor (plain DOM, isolated custom editor): Variant D dashboard, single review and Inbox Settings, on worker requests. |
+| [src/dashboard-style.ts](../src/dashboard-style.ts) | Variant D stylesheet, ported from the design lab's `d.css` and scoped to `.d-app` / `d-` classes. |
 | [src/inbox.test.tsx](../src/inbox.test.tsx) | Orca-runner tests for the model and the panel against controlled worker answers. |
 | [scripts/dom-smoke.mjs](../scripts/dom-smoke.mjs) | DOM scenarios for the editor (linkedom) against a recording stand-in worker, run by `npm run test:dom`. |
+| [scripts/preview-editor.mjs](../scripts/preview-editor.mjs) | Browser preview and real-Chromium layout checks (`--shots`); see [editor-preview.md](editor-preview.md). |
 
 ## Sources (phased V1, owner-approved)
 
@@ -46,22 +48,31 @@ Run everything: `npm test` (typecheck, `orca plugin test`, `orca plugin check`, 
 | Actionable rows | Shown by default: **Awaiting answer** and **Undelivered**. **Submitted / awaiting confirmation** and **Agent received** appear only with **Include history**. |
 | One row per question | A package is not one row. Each question is its own row, sorted on its own. Rows from the same package carry a "Package · N questions" badge. |
 | Deadlines in the list | Relative text only ("Overdue 21h", "Due in 3h", "Due in 2d"). The full timestamp belongs to the wide review. |
-| Annotations | A sticky **Notes sidebar** in the wide review. Below 800px the sidebar is hidden; **Add note** opens a **modal composer** instead. |
+| Annotations | One contextual note composer next to the selected text or image (see [Notes](#wide-review)). Saved notes are listed in a **Notes** panel opened from the reply card (a modal dialog below 800px); there is no always-visible Notes sidebar. |
 | Settings entry | A gear icon at the top right of the panel. The form opens in the wide editor. Placement may move top left if the broader design needs it. |
-| Receipt display | Four-step strip in the wide review, one status badge in the list row. The four states are never merged. |
+| Receipt display | The wide review shows an always-visible current-state card (state, one sentence, recorded milestones only); the panel and table rows show one status. The four states are never merged. |
+| Dashboard direction | Variant D, with the owner's later annotations: workspace picker top right of the tabs row; title-only question cells; recommendation shown once in the reply card with the pager; labelled icon controls; agent narrative context; Ctrl/Cmd+Enter in notes saves only the note; state card; full-screen images; Use PM recommendation; source actions; note composer that closes after saving; resizable sheet; Background before Description; clearer grouping. |
 | Language | Specs, handoffs and design discussion are English; owner-facing reports are Traditional Chinese. |
 
-Proposed by design and **not explicitly confirmed** by the owner: the evidence layout below. Confirm it during review.
+Proposed by design and **not explicitly confirmed** by the owner: keeping the side-by-side compare inside the collapsed **All images** section (see [Known differences](#known-differences-from-the-prototype)).
 
 ## Reader layout (owner readability request)
 
-Both the in-panel reader and the wide review read top to bottom: item context, the active question as the heading, compact badges (source, status, P0/P1, deadline), **Background** and **Recommendation** as sanitized Markdown (paragraphs, bold, http(s) links, lists), blocked work, then the recorded thread. Secondary metadata (**Details**) and the verbatim source text (**Original activity**) are collapsed. Options appear once: in the reply area for Chat decisions, as option chips in the native footer for Bot Items. **Question i / N** with Previous / Next pages within a package (worker `package.index/size/questionIds`, else the loaded package page; unknown totals read `N+`); each question keeps its own draft.
+**Narrow panel reader.** Top to bottom: item context, the active question as the heading, compact badges (source, status, P0/P1, deadline), **Background** as sanitized Markdown (paragraphs, bold, http(s) links, lists), blocked work, the recorded thread, and collapsed **Details** / **Original activity**. The reply card at the bottom (a non-shrinking `Box`, at most 58% of the panel height, scrolling on its own) holds **Question i / N** with Previous / Next, the **Recommendation** (shown once, only here), then the native footer or the reply controls. Orca has no sticky/dock component; the card stays in view only when the host gives the panel a definite height (desktop-unverified). Each question keeps its own draft.
 
-The reply area sits at the bottom. Wide review: a `position: sticky; bottom: 0` dock. Panel: Orca has no sticky/dock component, so the reader is a column `Box` (`height="100%"`) with the question in its own `Box grow scroll="y"` and the reply area in a non-shrinking `Box` after it; this keeps the reply area in view only when the host gives the panel a definite height (desktop-unverified). Native Items get a compact footer ("Answer in Orca's Bot Items: …", the options, read-only note) and no reply controls. Wide-review Markdown is built from text nodes with recorded source offsets, so anchored notes keep exact UTF-16 offsets.
+**Wide review (Variant D sheet).** A header (Back and Close in the dashboard, Copy decision link, Reset panel width), a body that scrolls on its own, and a reply card anchored at the bottom. Body order: title; source line with source actions; current-state card; facts card (priority, status, deadline, opened or "as of", blocks); **Background** then **Description**, each under its own heading only when supplied (an authored heading that already matches is not repeated; Description carries no note anchors); all images (collapsed when the agent placed them inline); linked evidence; the recorded thread; collapsed **Details** and **Original activity**. Background Markdown is built from text nodes with recorded source offsets, so anchored notes keep exact UTF-16 offsets into the unchanged background.
+
+**Narrative context.** Headings, paragraphs, lists, bold, inline code and http(s) links. Fenced code is inert text with a language label ("copy only, never run by Inbox") and a Copy button. Inline images come from the worker's `inlineImages` placements (raw UTF-16 offsets into the background, before a line or at the end, never inside a fence): the exact evidence version is fetched with `getSnapshot` and shown with its plain-text caption, width and height; a denied or failed placement is an "Image unavailable" placeholder without metadata. No raw HTML runs, nothing is executed, and no image is loaded except through the authorized snapshot request.
 
 ## Dashboard tab
 
-`+` menu / command palette → **Decision Inbox dashboard** (`newFiles` template `templates/dashboard.orca-decision`, content `{"view":"dashboard"}`) opens in the existing `review` editor. Wide: a compact queue (This workspace / All workspaces, search sent to the worker, Include history, source and mail notices, Load more, arrow keys between rows) beside the reader; the first decision opens by default. Narrow (≤800px): one surface at a time with **← Back to queue**. Selecting a decision rebinds the reader in the same tab (no new tabs); the previous draft is saved under its own question first; late answers from an earlier selection or search are dropped.
+`+` menu / command palette → **Decision Inbox dashboard** (`newFiles` template `templates/dashboard.orca-decision`, content `{"view":"dashboard"}`) opens in the existing `review` editor.
+
+**List.** Tabs **Pending** (actionable) / **Answered** / **All** with counts (arrow keys move between tabs), and the **Workspace** picker at the top right of the same row (This workspace, All workspaces, or one workspace seen in the rows; it adds no filter chip). The toolbar has **Priority**, **Status**, **Search** (sent to the worker, debounced), **Reset**, and, set apart from the filters, a labelled **Group by** control (Urgency, Priority, Status, Workspace). Below 900px Priority and Status sit behind a **Filters** toggle. Active filters show as removable chips. Source and mail notices appear once above the table; **Load more** pages the worker.
+
+**Table.** Columns: Question (the title button only: no tags, badges, counts or "Question x/N"), Background snippet, Priority, Status, Source (Chat / Bot Item), Workspace, Due. Each group has a full-width heading band with its name and a count badge, more space above it than below, so it sits with its own rows. The selected row has `aria-current="true"` on its title, a tint, a 4px bar and a bold title. Arrow keys move between row titles. Below 900px rows become cards and the source and workspace show inline.
+
+**Sheet.** Choosing a row opens the decision in the right-hand sheet without a new tab; the previous draft is saved under its own question first, and late answers from an earlier selection or search are dropped. Nothing opens by default. At 900px and wider the sheet sits beside the table and can be **resized**: drag the divider (pointer or touch), or focus it (`role="separator"`) and use ←/→ (Shift for larger steps), Home/End for the limits, Enter or a double-click to reset; **Reset panel width** in the header does the same. The sheet stays between 380px and the width that leaves the list column 460px. Below 900px the sheet is a full-screen modal (`aria-modal`, the list `inert`) with Back and Close. Esc closes the innermost layer: image viewer, note composer, Notes panel, then the sheet; focus returns to the row title.
 
 ## Narrow panel
 
@@ -83,19 +94,33 @@ Sort: P0 first; then overdue or due the same UTC day; then everything else. Insi
 
 ## Wide review
 
-Layout: content column plus the Notes sidebar. Order: meta line (project, workspace, host chip when not local, priority, deadline, blocked work); title; routing note (the reply goes to the original chat, wherever the owner is); overdue alert; same-package questions with their states; Background; Recommendation; Options; Evidence; Reply; delivery strip; Source links.
+The same sheet as in the dashboard, full-width when the editor opens one decision (`{"questionId": …}`); see [Reader layout](#reader-layout-owner-readability-request).
 
-**Evidence.** Seven images default to one large viewer with a thumbnail row. **Compare side by side** opens two viewers: click a thumbnail for the right pane, Shift-click for the left. Each viewer has zoom out, zoom in and reset, and its own note field. Placeholders keep the real width, height and alt text. Snapshots load through `getSnapshot`: not found shows "Snapshot expired or missing", forbidden shows "You do not have access to this snapshot", unavailable offers **Try again**. There is no re-attach action (no such operation). The single viewer with optional compare is still a proposal, not owner-signed. Linked evidence is a list of external links with versions.
+**Current state.** An always-visible card under the title: the state, one sentence, and only the milestones that were recorded (Opened; Answer or Follow-up saved; Submitted to Orca mail with time and message ID; Agent received with receipt ID; Delivery failed with the reason), plus at most one next step. Bot Items show Orca's status and the snapshot time. The current state carries `aria-current="step"`. Undelivered replies keep the alert with the reason, **Retry (same reply ID, same destination)** only when listed in `actions`, and **Copy reply**.
 
-**Notes.** Image notes carry `evidenceId` and `version`. Selecting text in Background offers **Add note (Alt+N)**; the note stores the quote and UTF-16 start and end offsets with the question `revision`, as the contract requires. In the wide layout the new note appears in the sidebar with its field focused. Below 800px a native `<dialog>` modal collects the text. Notes are sent with the reply in one operation.
+**Source actions.** Beside the source line: direct links for the worker's `workItemLinks` that pass the client allow-list (https only, no credentials; `github.com/<owner>/<repo>/issues|pull/<n>` and `linear.app/<team>/issue/<ID>`), deduplicated by case, trailing slash, query and hash, opened through `orca.shell.openExternal` on a click; and **Copy session ID** when `originalSessionId` is known. There is no "Focus session" action: Orca has no verified way to focus that session.
 
-**Reply.** Radio options when the question has them, plus a text field. With an option the text is `detail`; without one it is a text answer. Submit with the button or Ctrl/Cmd+Enter. An empty reply is refused with a live-region message and does not change state. A send acts only on the decision as drawn: if another surface recorded an answer while the owner was writing, nothing is sent, the recorded answer and receipt are shown, and the owner's text and option stay as **Your unsent answer** with **Write a follow-up from this text**, **Copy** and **Discard**. A follow-up is never composed or sent automatically.
+**Images.** Inline images (and a ⤢ button in each caption) open a full-screen viewer appended to the page, not the sheet (`role="dialog"`, `aria-modal`, the editor `inert`, focus on Close): fit to screen, zoom ×1.5 steps to ×8 (+ / − / 0, the wheel at the cursor, double-click), drag or arrow keys to pan when zoomed (clamped), Esc or Close; focus and the sheet's scroll return. **All images** keeps the optional side-by-side compare (thumbnail fills the right pane, Shift-click the left), per-viewer zoom and a note field per image. Snapshot failures read "Snapshot expired or missing", "You do not have access to this snapshot", or offer **Try again**; there is no re-attach action.
 
-**Delivery strip.** Four steps, the current one marked `aria-current="step"`: Awaiting answer, Submitted / awaiting confirmation, Agent received, Undelivered. Undelivered shows an alert with the reason, **Retry (same reply ID, same destination)** and **Copy reply**; the reply is kept.
+**Notes.** One contextual flow. Select text in Background or the Recommendation and press **Add note (Alt+N)**, or press ✎ under an image: a small composer opens next to it (a bottom sheet on small screens) with the quote or caption, a text box, **Cancel** and **Add note**. Ctrl/Cmd+Enter adds the note and never submits the decision (ignored while an input method is composing); Esc cancels. An empty note or a failed save keeps the composer open with the text. After a successful save the composer and the Notes panel close, the sheet's scroll is kept, focus returns to where the note started (✎ or the Notes button), the text is highlighted at its anchor, and the reply card shows "Note saved with your draft … Not sent yet" with **Edit notes**. The **Notes (n)** button in the reply card opens the Notes panel (a modal dialog below 800px) to edit, remove or **Go to** each note. Text notes store the quote and UTF-16 start and end offsets with the question `revision`; image notes carry `evidenceId` and `version`. Notes are saved with the draft and sent with the reply in one operation.
 
-**Answered question.** The initial reply shows as it was sent, with its accepted time, notes count and its own delivery line (receipt ID and time, or "waiting for a matching receipt", or the undelivered alert). Follow-ups append below, indented with a dashed border, each with its own delivery line. The original is never rewritten. A follow-up box (Ctrl/Cmd+Enter to send) sits under the thread; the button is `aria-disabled` while empty.
+**Reply card (Chat decisions).** Anchored at the bottom of the sheet; at most 58% of its height, scrolling on its own, compacted when the viewport is short so the text box and Submit stay visible with an on-screen keyboard. Order: Recommendation (shown once, clamped to three lines with an expand control) with the package pager **i / N** in its header (labelled previous/next icons; unknown totals read `N+`); option chips; **Use PM recommendation**; the reply text (Ctrl/Cmd+Enter submits); notices; a hint line, **Notes (n)** and **Submit reply** (or **Send follow-up**). **Use PM recommendation** selects the option named by `recommendedOptionId`, otherwise puts the recommendation text in the reply and never guesses an option; when a draft already exists it first asks "Replace your draft with the PM recommendation?" with focus on **Keep my draft**; after replacing it shows "Proposed from the PM recommendation … Nothing is sent until you submit" with **Undo**. Each question keeps its own draft when paging. A send acts only on the decision as drawn: if another surface recorded an answer while the owner was writing, nothing is sent and the owner's text stays as **Your unsent answer** with **Write a follow-up from this text**, **Copy** and **Discard**. An empty reply is refused with a live-region message.
+
+**Reply card (Bot Items).** Read-only: the Recommendation and pager, "Answer in Orca's Bot Items: bot …, item …", **Copy location**, the options as text and "Read-only copy: Decision Inbox cannot answer, resolve or open this Item for you." No reply, notes, Use PM recommendation, retry, resolve or deep link.
+
+**Answered question.** The initial reply shows as it was sent, with its accepted time, notes count and its own delivery line. Follow-ups append below, each with its own delivery line. The original is never rewritten; a follow-up is never composed or sent automatically.
 
 **Not found.** A missing or inaccessible `questionId` shows an alert instead of a blank tab.
+
+## Known differences from the prototype
+
+- No Answer / Clarify toggle: the contract has no clarify path.
+- The primary action is **Submit reply** (a real reply is sent, with truthful delivery state), not the prototype's local **Save**.
+- Notes are saved with the draft when added; the prototype's "pending until saved" note state does not exist.
+- No **Focus session** button (the prototype's is a stub); only **Copy session ID**.
+- Compare lives in the collapsed **All images** section instead of a header icon.
+- Rows do not show Draft / saved-note marks: list rows carry no draft data.
+- The narrow sidebar panel follows D only where Orca components allow (pager and recommendation in the footer card); the table, sheet, composer and viewer are wide-editor features.
 
 ## Inbox Settings
 
@@ -105,7 +130,7 @@ The `Settings` shape (`defaultTemplate`, `exceptions[{repo, template}]`) lives o
 
 ## Keyboard and focus
 
-List and toolbar use Orca's built-in keyboard handling. In the editor: Alt+N adds a note from the selection; Ctrl/Cmd+Enter submits the reply or the follow-up; Esc dismisses the selection pop-up and, in the modal, closes it with focus returning to the opener (native `<dialog>`). Focus rings use `:focus-visible` outlines. State changes announce through a `role="status"` live region. ARIA state attributes are strings (`aria-pressed="true"`), enforced in the `el()` helper and tested.
+The panel uses Orca's built-in keyboard handling. In the editor: arrow keys move between dashboard tabs and between row titles; Alt+N opens the note composer for the selection; Ctrl/Cmd+Enter submits the reply or follow-up from the reply box only, and in a note composer adds the note only; the sheet divider resizes with the arrow keys, Home, End and Enter; Esc closes the innermost layer (viewer, composer, Notes panel, sheet) with focus returned to its opener. Focus rings use `:focus-visible` outlines. State changes announce through a `role="status"` live region. ARIA state attributes are strings (`aria-pressed="true"`), enforced in the `el()` helper and tested.
 
 ## Acceptance examples (fixtures, clock 2030-06-14 12:00Z)
 
@@ -114,9 +139,11 @@ Covered by tests today:
 - This workspace on local `studio` shows only `image-review` and `schedule`; paired `studio` is excluded (`inbox.test.tsx`).
 - Search: `layout` by ID, `contrast` by background, `Fold-out` by option, `錄音` by recommendation; `matte sample` finds `layout` only with the history fixture and history on.
 - `historyExample` is Agent received and hidden by default.
-- Seven-image review, notes, expired snapshot, submit, and the four-state strip; answered thread, appended follow-up and undelivered retry; settings validation, exceptions, preview and save; not-found alert (`dom-smoke.mjs`).
+- Seven-image review, notes, expired snapshot, submit, and the current state; answered thread, appended follow-up and undelivered retry; settings validation, exceptions, preview and save; not-found alert (`dom-smoke.mjs`).
 
-Not covered, for FE verification: selection-offset capture against the real DOM; the 800px sidebar-to-modal switch; modal focus return; side-by-side layout at narrow widths; theme colors from `--orca-*`; all behavior inside a real Orca desktop.
+Also covered: the dashboard tabs, filters, grouping, selection, narrow modal sheet and Esc; the `richContext` narrative (inline image at its raw offset, denied placeholder, inert code and Copy, code-block note offsets); Background-then-Description with no duplicate headings and unchanged Background offsets; the note composer (empty and failed saves, Ctrl/Cmd+Enter isolation, Esc, focus return); Use PM recommendation (confirm, Undo, no guessed option); source-action allow-list; the image viewer (`dom-smoke.mjs`). Real-Chromium layout checks at 1920, 1603×656, 1280, 820, 390 and short heights run with `npm run preview:editor -- --shots` ([editor-preview.md](editor-preview.md)).
+
+Not covered, for desktop acceptance: everything inside a real Orca desktop (frame CSP for `data:` images, `orca.shell.openExternal` consent, whether `inbox.changed` reaches the isolated editor); real Chinese IME in the reply box and note composer; touch drag of the sheet divider and image pan; screen-reader output; theme colors beyond `--orca-foreground/background`; the narrow panel's reply card height.
 
 ## Assumptions to prove (also marked `ASSUMPTION` in code)
 
@@ -124,7 +151,7 @@ Not covered, for FE verification: selection-offset capture against the real DOM;
 | --- | --- | --- |
 | A1 | The focused workspace comes from `workspace.changed`; the fixture hard-codes local `studio`. | panel |
 | A2 | The review tab is a `.orca-decision` reference file opened by the worker with `editor.open` (worker-only), requested from the panel as `plugin.request` named `review.open` (`{questionId}`) or `settings.open`. These names are now the shipped requests; the worker opens a minimal reference file in the focused local workspace. Cross-repo placement without moving workspace focus still needs desktop proof. | panel, review |
-| A3 | Private snapshot bytes reach the editor through the worker. The prototype draws placeholders from metadata. | review |
+| A3 | Private snapshot bytes reach the editor only through the worker's `getSnapshot` (inline placements and the image list); the frame's CSP for `data:` images is desktop-unproven. | review |
 | A4 | Only `--orca-foreground` and `--orca-background` are confirmed; all other colors are derived with `color-mix`. | review |
 | A5 | A reply routes to the original Chat, including on a paired host. This is a release gate. | review |
 | A6 | Drafts (with compare-and-set revisions), follow-ups and settings persist through the worker. Desktop restart behaviour is unproven. | review |
@@ -132,5 +159,5 @@ Not covered, for FE verification: selection-offset capture against the real DOM;
 ## Known gaps for implementation
 
 - The package reply flow is per question; there is no "answer the whole package" action.
-- Desktop-only checks: real Chinese IME, click timing after typing, scroll retention, the 800px dialog, compare stacking below 640px, macOS Option+N, whether `inbox.changed` reaches the isolated editor, `data:` image CSP, panel remount.
+- Desktop-only checks: real Chinese IME (reply box and note composer), click timing after typing, sheet scroll retention after notes and image viewer, the Notes dialog below 800px, compare stacking below 640px, macOS Option+N and Cmd+Enter, divider drag by touch, whether `inbox.changed` reaches the isolated editor, `data:` image CSP, external-open consent for source actions, panel remount.
 - Plugin load on Orca 1.4.271 from the CLI is blocked on this runtime ("Plugin service is not available"); desktop load is by Settings → Plugins → Development folders.

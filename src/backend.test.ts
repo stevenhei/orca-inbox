@@ -1,5 +1,6 @@
 import { assert, hostError, mockHost, mountWorker, test } from 'orca/testing'
 import { decisions, reviewReply } from '../fixtures/decisions.ts'
+import { richContext } from '../fixtures/rich-context.ts'
 import { InboxBackend } from './backend.ts'
 import { orcaStorage } from './backend-storage.ts'
 import type { JsonValue, PanelRequestContext } from 'orca/worker'
@@ -650,7 +651,7 @@ test('desktop ingress uses only one matching assistant record from a resolved lo
   const marker = (input = request) => 'ORCA-INBOX-V1 ' + JSON.stringify({ op: 'submit', input })
   const addResponse = (text: string) => entries.push({ kind: 'message', role: 'assistant', text })
   const synthetic = { uid: 'native-uid', number: 4, owner: { name: 'Lab' }, status: 'needs_you', title: 'Layout',
-    description: 'Context\nORCA-DECISION-META {"priority":"P0","blockedWork":["Layout"]}', createdAt: 1,
+    description: '## Description\r\nOverview\r\n\r\n```md\r\n## Background\r\n```\r\n\r\n## Background\r\nSupport [source](https://example.test/support)\r\nORCA-DECISION-META {"priority":"P0","blockedWork":["Layout"]}', createdAt: 1,
     question: { eventId: 'e42', text: 'Please choose.', decisions: [
       { question: 'Which layout?', replies: [{ label: 'Stack', detail: 'One column', recommended: true }] }
     ] } }
@@ -705,6 +706,9 @@ test('desktop ingress uses only one matching assistant record from a resolved lo
   assert.deepEqual(host.callsOf('editor.open'), [{ workspaceId, path: '.orca-decision-inbox/probe.orca-decision' }])
   const nativeRef = references[0] as { questionId: string }
   const nativeDetail = value(await worker.request('getDecision', nativeRef, panel))
+  assert.equal(nativeDetail.description, 'Overview\r\n\r\n```md\r\n## Background\r\n```\r\n\r\n')
+  assert.equal(nativeDetail.background, 'Support [source](https://example.test/support)\r\n')
+  assert.deepEqual(nativeDetail.sourceLinks, [{ label: 'source', url: 'https://example.test/support' }])
   assert.equal(nativeDetail.options[0].label, 'Stack')
   assert.deepEqual(nativeDetail.actions, [])
   assert.equal(code(await worker.request('review.open', { questionId: 'bot-item:unauthorized:e42:0' }, panel)), 'not-found')
@@ -888,14 +892,25 @@ test('the dashboard uses the authorized review editor contribution for Inbox dat
       }
     })
   } }, { host })
-  value(await backend.submitDecision(source, { ...packageInput([d]), evidence: [] }))
+  const inputPackage = packageInput([d])
+  const description = 'A separate overview.'
+  value(await backend.submitDecision(source, { ...inputPackage, evidence: [],
+    questions: [{ ...inputPackage.questions[0], description }]
+  }))
   const dashboard = { panel: 'review' }
   const page = value(await worker.request('listDecisionPage', { scope, includeHistory: false }, dashboard))
   assert.equal(page.rows[0].questionId, d.questionId)
+  assert.equal(page.rows[0].description, undefined)
+  const [legacy] = value(await worker.request('listDecisions', { scope, includeHistory: false }, dashboard))
+  assert.equal(Object.hasOwn(legacy, 'description'), false)
+  assert.equal(legacy.background, d.background)
+  assert.deepEqual(legacy.options, d.options)
   assert.equal(page.sources?.find(item => item.source === 'plugin')?.state, 'available')
   assert.equal(page.mail?.state, 'unavailable')
   const input = { questionId: d.questionId }
-  assert.deepEqual(value(await worker.request('getDecision', input, dashboard)).actions, ['reply'])
+  const detail = value(await worker.request('getDecision', input, dashboard))
+  assert.equal(detail.description, description)
+  assert.deepEqual(detail.actions, ['reply'])
   const draft = value(await worker.request('draft.get', input, dashboard))
   assert.equal(value(await worker.request('draft.save', { ...input, revision: draft.revision,
     draft: { text: 'Dashboard draft', annotations: [] }
@@ -907,4 +922,200 @@ test('the dashboard uses the authorized review editor contribution for Inbox dat
   surface = 'panel'
   assert.equal(code(await worker.request('listDecisionPage', { scope, includeHistory: true }, dashboard)), 'forbidden')
   await worker.deactivate()
+})
+
+test('ordered Markdown images preserve raw anchors and exact attachment grants across restart', async () => {
+  const h = harness()
+  const source = agentFor(question('image-review'))
+  const input = richContext
+  const [questionInput] = input.questions
+  const imageRef = questionInput.inlineImages![0]
+  const places = [{ ...imageRef, offset: 0, caption: 'First' }, imageRef, { ...imageRef, caption: 'Second at same offset' }]
+  const description = 'Overview 📐\n\n**Scope**'
+  const request = { ...input, questions: [{ ...questionInput, description, inlineImages: places }] }
+  const [saved] = value(await h.backend.submitDecision(source, request))
+  assert.deepEqual(saved.inlineImages, places)
+  const backend = h.restart()
+  const { questionId, background } = questionInput
+  const record = value(await backend.getDecision(owner, { questionId }))
+  assert.equal(record.description, description)
+  assert.equal(record.background, background)
+  assert.deepEqual(record.inlineImages, places)
+  assert.equal(value(await backend.getSnapshot(owner, { questionId, attachmentId: 'fixture-fold-v2' })).base64, image.base64)
+  const hidden = places.map(({ offset }) => ({ offset, unavailable: true }))
+  const other = value(await backend.getDecision(secondOwner, { questionId }))
+  assert.deepEqual(other.inlineImages, hidden)
+  assert.deepEqual(other.evidence, [])
+  assert.equal(code(await backend.getSnapshot(secondOwner, { questionId, attachmentId: 'fixture-fold-v2' })), 'forbidden')
+  const quote = 'Choose the easier fold.'
+  const start = background.indexOf(quote)
+  value(await backend.submitReply(owner, {
+    ...initial(questionId, 'ordered-anchor'), annotations: [{
+      kind: 'selection', text: 'Review this sentence',
+      anchor: { kind: 'question', field: 'background', revision: 1 }, start, end: start + quote.length, quote
+    }]
+  }))
+  h.revoke(owner.id, 'fixture-fold-v2')
+  assert.deepEqual(value(await backend.getDecision(owner, { questionId })).inlineImages, hidden)
+  const page = value(await backend.listDecisionPage(owner, { scope, includeHistory: true }))
+  assert.equal(page.rows[0].inlineImages, undefined)
+  assert.equal(page.rows[0].description, undefined)
+  assert.equal(code(await backend.submitDecision(source, request)), 'ok')
+  assert.equal(code(await backend.submitDecision(source, {
+    ...request, questions: [{ ...request.questions[0], description: 'Changed overview' }]
+  })), 'conflict')
+  assert.equal(code(await backend.submitDecision(source, {
+    ...request, questions: [{ ...questionInput, inlineImages: [{ ...imageRef, caption: 'Changed' }] }]
+  })), 'conflict')
+})
+
+test('ordered placements reject invalid boundaries, fenced code and mismatched snapshot versions', async () => {
+  const h = harness()
+  const source = agentFor(question('image-review'))
+  const [q] = richContext.questions
+  const ref = q.inlineImages![0]
+  for (const inlineImages of [
+    [{ ...ref, offset: ref.offset + 1 }],
+    [{ ...ref, offset: q.background.indexOf('printf') }],
+    [ref, { ...ref, offset: 0 }],
+    [{ ...ref, version: ref.version + 1 }],
+    [{ ...ref, caption: 'x'.repeat(1025) }],
+    Array.from({ length: 21 }, () => ref)
+  ]) {
+    assert.equal(code(await h.backend.submitDecision(source, { ...richContext, questions: [{ ...q, inlineImages }] })), 'invalid')
+  }
+  const fenced = q.background.replace('```sh\n', '```sh\n\n')
+  assert.equal(code(await h.backend.submitDecision(source, { ...richContext, questions: [
+    { ...q, background: fenced, inlineImages: [{ ...ref, offset: fenced.indexOf('printf') }] }
+  ] })), 'invalid')
+  assert.equal(code(await h.backend.submitDecision(source, {
+    ...richContext, evidence: [{ kind: 'link', evidenceId: ref.evidenceId,
+      version: ref.version, label: 'Sample', url: 'https://example.test/sample' }]
+  })), 'invalid')
+  for (const [before, after] of [
+    ['- Example\n\n    ```sh\n\n', '    printf inert\n    ```\n\nAfter.'],
+    ['- Example\n\n', '  Continued item'],
+    ['- Example\n\n', '- Another item'],
+    ['> Example\n\n', '> Another quoted line'],
+    ['Paragraph\n\n', '\nNext paragraph']
+  ]) {
+    assert.equal(code(await h.backend.submitDecision(source, { ...richContext, questions: [
+      { ...q, background: before + after, inlineImages: [{ ...ref, offset: before.length }] }
+    ] })), 'invalid')
+  }
+  for (const description of [null, 12, 'x'.repeat(16_385)]) {
+    assert.equal(code(await h.backend.submitDecision(source, {
+      ...richContext, questions: [{ ...q, description }]
+    })), 'invalid')
+  }
+  const { inlineImages: _optional, ...legacy } = q
+  const [saved] = value(await h.backend.submitDecision(source, { ...richContext, questions: [legacy] }))
+  assert.equal(saved.inlineImages, undefined)
+  assert.equal(saved.background, q.background)
+  assert.equal(saved.description, undefined)
+})
+
+test('local image intake reports missing staging while a verified link-only Chat can still submit', async () => {
+  const workspaceId = 'local-image-intake-workspace'
+  const session = '0828e9bd-ac0a-4a0d-8017-8232af389711'
+  const hint = `submit.${session}.${richContext.requestId}`
+  const host = mockHost({ capabilities: ['storage:own', 'workspace:read'], results: {
+    'workspace.list': { workspaces: [{ id: workspaceId, hostId: 'local', kind: 'worktree',
+      name: 'Synthetic image test', path: '/fixture', branch: null }], truncated: false }
+  } })
+  let request = richContext
+  let removed = false
+  const worker = await mountWorker({ default(orca) {
+    registerDesktopWorker(orca, {
+      hints: async () => removed ? [] : [hint],
+      removeHint: async () => { removed = true },
+      async cli(args) {
+        if (args.join(' ') === 'bot list') return { bots: [] }
+        if (args.join(' ') === 'environment list') return { environments: [] }
+        if (args[1] === 'show') return { kind: 'chat', orcaSessionId: session, places: [
+          { kind: 'chat', orcaSessionId: session, worktreeId: workspaceId, hostId: 'local', agent: 'codex' }
+        ] }
+        if (args[1] === 'read') return { kind: 'chat', source: 'chat', state: 'done', orcaSessionId: session, entries: [
+          { kind: 'message', role: 'user', text: 'Run a synthetic intake test.' },
+          { kind: 'message', role: 'assistant', text: 'ORCA-INBOX-V1 ' + JSON.stringify({ op: 'submit', input: request }) }
+        ] }
+        throw new Error('Unexpected CLI command.')
+      }
+    })
+  } }, { host })
+  const panel = { panel: 'inbox' }
+  const query = { scope, includeHistory: false }
+  const rejected = value(await worker.request('listDecisionPage', query, panel))
+  assert.equal(rejected.rows.length, 0)
+  assert.match(rejected.sources?.find(source => source.source === 'plugin')?.message ?? '', /Stage it again or use a source link/)
+  assert.equal(removed, false)
+  request = { ...richContext, evidence: [], questions: richContext.questions.map(({ inlineImages: _images, ...q }) => q) }
+  const fallback = value(await worker.request('listDecisionPage', query, panel))
+  assert.equal(fallback.rows[0].questionId, request.questions[0].questionId)
+  assert.equal(fallback.sources?.find(source => source.source === 'plugin')?.state, 'available')
+  assert.equal(removed, true)
+  await worker.deactivate()
+})
+
+test('ordinary detail retains explicit recommendations and exposes only recognized existing work-item URLs', async () => {
+  const h = harness()
+  const d = question('schedule')
+  const sessionId = '66859c3c-6549-4532-a984-61566084467a'
+  const source = { ...agentFor(d), id: sessionId, origin: { ...d.origin, sessionId } }
+  const pack = packageInput([d])
+  const optionId = d.options[0].optionId
+  const sourceLinks = [
+    { label: 'Existing issue', url: 'https://github.com/example/project/issues/42' },
+    { label: 'Existing PR', url: 'https://github.com/example/project/pull/19' },
+    { label: 'Existing Linear issue', url: 'https://linear.app/team/issue/D-12/title' },
+    { label: 'Documentation', url: 'https://example.test/docs' },
+    { label: 'Lookalike', url: 'https://github.com.example.test/example/project/issues/42' },
+    { label: 'Unsupported path', url: 'https://github.com/example/project/tree/main' }
+  ]
+  assert.equal(code(await h.backend.submitDecision(source, {
+    ...pack, questions: [{ ...pack.questions[0], recommendedOptionId: 'missing-option' }]
+  })), 'invalid')
+  value(await h.backend.submitDecision(source, {
+    ...pack, sourceLinks, questions: [{ ...pack.questions[0], recommendedOptionId: optionId, originalSessionId: 'untrusted' }]
+  }))
+  const detail = value(await h.backend.getDecision(owner, { questionId: d.questionId }))
+  assert.equal(detail.recommendedOptionId, optionId)
+  assert.equal(detail.recommendation, d.recommendation)
+  assert.equal(detail.originalSessionId, 'orca_session_id:' + sessionId)
+  assert.deepEqual(detail.workItemLinks?.map(link => link.kind), ['github-issue', 'github-pr', 'linear-issue'])
+  assert.deepEqual(detail.sourceLinks, sourceLinks)
+  const [row] = value(await h.backend.listDecisionPage(owner, { scope, includeHistory: false })).rows
+  assert.equal(row.originalSessionId, undefined)
+  assert.equal(row.workItemLinks, undefined)
+})
+
+test('native metadata examples stay inert in both sections while top-level metadata still applies', async () => {
+  const { nativeDetail, nativePage } = await import('./backend-orca.ts')
+  const example = '~~~text\r\nORCA-DECISION-META {"priority":"P0"}\r\n## Background\r\n~~~\r\n'
+  const item = {
+    uid: 'fenced-item', title: 'Synthetic Item', status: 'needs_you', createdAt: 1, description: example,
+    question: { eventId: 'e1', decisions: [{ question: 'Choose?', replies: [] }] }
+  }
+  const cli = async (args: string[]) => {
+    if (args[0] === 'environment') return { environments: [] }
+    if (args.join(' ') === 'bot list') return { bots: [{ id: 'sample-bot' }] }
+    return args[2] === 'show' ? { item } : { items: [item] }
+  }
+  const read = async () => {
+    const [row] = (await nativePage(cli)).rows
+    const detail = await nativeDetail(cli, row.questionId)
+    assert.equal(row.priority, detail.priority)
+    return detail
+  }
+  const fenced = await read()
+  assert.equal(fenced.priority, 'P2')
+  assert.equal(fenced.description, example)
+  assert.equal(fenced.background, '')
+  item.description = '## Description\r\n' + example + '\r\n## Background\r\n' + example +
+    'ORCA-DECISION-META {"priority":"P1","blockedWork":["Example"]}\r\nAfter.\r\n'
+  const mixed = await read()
+  assert.equal(mixed.priority, 'P1')
+  assert.deepEqual(mixed.blockedWork, ['Example'])
+  assert.equal(mixed.description, example + '\r\n')
+  assert.equal(mixed.background, example + 'After.\r\n')
 })

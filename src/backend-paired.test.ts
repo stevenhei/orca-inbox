@@ -30,13 +30,13 @@ test('paired native reads isolate equal host IDs, verify attribution, preserve s
     uid: 'same-item', number: 2, owner: { botId: 'same-bot', name: 'Test Bot' }, status: 'needs_you',
     title: label + ' Item', description: '  **Description**\n\nSecond paragraph\nORCA-DECISION-META {"priority":"P0"}\n',
     doneMeans: 'Acceptance conditions', createdAt: 1,
-    chat: { kind: 'chat', id: 'same-session' },
+    chat: { kind: 'chat', id: '89626680-3dc3-4f2b-b4dc-c22909bd78ff' },
     question: { eventId: 'e42', text: 'Original ask\n\n[Source](https://example.test/source)\nRepeated options',
       decisions: [{ question: label + ' question', replies: [{ label: 'Yes', recommended: true }] },
         { question: label + ' sibling', replies: [{ label: 'Not yet' }] }] },
     links: [{ kind: 'dispatch', ref: 'same-dispatch', title: 'Source dispatch' }]
   })
-  const unassigned = { ...base('Unattributed paired'), uid: 'unattributed', chat: { kind: 'home', id: 'same-session' } }
+  const unassigned = { ...base('Unattributed paired'), uid: 'unattributed', chat: { kind: 'home', id: '89626680-3dc3-4f2b-b4dc-c22909bd78ff' } }
   const history = { ...base('In progress'), uid: 'in-progress', status: 'in_progress' }
   let denyPaired = false
   const worker = await mountWorker({ default(orca) {
@@ -54,7 +54,7 @@ test('paired native reads isolate equal host IDs, verify attribution, preserve s
         const label = selector ? 'Paired' : 'Local'
         if (args.join(' ') === 'bot list') return { bots: [{ id: 'same-bot' }] }
         if (args[0] === 'agent' && args[1] === 'list') return {
-          agents: [{ kind: 'chat', hostId: 'local', orcaSessionId: 'same-session', worktreeId: 'same-worktree' }], truncated: false
+          agents: [{ kind: 'chat', hostId: 'local', orcaSessionId: '89626680-3dc3-4f2b-b4dc-c22909bd78ff', worktreeId: 'same-worktree' }], truncated: false
         }
         if (args[0] === 'worktree') return {
           worktrees: [{ id: 'same-worktree', identity: { key: 'shared-workspace' }, hostId: 'local' }], truncated: false
@@ -68,11 +68,11 @@ test('paired native reads isolate equal host IDs, verify attribution, preserve s
           ] }
         }
         if (args.includes('--cursor')) return { botId: 'same-bot',
-          items: [{ ...base('Second page'), uid: 'next-item', chat: { kind: 'home', id: 'same-session' }, question: null, createdAt: 100 }],
+          items: [{ ...base('Second page'), uid: 'next-item', chat: { kind: 'home', id: '89626680-3dc3-4f2b-b4dc-c22909bd78ff' }, question: null, createdAt: 100 }],
           nextCursor: 'more-pages' }
         return { botId: 'same-bot', items: selector
           ? [base(label), unassigned, history, ...Array.from({ length: 47 }, (_, i) => ({
-            ...base('Extra'), uid: 'extra-' + i, chat: { kind: 'home', id: 'same-session' }, question: null, createdAt: i + 8
+            ...base('Extra'), uid: 'extra-' + i, chat: { kind: 'home', id: '89626680-3dc3-4f2b-b4dc-c22909bd78ff' }, question: null, createdAt: i + 8
           }))]
           : [base(label)], ...(selector ? { nextCursor: 'second-page' } : {}) }
       }
@@ -90,8 +90,8 @@ test('paired native reads isolate equal host IDs, verify attribution, preserve s
   const paired = page.rows.find(row => row.title === 'Paired question')!
   assert.notEqual(local.questionId, paired.questionId)
   assert.notEqual(local.packageId, paired.packageId)
-  assert.deepEqual(local.origin, { ...localWorkspace, sessionId: 'same-session' })
-  assert.deepEqual(paired.origin, { ...pairedWorkspace, sessionId: 'same-session' })
+  assert.deepEqual(local.origin, { ...localWorkspace, sessionId: '89626680-3dc3-4f2b-b4dc-c22909bd78ff' })
+  assert.deepEqual(paired.origin, { ...pairedWorkspace, sessionId: '89626680-3dc3-4f2b-b4dc-c22909bd78ff' })
   const missingWorkspace = page.rows.find(row => row.title === 'Unattributed paired question')!
   assert.equal(missingWorkspace.origin.hostId, pairedWorkspace.hostId)
   assert.equal(missingWorkspace.source?.kind === 'native-item' && missingWorkspace.source.workspaceAttributed, false)
@@ -107,8 +107,12 @@ test('paired native reads isolate equal host IDs, verify attribution, preserve s
   assert.equal(value(await workspacePage(offlineWorkspace)).sources?.find(source => source.source === 'native-item')?.state, 'unavailable')
   const detail = value(await worker.request('getDecision', { questionId: paired.questionId }, caller))
   assert.equal(detail.context, 'Paired Item')
-  assert.equal(detail.background, '  **Description**\n\nSecond paragraph\n')
+  assert.equal(detail.description, '  **Description**\n\nSecond paragraph\n')
+  assert.equal(detail.background, '')
   assert.equal(detail.options[0].label, 'Yes')
+  assert.equal(detail.recommendedOptionId, '0')
+  assert.equal(detail.originalSessionId, 'orca_session_id:89626680-3dc3-4f2b-b4dc-c22909bd78ff')
+  assert.equal(detail.workItemLinks, undefined)
   assert.equal(detail.package?.index, 0)
   assert.equal(detail.package?.size, 2)
   assert.deepEqual(detail.package?.questionIds, [paired.questionId, scoped.rows.find(row => row.title === 'Paired sibling')?.questionId])

@@ -1,4 +1,4 @@
-import type { Annotation, Decision, Result, SubmitDecision, SubmitReply } from './contract.ts'
+import type { Annotation, Decision, InlineImagePlacement, Result, SubmitDecision, SubmitReply } from './contract.ts'
 
 export type InboxErrorCode = Extract<Result<never>, { ok: false }>['code']
 
@@ -52,6 +52,45 @@ function optionalText(value: unknown, name: string) {
   return value === undefined ? {} : { [name]: string(value, name, true) }
 }
 
+function inlineImages(value: unknown, background: string): InlineImagePlacement[] {
+  const entries = list(value, 'inline image')
+  requireInput(entries.length <= 20, 'At most 20 inline images are supported per question.')
+  const boundaries = new Set([0])
+  let offset = 0
+  let blank = true
+  let fence: string | undefined
+  for (const line of background.split(/(?<=\n)/)) {
+    // Split only before a nonblank, unindented top-level line. List
+    // siblings and quote lines can still belong to the preceding block.
+    if (!fence && blank && /^\S/.test(line) && !/^(?:>|(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$))/.test(line)) {
+      boundaries.add(offset)
+    }
+    const match = /^ {0,3}(`{3,}|~{3,})([^\r\n]*)/.exec(line)
+    if (match) {
+      if (fence) {
+        if (match[1][0] === fence[0] && match[1].length >= fence.length && !match[2].trim()) fence = undefined
+      } else if (match[1][0] === '~' || !match[2].includes('`')) {
+        fence = match[1]
+      }
+    }
+    blank = !line.trim()
+    offset += line.length
+  }
+  if (!fence) boundaries.add(background.length)
+
+  let previous = -1
+  return entries.map(entry => {
+    const image = object(entry)
+    const offset = integer(image.offset, 'inline image offset', 0)
+    requireInput(boundaries.has(offset), 'Place inline images between Markdown blocks and outside fenced code.')
+    requireInput(offset >= previous, 'Inline images must be in background order.')
+    previous = offset
+    const caption = image.caption === undefined ? undefined : string(image.caption, 'inline image caption', true)
+    requireInput(caption === undefined || caption.length <= 1024, 'Inline image captions are limited to 1,024 characters.')
+    return { offset, ...evidenceRef(image), ...(caption === undefined ? {} : { caption }) }
+  })
+}
+
 export function submission(input: unknown): SubmitDecision {
   const value = object(input)
   const questions = list(value.questions, 'questions').map((entry): SubmitDecision['questions'][number] => {
@@ -63,12 +102,21 @@ export function submission(input: unknown): SubmitDecision {
       return { optionId: id(o.optionId, 'optionId'), label: string(o.label, 'option label'), ...optionalText(o.detail, 'detail') }
     })
     distinct(options.map(o => o.optionId), 'option ID')
+    const recommendedOptionId = q.recommendedOptionId === undefined ? undefined : id(q.recommendedOptionId, 'recommended option ID')
+    requireInput(recommendedOptionId === undefined || options.some(option => option.optionId === recommendedOptionId),
+      'The recommended option must match an option on this question.')
     const deadline = q.deadline === undefined ? undefined : string(q.deadline, 'deadline')
     requireInput(deadline === undefined || (/T.*(?:Z|[+-]\d{2}:\d{2})$/i.test(deadline) &&
       Number.isFinite(Date.parse(deadline))), 'Deadline must include a time and zone.')
+    const description = q.description === undefined ? undefined : string(q.description, 'description', true)
+    requireInput(description === undefined || description.length <= 16_384, 'Description exceeds 16,384 characters.')
+    const background = string(q.background, 'background', true)
     return {
       questionId: id(q.questionId, 'questionId'), title: string(q.title, 'title'),
-      background: string(q.background, 'background', true), recommendation: string(q.recommendation, 'recommendation', true),
+      ...(description === undefined ? {} : { description }),
+      background, ...(q.inlineImages === undefined ? {} : { inlineImages: inlineImages(q.inlineImages, background) }),
+      recommendation: string(q.recommendation, 'recommendation', true),
+      ...(recommendedOptionId === undefined ? {} : { recommendedOptionId }),
       options, priority, ...(deadline === undefined ? {} : { deadline }),
       blockedWork: list(q.blockedWork, 'blockedWork').map(x => string(x, 'blocked work'))
     }
@@ -84,6 +132,12 @@ export function submission(input: unknown): SubmitDecision {
       width: integer(e.width, 'width'), height: integer(e.height, 'height'), alt: string(e.alt, 'alt', true) }
   })
   distinct(evidence.map(e => JSON.stringify([e.evidenceId, e.version])), 'evidence version')
+  for (const question of questions) {
+    for (const image of question.inlineImages ?? []) {
+      requireInput(evidence.some(item => item.kind === 'image-snapshot' && item.evidenceId === image.evidenceId &&
+        item.version === image.version), 'Inline images require matching image snapshot evidence and version.')
+    }
+  }
   const sourceLinks = list(value.sourceLinks, 'sourceLinks').map(entry => {
     const link = object(entry)
     return { label: string(link.label, 'source label'), url: url(link.url) }

@@ -112,7 +112,30 @@ function checkDetailBudget(d: Decision) {
     : 'Decision thread exceeds the Inbox detail limit.')
 }
 
-function projectRow({ packageSummary: _summary, activity: _activity, nativeLinks: _nativeLinks, ...d }: Decision): Decision {
+export function decisionSourceMetadata(links: Decision['sourceLinks'], sessionId: string) {
+  const workItemLinks: NonNullable<Decision['workItemLinks']> = []
+  const seen = new Set<string>()
+  for (const link of links) {
+    if (workItemLinks.length >= 20) break
+    if (link.url.length > 2048) continue
+    let url: URL
+    try { url = new URL(link.url) } catch { continue }
+    if (url.protocol !== 'https:' || url.username || url.password || url.port || seen.has(link.url)) continue
+    const github = url.hostname === 'github.com' && /^\/[\w.-]+\/[\w.-]+\/(issues|pull)\/[1-9]\d*\/?$/.exec(url.pathname)
+    const linear = url.hostname === 'linear.app' && /^\/[\w-]+\/issue\/[A-Za-z][A-Za-z0-9]*-[1-9]\d*(?:\/[^/]+)?\/?$/.test(url.pathname)
+    if (github) workItemLinks.push({ url: link.url, label: link.label.slice(0, 256), kind: github[1] === 'pull' ? 'github-pr' : 'github-issue' })
+    if (linear) workItemLinks.push({ url: link.url, label: link.label.slice(0, 256), kind: 'linear-issue' })
+    seen.add(link.url)
+  }
+  const original = sessionId.replace(/^orca_session_id:/, '')
+  return {
+    ...(workItemLinks.length ? { workItemLinks } : {}),
+    ...(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(original)
+      ? { originalSessionId: 'orca_session_id:' + original } : {})
+  }
+}
+
+function projectRow({ description: _description, packageSummary: _summary, activity: _activity, nativeLinks: _nativeLinks, inlineImages: _inlineImages, workItemLinks: _workItemLinks, originalSessionId: _session, ...d }: Decision): Decision {
   const minimalReply = (r: RecordedReply): RecordedReply => ({
     ...r, answer: { kind: 'text', text: '' }, annotations: []
   })
@@ -178,7 +201,12 @@ function redact(caller: Caller, decision: Decision, evidence: Evidence[]): Decis
   const answerState = decision.answerState.state === 'answered'
     ? { ...decision.answerState, initial: visibleReply(decision.answerState.initial), followUps: decision.answerState.followUps.map(visibleReply) }
     : decision.answerState
-  return { ...decision, evidence, answerState, access: {
+  const inlineImages = decision.inlineImages?.map(image =>
+    'evidenceId' in image && evidence.some(item => item.kind === 'image-snapshot' &&
+      item.evidenceId === image.evidenceId && item.version === image.version)
+      ? image
+      : { offset: image.offset, unavailable: true as const })
+  return { ...decision, ...(inlineImages ? { inlineImages } : {}), evidence, answerState, access: {
     participantIds: [caller.id],
     attachmentReaderIds: Object.fromEntries(evidence.flatMap(e => e.kind === 'image-snapshot' ? [[e.attachmentId, [caller.id]]] : []))
   } }
@@ -310,7 +338,7 @@ export class InboxBackend {
       const rows = await this.queryRows(caller, raw)
       let bytes = 64
       const visible = []
-      for (const row of rows) {
+      for (const { description: _description, ...row } of rows) {
         bytes += jsonBytes(row) + 1
         if (bytes > bridgeBudget) return fail('unavailable', 'Use the paged Inbox operation for this result.')
         visible.push(await this.visibleDecision(caller, row))
@@ -341,8 +369,11 @@ export class InboxBackend {
   getDecision(caller: Caller, raw: unknown) {
     return result(() => this.transaction(async state => {
       const d = await this.visibleDecision(caller, findDecision(state, caller, id(object(raw).questionId, 'questionId')))
-      if (jsonBytes(d) > bridgeBudget) return fail('unavailable', 'Decision exceeds the Inbox detail limit.')
-      return d
+      const bytes = jsonBytes(d)
+      if (bytes > bridgeBudget) return fail('unavailable', 'Decision exceeds the Inbox detail limit.')
+      const metadata = decisionSourceMetadata(d.sourceLinks, d.origin.sessionId)
+      // Optional display metadata must not make an existing readable detail fail.
+      return bytes + jsonBytes(metadata) <= bridgeBudget ? { ...d, ...metadata } : d
     }))
   }
 

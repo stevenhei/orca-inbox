@@ -32,11 +32,22 @@ export type Evidence = EvidenceRef & {
   | { kind: 'link'; url: string }
 )
 
+export interface InlineImagePlacement extends EvidenceRef {
+  // UTF-16 offset into the original background Markdown. Insert before this offset.
+  offset: number
+  caption?: string
+}
+
+export type VisibleInlineImage = InlineImagePlacement | { offset: number; unavailable: true }
+
 export interface QuestionInput {
   questionId: string
   title: string
+  description?: string
   background: string
+  inlineImages?: InlineImagePlacement[]
   recommendation: string
+  recommendedOptionId?: string
   options: { optionId: string; label: string; detail?: string }[]
   priority: Priority
   deadline?: string
@@ -109,7 +120,8 @@ export type DecisionSource = { kind: 'plugin' } | {
 
 export type DecisionAction = 'reply' | 'retry' | 'follow-up'
 
-export interface Decision extends QuestionInput {
+export interface Decision extends Omit<QuestionInput, 'inlineImages'> {
+  inlineImages?: VisibleInlineImage[]
   source?: DecisionSource
   context?: string
   activity?: { label: string; at?: string; text: string }[]
@@ -127,6 +139,8 @@ export interface Decision extends QuestionInput {
   createdAt: string
   decisionLink: string
   sourceLinks: SourceLink[]
+  workItemLinks?: (SourceLink & { kind: 'github-issue' | 'github-pr' | 'linear-issue' })[]
+  originalSessionId?: string
   evidence: Evidence[]
   answerState: AnswerState
 }

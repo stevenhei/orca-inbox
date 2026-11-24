@@ -12,10 +12,11 @@ It prints the address, by default `http://127.0.0.1:4870/` (the next free port i
 
 | URL | What it shows |
 | --- | --- |
-| `/` or `?ref=dashboard` | Dashboard: queue and reader (resize below 800px for one surface at a time) |
+| `/` or `?ref=dashboard` | Dashboard (Variant D): Pending / Answered / All table and the detail sheet (modal below 900px) |
 | `?ref=bot-item:preview:e1:0` | Native Bot Item with two questions (paging, Markdown, footer) |
 | `?ref=preview-long` | Long Chinese Chat decision (paragraphs, sticky reply area) |
 | `?ref=image-review` | Seven synthetic images |
+| `?ref=preview-narrative` | Agent narrative: headings, links, inert code with Copy, seven inline images (one unavailable) |
 | `?ref=settings` | Inbox Settings |
 | `&theme=light`, `&zone=Asia/Hong_Kong`, `&history=1` | Light theme, another time zone, answered history fixture |
 
