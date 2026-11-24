@@ -257,6 +257,10 @@ if (scenario === 'review') {
   assert.ok(!/re-attach/i.test(text())); ok('no unsupported re-attach action')
   await setValue(byLabel('Note for Side square'), 'Check the fold')
   assert.match(document.querySelector('.side').textContent, /Notes \(1\)/); ok('image note listed in the sidebar')
+  await setValue(byLabel('Note for Side square'), 'Check the fold twice', 'input')
+  await changed()
+  assert.equal(byLabel('Note for Side square').value, 'Check the fold twice'); ok('typing survives a worker-driven re-render')
+  await setValue(byLabel('Note for Side square'), 'Check the fold')
   // Select "Paper models" in Background: UTF-16 offsets [0, 12) at revision 1.
   const bg = document.querySelector('[data-field="background"]').firstChild
   selection = { rangeCount: 1, isCollapsed: false, getRangeAt: () => ({ startContainer: bg, endContainer: bg, startOffset: 0, endOffset: 12, getBoundingClientRect: () => ({ left: 0, bottom: 0 }) }) }

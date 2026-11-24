@@ -379,12 +379,19 @@ function viewer(list: Img[], i: number, side: string) {
   const note = draft.annotations.find((n) => n.kind === 'image' && n.evidence.evidenceId === e.evidenceId && n.evidence.version === e.version)
   return el('div', {}, v, el('div', { class: 'bar' }, zb('−', 'Zoom out', (n) => Math.max(0.25, n - 0.25)), zb('+', 'Zoom in', (n) => Math.min(4, n + 0.25)), zb('100%', 'Reset zoom', () => 1),
     field('input', { type: 'text', 'data-k': `note-${e.evidenceId}`, 'aria-label': `Note for ${e.label}`, placeholder: `Note on ${e.label}`,
-      onchange: (ev: Event) => {
-        const text = (ev.target as HTMLInputElement).value.trim()
-        const keep = draft.annotations.filter((n) => !(n.kind === 'image' && n.evidence.evidenceId === e.evidenceId))
-        draft.annotations = text ? [...keep, { kind: 'image', evidence: { evidenceId: e.evidenceId, version: e.version }, text }] : keep
-        scheduleSave(); render()
-      } }, note?.text ?? '')))
+      // Commit on every keystroke (no re-render), so a refresh or clock tick never loses typing.
+      oninput: (ev: Event) => { setImageNote(e, (ev.target as HTMLInputElement).value); scheduleSave() },
+      onchange: (ev: Event) => { setImageNote(e, (ev.target as HTMLInputElement).value); scheduleSave(); render() } }, note?.text ?? '')))
+}
+
+/** One note per image version, kept in place so the sidebar order stays stable while typing. */
+function setImageNote(e: Img, raw: string) {
+  const text = raw.trim()
+  const i = draft.annotations.findIndex((n) => n.kind === 'image' && n.evidence.evidenceId === e.evidenceId)
+  const note: Annotation = { kind: 'image', evidence: { evidenceId: e.evidenceId, version: e.version }, text }
+  if (i < 0) { if (text) draft.annotations.push(note) }
+  else if (text) draft.annotations[i] = note
+  else draft.annotations.splice(i, 1)
 }
 
 function sidebar(x: Decision) {
@@ -399,7 +406,7 @@ function sidebar(x: Decision) {
       return el('div', { class: `note${stale ? ' stale' : ''}` },
         el('b', {}, name(n)), ...(n.kind === 'selection' ? [el('q', {}, n.quote)] : []),
         ...(stale ? [el('div', { class: 'err' }, `Out of date: ${stale}`)] : []),
-        field('input', { type: 'text', 'data-note': i, 'data-k': `side-note-${i}`, 'aria-label': `Note text ${i + 1}`, onchange: (ev: Event) => { n.text = (ev.target as HTMLInputElement).value; scheduleSave(); render() } }, n.text),
+        field('input', { type: 'text', 'data-note': i, 'data-k': `side-note-${i}`, 'aria-label': `Note text ${i + 1}`, oninput: (ev: Event) => { n.text = (ev.target as HTMLInputElement).value; scheduleSave() }, onchange: (ev: Event) => { n.text = (ev.target as HTMLInputElement).value; scheduleSave(); render() } }, n.text),
         el('button', { type: 'button', 'aria-label': `Remove note ${i + 1}`, onclick: () => { list.splice(i, 1); scheduleSave(); render() } }, 'Remove'))
     }))
 }
@@ -552,8 +559,12 @@ async function loadSettings() {
   effective = null
   render()
 }
+let effectiveLoading: string | null = null
 async function loadEffective(repo: string) {
+  if (effectiveLoading === repo) return
+  effectiveLoading = repo
   const r = await call(req, 'settings.effective', { repo })
+  effectiveLoading = null
   effective = { repo, r }
   render()
 }
@@ -605,6 +616,7 @@ function renderSettings() {
     ...(stale ? [el('div', { class: 'callout warn', role: 'status' }, 'Settings were changed elsewhere. ', el('button', { type: 'button', onclick: () => loadSettings() }, 'Load latest (discards your edits)'))] : []),
     el('h2', {}, 'Default question template'),
     field('textarea', { rows: 7, 'data-k': 'default', 'aria-label': 'Default question template', 'aria-invalid': defaultEmpty, 'aria-describedby': defaultEmpty ? 'default-err' : false,
+      oninput: (ev: Event) => { s.defaultTemplate = (ev.target as HTMLTextAreaElement).value },
       onchange: (ev: Event) => { s.defaultTemplate = (ev.target as HTMLTextAreaElement).value; settingsNotice = null; render() } }, s.defaultTemplate),
     ...(defaultEmpty ? [el('div', { class: 'err', id: 'default-err', role: 'alert' }, 'The default template cannot be empty.')] : []),
     el('h2', {}, `Repo exceptions (${s.exceptions.length})`),
@@ -612,7 +624,7 @@ function renderSettings() {
     ...(s.exceptions.length ? [] : [el('p', { class: 'meta' }, 'No exceptions. Every repo uses the default template.')]),
     ...s.exceptions.map((e, i) => el('div', { class: 'row2' },
       select(`Repo for exception ${i + 1}`, `ex-repo-${i}`, e.repo, [e.repo, ...free], (v) => { e.repo = v; render() }),
-      field('textarea', { rows: 3, 'data-k': `ex-tpl-${i}`, 'aria-label': `Template for ${e.repo}`, onchange: (ev: Event) => { e.template = (ev.target as HTMLTextAreaElement).value; render() } }, e.template),
+      field('textarea', { rows: 3, 'data-k': `ex-tpl-${i}`, 'aria-label': `Template for ${e.repo}`, oninput: (ev: Event) => { e.template = (ev.target as HTMLTextAreaElement).value }, onchange: (ev: Event) => { e.template = (ev.target as HTMLTextAreaElement).value; render() } }, e.template),
       el('button', { type: 'button', 'aria-label': `Remove exception for ${e.repo}`, onclick: () => { s.exceptions.splice(i, 1); render() } }, 'Remove'))),
     el('button', { type: 'button', 'data-k': 'add-ex', 'aria-disabled': free.length === 0, onclick: () => { if (free.length) { s.exceptions.push({ repo: free[0], template: s.defaultTemplate }); render() } } },
       free.length ? 'Add exception' : repos.length ? 'Every repo already has an exception' : 'No repos to add'),
