@@ -38,6 +38,7 @@ export type SourceAvailability = {
 
 export interface DecisionPage {
   sources?: SourceAvailability[]
+  mail?: { state: 'available' | 'unavailable'; message?: string }
   rows: Decision[]
   nextCursor?: string
 }

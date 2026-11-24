@@ -1,0 +1,15 @@
+{
+  "manifestVersion": 2,
+  "id": "decision-inbox-push-probe",
+  "name": "Decision Inbox Push Probe",
+  "version": "0.1.0",
+  "description": "Explicit one-shot Orca desktop worker mail experiment.",
+  "engines": { "orca": ">=1.4.264" },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "worker.mjs",
+  "contributes": {
+    "panels": [{ "id": "probe", "title": "Push Probe", "icon": "flag", "entry": "panel.html", "ui": "html" }]
+  },
+  "capabilities": []
+}

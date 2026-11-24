@@ -12,7 +12,7 @@ Each decision has a stable link and source issue or spec link where available. T
 
 ## Agent workflow and authority
 
-The versioned [agent skill](../agent/decision-inbox/SKILL.md) documents the local intake command. The CLI writes a lookup hint and emits a structured line for the originating Chat's assistant response. The desktop worker verifies exactly one matching canonical record in the explicitly named, live local Chat and checks its host and workspace against the approved desktop scope. A hint alone provides no origin authority. Inbox Settings support local defaults and workspace-project exceptions. Agents follow the repository rules and selected role and continue unaffected work.
+The versioned [agent skill](../agent/decision-inbox/SKILL.md) documents the local intake command. The CLI writes a lookup hint and emits a structured line for the originating Chat's assistant response. The desktop worker verifies a matching marker in the final assistant response of the latest completed exchange in the explicitly named, live local Chat and checks its host and workspace against the approved desktop scope. A hint alone provides no origin authority. Inbox Settings support local defaults and workspace-project exceptions. Agents follow the repository rules and selected role and continue unaffected work.
 
 Agents research and check previous decisions first, decide routine reversible details within scope, submit material owner choices or decisions requiring owner authority with rationale and impact, and continue unaffected work. The plugin validates request shape, trusted session and workspace scope, and duplicate requests. Orca and underlying tools and accounts retain tool authority.
 

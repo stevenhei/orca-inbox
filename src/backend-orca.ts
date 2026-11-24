@@ -72,21 +72,25 @@ function placeMatches(place: RecordValue, session: string, workspace: string) {
 async function findChatRecord(cli: Cli, session: string, op: string, lookupId: string, ack?: AcknowledgeReply) {
   const history = record(await cli(['agent', 'read', 'orca_session_id:' + session, '--limit', '20']))
   if (history.kind !== 'chat' || history.source !== 'chat' || history.orcaSessionId !== session || history.state !== 'done') return
+  const entries = array(history.entries)
+  const entry = entries.at(-1)
+  // This CLI reports a bounded suffix and no turn ID. Require the latest user
+  // boundary and final assistant message in that suffix. Older turns cannot
+  // satisfy a hint, even when their markers have the same request ID.
+  if (!entries.some(item => item.kind === 'message' && item.role === 'user') ||
+    entry?.kind !== 'message' || entry.role !== 'assistant' || typeof entry.text !== 'string' ||
+    entry.text.length > 32_768 || entry.shortened === true) return
   const matches = new Map<string, RecordValue>()
-  for (const entry of array(history.entries)) {
-    if (entry.kind !== 'message' || entry.role !== 'assistant' || typeof entry.text !== 'string' ||
-      entry.text.length > 32_768 || entry.shortened === true) continue
-    for (const line of entry.text.split(/\r?\n/)) {
-      if (!line.startsWith(marker)) continue
-      try {
-        const parsed = record(JSON.parse(line.slice(marker.length)))
-        const input = record(parsed.input)
-        if (parsed.op !== op || (op === 'submit' ? input.requestId : input.receiptId) !== lookupId) continue
-        if (ack && (input.questionId !== ack.questionId || input.replyId !== ack.replyId)) continue
-        const canonical = op === 'submit' ? submission(input) : input
-        matches.set(JSON.stringify(canonical), canonical as unknown as RecordValue)
-      } catch { /* An incomplete or invalid record cannot authorize an operation. */ }
-    }
+  for (const line of entry.text.split(/\r?\n/)) {
+    if (!line.startsWith(marker)) continue
+    try {
+      const parsed = record(JSON.parse(line.slice(marker.length)))
+      const input = record(parsed.input)
+      if (parsed.op !== op || (op === 'submit' ? input.requestId : input.receiptId) !== lookupId) continue
+      if (ack && (input.questionId !== ack.questionId || input.replyId !== ack.replyId)) continue
+      const canonical = op === 'submit' ? submission(input) : input
+      matches.set(JSON.stringify(canonical), canonical as unknown as RecordValue)
+    } catch { /* An incomplete or invalid record cannot authorize an operation. */ }
   }
   if (matches.size === 1) return matches.values().next().value
 }
@@ -134,7 +138,8 @@ function metadata(description: string) {
 function itemRows(item: RecordValue): Decision[] {
   const uid = text(item.uid, 97)
   const title = text(item.title)
-  const status = text(item.status, 64)
+  const rawStatus = text(item.status, 64)
+  const status = rawStatus === 'needs_you' ? 'needs-you' : rawStatus === 'in_progress' ? 'in-progress' : rawStatus
   if (uid.length > 96 || !activityId.test(uid) || !title || !status) return []
   const ask = record(item.question)
   const eventId = text(ask.eventId, 65)

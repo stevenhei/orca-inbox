@@ -91,7 +91,7 @@ type PageInput = ListDecisions & { cursor?: string; timeZone?: string }
  * scope, history (shared `isActionable`) and query server-side, orders in the requested zone and
  * answers bounded pages of `size` rows with an opaque cursor.
  */
-function worker(list: Decision[] = decisions, extra: MockRequests = {}, size = 50, sources?: SourceAvailability[]): MockRequests {
+function worker(list: Decision[] = decisions, extra: MockRequests = {}, size = 50, sources?: SourceAvailability[], mail?: DecisionPage['mail']): MockRequests {
   return {
     'workspace.resolve': ({ workspaceId }: { workspaceId: string }) =>
       workspaces[workspaceId] ? ok(workspaces[workspaceId]) : { ok: false, code: 'not-found', message: 'Unknown workspace.' },
@@ -103,7 +103,7 @@ function worker(list: Decision[] = decisions, extra: MockRequests = {}, size = 5
       const start = cursor ? Number(cursor.slice(2)) : 0
       const rows = all.slice(start, start + size)
       const page = start + size < all.length ? { rows, nextCursor: `c:${start + size}` } : { rows }
-      return ok(sources ? { ...page, sources } : page)
+      return ok({ ...page, ...(sources ? { sources } : {}), ...(mail ? { mail } : {}) })
     },
     'review.open': () => ok(null),
     'settings.open': () => ok(null),
@@ -389,7 +389,7 @@ test('panel: Chat decisions unavailable still shows read-only Bot Items', () => 
   await view.emit('workspace.changed', ctx('studio-local'))
   assert.deepEqual(titles(view), ['Ship the lantern build?'])
   assert.ok(view.find({ label: 'Chat decisions are unavailable' }))
-  assert.ok(view.find({ text: /cannot be answered here until this is fixed; existing drafts are kept\. Bot Items below are not affected\./ }))
+  assert.ok(view.find({ text: /cannot be listed or answered here right now; saved drafts are kept\. Bot Items below are not affected\./ }))
 }))
 
 test('panel: partial Bot Items and an empty list say only what could be checked', () => withPanel(worker([], {}, 50,
@@ -397,8 +397,74 @@ test('panel: partial Bot Items and an empty list say only what could be checked'
   await view.select({ label: 'Scope' }, 'all')
   assert.ok(view.find({ label: 'Some Bot Items could not be read' }))
   assert.ok(view.find({ label: 'Nothing found in all workspaces from the sources that could be read' }), 'no "all caught up" claim')
-  assert.ok(!view.find({ text: 'You are all caught up.' }))
+  assert.ok(!view.find({ label: /^Nothing needs you/ }), 'no "nothing needs you" title while a source is degraded')
 }))
+
+// ---- read coverage vs mail delivery; native status normalization; failed-reply queue -------------
+const mailOff = { state: 'unavailable' as const, message: 'No supported plugin mail sender on Orca 1.4.271.' }
+
+test('panel: all Chat decisions read but mail unavailable: a neutral saved-not-delivered notice, no read warning', () =>
+  withPanel(worker(decisions, {}, 50, allAvailable, mailOff), async (view) => {
+    await view.emit('workspace.changed', ctx('studio-local'))
+    assert.deepEqual(titles(view), ['Compare seven paper model views', 'Pick a rehearsal slot'])
+    const n = view.find({ label: 'Answers are saved, not delivered yet' })
+    assert.ok(n && n.props.tone === 'neutral')
+    assert.ok(view.find({ text: /Answers to Chat decisions are saved in Decision Inbox\. Orca mail from this plugin is unavailable on this host, so saved answers are not delivered to the chat yet\. No supported plugin mail sender on Orca 1\.4\.271\./ }))
+    assert.ok(!view.find({ label: /could not be read|are unavailable/ }), 'mail is not a read failure')
+    assert.ok(!view.find({ text: /cannot be (listed or )?answered/ }), 'never claims loaded Chat decisions cannot be answered')
+  }))
+
+test('panel: mail unavailable does not make an empty list look degraded', () => withPanel(worker([], {}, 50, allAvailable, mailOff), async (view) => {
+  await view.select({ label: 'Scope' }, 'all')
+  assert.ok(view.find({ label: 'Nothing needs you in all workspaces' }))
+  assert.ok(!view.summary().some((line) => /sources that could be read/.test(line)), 'not shown as degraded')
+}))
+
+test('panel: genuinely partial Chat intake says some were not read and the shown ones can be answered', () =>
+  withPanel(worker(decisions, {}, 50, [{ source: 'plugin', state: 'partial', message: 'Two Chat decisions are waiting for intake checks.' }, { source: 'native-item', state: 'available' }]), async (view) => {
+    await view.emit('workspace.changed', ctx('studio-local'))
+    assert.ok(view.find({ label: 'Some Chat decisions could not be read' }))
+    assert.ok(view.find({ text: /Two Chat decisions are waiting for intake checks\. The Chat decisions shown can still be answered\. Bot Items below are not affected\./ }))
+    assert.equal(titles(view).length, 2)
+  }))
+
+test('model: native statuses are normalized (needs_you, in_progress, Needs You)', () => {
+  const n = (st: string) => nativeRow({ id: `n-${st}`, title: st, status: st })
+  assert.equal(isActionable(n('needs_you')), true)
+  assert.equal(isActionable(n('Needs You')), true)
+  assert.equal(isActionable(n('in_progress')), false)
+  assert.equal(nativeStatusLabel('needs_you'), 'Needs you')
+  assert.equal(nativeStatusLabel('in_progress'), 'In progress')
+})
+
+test('panel: a needs_you Bot Item without workspace is visible by default in All workspaces and opens its review', async () => {
+  const item = nativeRow({ id: 'bot-item:native-uid:e42:0', title: 'Approve release notes?', status: 'needs_you', attributed: false })
+  const progress = nativeRow({ id: 'bot-item:native-uid:e43:0', title: 'Tag the release?', status: 'in_progress', attributed: false })
+  await withPanel(worker([...decisions, item, progress], {}, 50, allAvailable), async (view) => {
+    await view.select({ label: 'Scope' }, 'all')
+    assert.ok(titles(view).includes('Approve release notes?'), 'visible with history off')
+    assert.ok(!titles(view).includes('Tag the release?'), 'in_progress is history')
+    assert.ok(view.find({ text: 'Needs you' }))
+    await view.press({ label: 'Approve release notes?' })
+    assert.deepEqual(requestsOf(view, 'review.open').at(-1), { questionId: 'bot-item:native-uid:e42:0' })
+    assert.ok(!view.find({ label: 'Could not open the review tab' }))
+    assert.equal(view.find({ label: 'Approve release notes?' })?.props.current, true)
+  })
+})
+
+test('panel: a saved-but-undelivered answer stays in the default queue (owner-approved) and says it was saved', () => {
+  const s = historyExample.answerState
+  assert.ok(s.state === 'answered')
+  if (s.state !== 'answered') return
+  const saved: Decision = { ...historyExample, actions: ['follow-up'], answerState: { ...s, initial: { ...s.initial, delivery: { state: 'undelivered', reason: 'delivery-failed' } } } }
+  const retryable: Decision = { ...saved, questionId: 'layout-2', title: 'Retryable layout', actions: ['follow-up', 'retry'] }
+  return withPanel(worker(decisions.map((d) => (d.questionId === 'layout' ? saved : d)).concat(retryable), {}, 50, allAvailable, mailOff), async (view) => {
+    await view.emit('workspace.changed', ctx('library-local'))
+    assert.ok(titles(view).includes('Choose the catalogue layout'), 'still needs you with history off')
+    assert.ok(view.find({ text: 'Saved · not delivered' }), 'no retry offered: says it is saved')
+    assert.ok(view.find({ text: 'Undelivered' }), 'retry offered: plain Undelivered')
+  })
+})
 
 // ---- N1: refresh racing Load more (deterministic orderings) -----------------------------------------
 /** A paged worker whose next matching request is held until `release()`. */

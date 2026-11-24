@@ -23,11 +23,15 @@ One queue holds two sources. Every row and review names its source in text.
 | --- | --- | --- |
 | What it is | A plugin-owned decision from an ordinary workspace Chat. | A read-only copy of a native Orca Bot Item. |
 | Row badge | "Chat decision", plus the four-state badge. | "Bot Item · answer in Orca", plus Orca's status ("Needs you", "In progress", "Planned", "Done", "Canceled"; any other status as reported). |
-| Needs you | Awaiting answer, or any reply undelivered. | Orca status `needs-you`. |
+| Needs you | Awaiting answer, or any reply undelivered (owner-approved: a saved answer that could not be delivered stays in the queue). | Orca status `needs-you`; CLI spellings such as `needs_you` or `Needs You` are normalized (also `in_progress`). |
 | Review | Full review; reply, follow-up and retry only when listed in `actions`. | Read-only: status with "as of" time, details, options as text, and "Where to answer: answer this in Orca's Bot Items: bot …, item …". No reply, notes, retry, resolve or deep link. |
 | Workspace | Always attributed (host + workspace). | When `workspaceAttributed` is false the row appears only in **All workspaces**, labelled "No workspace attribution". |
 
 Delivery for Chat decisions keeps two facts apart. **Mail submitted** (shown with time and message ID) means Orca accepted the message for the original chat (`submitted.transport`). **Agent received** needs a receipt matching the reply, question and exact origin. On a host without a supported plugin mail sender the worker saves the answer and returns it undelivered: the review says "saved in Decision Inbox, but not delivered to the original chat", keeps the reply ID, and offers Copy (Retry only when listed in `actions`).
+
+Without a supported retry, the row badge for an undelivered reply reads "Saved · not delivered" (or "Follow-up saved · not delivered"); with retry it reads "Undelivered".
+
+Read coverage and delivery are separate page facts. `sources[]` reports read coverage only (`partial` means some rows were not read, for example pending intake checks: "Some Chat decisions could not be read … The Chat decisions shown can still be answered"). `mail` reports whether a delivery sender exists: when unavailable the panel shows a neutral notice "Answers are saved, not delivered yet" and never says loaded Chat decisions cannot be answered; it does not make an empty list look degraded.
 
 Each source reports its own availability (`sources[]` on a page). A source that is unavailable or partial gets its own warning callout saying what still works ("… below are not affected"); it never blanks the other source. An empty list with a degraded source says "Nothing found … from the sources that could be read" instead of "You are all caught up".
 

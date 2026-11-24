@@ -52,9 +52,12 @@ export type NativeSource = Extract<DecisionSource, { kind: 'native-item' }>
 export const sourceOf = (d: Decision): DecisionSource => d.source ?? { kind: 'plugin' }
 export const nativeOf = (d: Decision): NativeSource | null => { const s = sourceOf(d); return s.kind === 'native-item' ? s : null }
 
-const NATIVE_STATUS: Record<string, string> = { 'needs-you': 'Needs you', 'in-progress': 'In progress', planned: 'Planned', done: 'Done', canceled: 'Canceled' }
+const NATIVE_STATUS: Record<string, string> = { 'needs-you': 'Needs you', 'in-progress': 'In progress', planned: 'Planned', done: 'Done', canceled: 'Canceled', cancelled: 'Canceled' }
+/** Orca's CLI may spell statuses `needs_you`, `Needs You` or `needs-you`: compare one canonical form. */
+export const normalizeNativeStatus = (status?: string) => status?.trim().toLowerCase().replace(/[\s_]+/g, '-')
 /** Recognized native statuses get a label; any other status is shown as Orca reported it. */
-export const nativeStatusLabel = (status?: string) => (status ? NATIVE_STATUS[status] ?? status : 'Status not reported')
+export const nativeStatusLabel = (status?: string) => (status ? NATIVE_STATUS[normalizeNativeStatus(status)!] ?? status : 'Status not reported')
+export const nativeNeedsYou = (n: NativeSource) => normalizeNativeStatus(n.itemStatus) === 'needs-you'
 
 /**
  * The actions the worker supports for this row. Native items have none. Legacy plugin rows
@@ -77,7 +80,7 @@ export function actionsOf(d: Decision): DecisionAction[] {
  */
 export const isActionable = (d: Decision) => {
   const native = nativeOf(d)
-  if (native) return native.itemStatus === 'needs-you'
+  if (native) return nativeNeedsYou(native)
   return shownState(d) === 'awaiting-answer' || undeliveredReplies(d).length > 0
 }
 

@@ -61,6 +61,7 @@ export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
 
   const local = boundary.localSources
   let intake: Promise<boolean> | undefined
+  let hintsPending = false
   const syncHints = (caller: OwnerCaller) => {
     if (!local) return Promise.resolve(false)
     return intake ??= (async () => {
@@ -74,28 +75,35 @@ export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
           } catch { pending = true }
         }))
       } catch { pending = true }
+      hintsPending = pending
       return pending
     })().finally(() => { intake = undefined })
   }
 
   orca.panels.handle('listDecisionPage', (input, context) => withOwner(context, async caller => {
     if (!local) return backend.listDecisionPage(caller, input)
-    const [pending, native] = await Promise.all([input?.cursor ? false : syncHints(caller), nativePage(local.cli)])
+    const [pending, native] = await Promise.all([input?.cursor ? hintsPending : syncHints(caller), nativePage(local.cli)])
     const page = await backend.listDecisionPage(caller, input, native.rows)
-    const plugin: SourceAvailability = { source: 'plugin', state: 'partial',
-      message: (pending ? 'Some Chat submissions are waiting for verification. ' : '') +
-        'Answers are saved in Decision Inbox. Orca mail from this plugin is unavailable on this host.' }
-    return page.ok ? { ...page, value: { ...page.value, rows: page.value.rows.map(localActions), sources: [plugin, native.source] } } : page
+    const plugin: SourceAvailability = pending
+      ? { source: 'plugin', state: 'partial', message: 'Some Chat submissions are waiting for verification.' }
+      : { source: 'plugin', state: 'available' }
+    return page.ok ? { ...page, value: {
+      ...page.value, rows: page.value.rows.map(localActions), sources: [plugin, native.source],
+      mail: { state: 'unavailable' as const, message: 'Answers are saved in Decision Inbox. Orca mail from this plugin is unavailable on this host.' }
+    } } : page
   }))
   orca.panels.handle('listDecisions', (input, context) => withOwner(context, caller => backend.listDecisions(caller, input)))
-  orca.panels.handle('getDecision', (input, context) => withOwner(context, async caller => {
+
+  async function readDecision(caller: OwnerCaller, input: { questionId: string }) {
     const questionId = input?.questionId
     if (local && typeof questionId === 'string' && questionId.startsWith(nativePrefix)) {
       return result(() => nativeDetail(local.cli, questionId))
     }
     const decision = await backend.getDecision(caller, input)
     return local && decision.ok ? { ...decision, value: localActions(decision.value) } : decision
-  }))
+  }
+
+  orca.panels.handle('getDecision', (input, context) => withOwner(context, caller => readDecision(caller, input)))
   orca.panels.handle('submitReply', (input, context) => withOwner(context, caller => backend.submitReply(caller, input)))
   orca.panels.handle('retryReply', (input, context) => withOwner(context, caller => local
     ? result(() => { throw missing('Orca mail from Decision Inbox') })
@@ -108,7 +116,7 @@ export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
   orca.panels.handle('settings.effective', (input, context) => withOwner(context, caller => backend.effectivePolicy(caller, input)))
   orca.panels.handle('settings.repos', (_input, context) => withOwner(context, caller => result(() => [...new Set(caller.repos)].sort())))
   orca.panels.handle('review.open', (input, context) => withOwner(context, async caller => {
-    const decision = await backend.getDecision(caller, input)
+    const decision = await readDecision(caller, input)
     if (!decision.ok) return decision
     return result(async () => {
       await boundary.openReference(caller, { questionId: decision.value.questionId })

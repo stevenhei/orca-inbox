@@ -647,20 +647,22 @@ test('desktop ingress uses only one matching assistant record from a resolved lo
     { kind: 'message', role: 'user', text: 'ORCA-INBOX-V1 ' + JSON.stringify({ op: 'submit', input: request }) },
     { kind: 'tool', role: 'assistant', text: 'ORCA-INBOX-V1 ' + JSON.stringify({ op: 'submit', input: request }) }
   ]
-  const addSubmission = (input = request) =>
-    entries.push({ kind: 'message', role: 'assistant', text: 'ORCA-INBOX-V1 ' + JSON.stringify({ op: 'submit', input }) })
-  const synthetic = { uid: 'native-uid', number: 4, owner: { name: 'Lab' }, status: 'needs-you', title: 'Layout',
+  const marker = (input = request) => 'ORCA-INBOX-V1 ' + JSON.stringify({ op: 'submit', input })
+  const addResponse = (text: string) => entries.push({ kind: 'message', role: 'assistant', text })
+  const synthetic = { uid: 'native-uid', number: 4, owner: { name: 'Lab' }, status: 'needs_you', title: 'Layout',
     description: 'Context\nORCA-DECISION-META {"priority":"P0","blockedWork":["Layout"]}', createdAt: 1,
     question: { eventId: 'e42', text: 'Please choose.', decisions: [
       { question: 'Which layout?', replies: [{ label: 'Stack', detail: 'One column', recommended: true }] }
     ] } }
-  const plain = { uid: 'plain-uid', number: 5, owner: { name: 'Lab' }, title: 'Plain Item', status: 'planned', createdAt: 2 }
+  const plain = { uid: 'plain-uid', number: 5, owner: { name: 'Lab' }, title: 'Plain Item', status: 'in_progress', createdAt: 2 }
   const places = [{ orcaSessionId: session, kind: 'chat', agent: 'codex', hostId: 'local',
     worktreeId: workspaceId, workspace: 'Studio', repo: 'Studio' }]
   let removed = false
   let reads = 0
   let nativeAvailable = true
   let chatState = 'done'
+  let historyLimited = false
+  let hideUserBoundary = false
   const references: unknown[] = []
   const worker = await mountWorker({ default(orca) {
     registerDesktopWorker(orca, {
@@ -668,7 +670,7 @@ test('desktop ingress uses only one matching assistant record from a resolved lo
       removeHint: async name => { assert.equal(name, hint); removed = true },
       async cli(args) {
         if (args[0] === 'agent' && args[1] === 'show') return { kind: 'chat', places, orcaSessionId: session }
-        if (args[0] === 'agent' && args[1] === 'read') { reads++; return { kind: 'chat', source: 'chat', orcaSessionId: session, state: chatState, entries } }
+        if (args[0] === 'agent' && args[1] === 'read') { reads++; return { kind: 'chat', source: 'chat', orcaSessionId: session, state: chatState, limited: historyLimited, entries: hideUserBoundary ? entries.slice(1) : entries } }
         if (!nativeAvailable) throw new Error('Unsupported Bot CLI')
         if (args.join(' ') === 'bot list') return { bots: [{ id: 'bot-1' }, { id: 'remote', server: { on: 'paired' } }] }
         if (args[2] === 'list') {
@@ -690,17 +692,41 @@ test('desktop ingress uses only one matching assistant record from a resolved lo
   const first = await readPage()
   assert.deepEqual(first.rows.map(row => row.title), ['Which layout?', 'Plain Item'])
   assert.equal(first.sources?.find(src => src.source === 'native-item')?.state, 'partial')
+  assert.equal(first.sources?.find(src => src.source === 'plugin')?.state, 'partial')
+  assert.equal(first.mail?.state, 'unavailable')
+  assert.deepEqual(value(await worker.request('listDecisionPage', { ...list, includeHistory: false }, panel))
+    .rows.map(row => row.title), ['Which layout?'])
   const native = first.rows[0]
+  assert.equal(native.source?.kind === 'native-item' && native.source.itemStatus, 'needs-you')
+  const plainSource = first.rows[1].source
+  assert.equal(plainSource?.kind === 'native-item' && plainSource.itemStatus, 'in-progress')
   assert.deepEqual(native.actions, [])
-  assert.equal(value(await worker.request('getDecision', { questionId: native.questionId }, panel)).options[0].label, 'Stack')
+  value(await worker.request('review.open', { questionId: native.questionId }, panel))
+  assert.deepEqual(host.callsOf('editor.open'), [{ workspaceId, path: '.orca-decision-inbox/probe.orca-decision' }])
+  const nativeRef = references[0] as { questionId: string }
+  const nativeDetail = value(await worker.request('getDecision', nativeRef, panel))
+  assert.equal(nativeDetail.options[0].label, 'Stack')
+  assert.deepEqual(nativeDetail.actions, [])
+  assert.equal(code(await worker.request('review.open', { questionId: 'bot-item:unauthorized:e42:0' }, panel)), 'not-found')
+  assert.equal(host.callsOf('editor.open').length, 1)
   assert.equal(code(await worker.request('submitReply', initial(native.questionId, 'native-answer'), panel)), 'not-found')
   assert.equal(code(await worker.request('listDecisionPage', list, { panel: 'unrelated' })), 'forbidden')
 
-  addSubmission()
+  addResponse(marker())
   chatState = 'working'
   assert.ok(!(await readPage()).rows.some(row => row.questionId === questionId))
   chatState = 'done'
-  addSubmission({ ...request, summary: 'Changed under the same ID' })
+  // A bounded suffix cannot authorize a marker whose user boundary was cut.
+  historyLimited = true
+  hideUserBoundary = true
+  assert.ok(!(await readPage()).rows.some(row => row.questionId === questionId))
+  hideUserBoundary = false
+  // A new, unrelated exchange cannot select a marker from the earlier turn.
+  entries.push({ kind: 'message', role: 'user', text: 'Unrelated work' })
+  addResponse('No decision here.')
+  assert.ok(!(await readPage()).rows.some(row => row.questionId === questionId))
+  entries.pop()
+  addResponse(marker() + '\n' + marker({ ...request, summary: 'Changed under the same ID' }))
   assert.ok(!(await readPage()).rows.some(row => row.questionId === questionId))
   entries.pop()
   places[0].hostId = 'paired'
@@ -708,8 +734,13 @@ test('desktop ingress uses only one matching assistant record from a resolved lo
   assert.ok(!(await readPage()).rows.some(row => row.questionId === questionId))
   assert.equal(reads, priorReads)
   places[0].hostId = 'local'
-  addSubmission() // Exact duplicate records are one idempotent submission.
-  assert.ok((await readPage()).rows.some(row => row.questionId === questionId))
+  // Only the latest assistant response is considered. Identical lines
+  // in that response are one idempotent submission.
+  addResponse(marker() + '\n' + marker())
+  const imported = await readPage()
+  assert.ok(imported.rows.some(row => row.questionId === questionId))
+  assert.deepEqual(imported.sources?.find(src => src.source === 'plugin'), { source: 'plugin', state: 'available' })
+  assert.equal(imported.mail?.state, 'unavailable')
   assert.ok(removed)
   const workspace = { hostId: 'local', workspaceId }
   assert.deepEqual(value(await worker.request('listDecisionPage', {
@@ -717,9 +748,13 @@ test('desktop ingress uses only one matching assistant record from a resolved lo
   }, panel)).rows.map(row => row.questionId), [questionId])
   value(await worker.request('review.open', { questionId }, panel))
   value(await worker.request('settings.open', undefined, panel))
-  assert.deepEqual(references, [{ questionId }, { view: 'settings' }])
+  assert.deepEqual(references, [{ questionId: native.questionId }, { questionId }, { view: 'settings' }])
   const answer = value(await worker.request('submitReply', initial(questionId, 'saved-locally'), panel))
   assert.equal(answer.delivery.state, 'undelivered')
+  value(await worker.request('review.open', { questionId }, panel))
+  const saved = value(await worker.request('getDecision', { questionId }, panel))
+  assert.deepEqual(saved.actions, ['follow-up'])
+  assert.equal(saved.answerState.state === 'answered' && saved.answerState.initial.delivery.state, 'undelivered')
   assert.equal(code(await worker.request('retryReply', { questionId, replyId: answer.replyId }, panel)), 'unavailable')
   nativeAvailable = false
   const available = await readPage()

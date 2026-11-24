@@ -5,8 +5,10 @@ import {
 } from 'orca'
 import type { PanelContext } from 'orca'
 import type { Decision, Workspace } from './contract.ts'
-import { STATE_LABEL, deadlineLabel, isActionable, nativeOf, nativeStatusLabel, order, sameWorkspace, shownState, siblings, undeliveredReplies } from './model.ts'
+import { STATE_LABEL, actionsOf, deadlineLabel, isActionable, nativeNeedsYou, nativeOf, nativeStatusLabel, order, sameWorkspace, shownState, siblings, undeliveredReplies } from './model.ts'
 import { call, clock, failureText, sourcesOf, type Failure, type Requester, type SourceStatus } from './client.ts'
+import type { DecisionPage } from './backend-protocol.ts'
+type MailStatus = NonNullable<DecisionPage['mail']>
 
 // Narrow right-sidebar panel, declarative Orca components only. Data comes from the plugin
 // worker (`listDecisionPage`); there is no fixture fallback. Rules:
@@ -31,7 +33,7 @@ const openError = atom<{ title: string; text: string } | null>(null)
 const current = atom<Workspace | null | undefined>(undefined)
 const focusError = atom<string | null>(null)
 /** Loaded pages for one query key, so a failed refresh still shows (and labels) the last list. */
-const rows = atom<{ key: string; list: Decision[]; nextCursor?: string; sources: SourceStatus[] } | null>(null)
+const rows = atom<{ key: string; list: Decision[]; nextCursor?: string; sources: SourceStatus[]; mail?: MailStatus } | null>(null)
 const loading = atom<false | 'first' | 'more'>(false)
 /** The last load failure, for the query key it happened in. */
 const loadError = atom<{ key: string; f: Failure } | null>(null)
@@ -73,7 +75,7 @@ async function load(more = false) {
     const seen = new Set(cursor ? prev!.list.map((d) => d.questionId) : [])
     const list = cursor ? [...prev!.list, ...r.value.rows.filter((d) => !seen.has(d.questionId))] : r.value.rows
     // The latest page's per-source report describes the whole list.
-    set(rows, { key, list, ...(r.value.nextCursor ? { nextCursor: r.value.nextCursor } : {}), sources: sourcesOf(r.value) })
+    set(rows, { key, list, ...(r.value.nextCursor ? { nextCursor: r.value.nextCursor } : {}), sources: sourcesOf(r.value), ...(r.value.mail ? { mail: r.value.mail } : {}) })
     set(loadError, null)
   } else set(loadError, { key, f: r })
 }
@@ -100,19 +102,20 @@ async function refresh() {
   let cursor: string | undefined
   let pages = 0
   let sources: SourceStatus[] = []
+  let mail: MailStatus | undefined
   do {
     const r = await call(req, 'listDecisionPage', pageInput(sc, w, t, h, cursor))
     if (mine !== seq) return
     if (!r.ok) { refreshing = false; set(loading, false); set(loadError, { key, f: r }); return }
     const before = list.length
     for (const d of r.value.rows) if (!seen.has(d.questionId)) { seen.add(d.questionId); list.push(d) }
-    if (pages === 0) sources = sourcesOf(r.value) // the first page reports each source's availability
+    if (pages === 0) { sources = sourcesOf(r.value); mail = r.value.mail } // the first page reports availability
     cursor = r.value.nextCursor
     if (before >= prev.list.length) break // this was the extra page a pending "Load more" asked for
   } while (cursor && (list.length < prev.list.length || wantExtra) && ++pages < MAX_REFRESH_PAGES)
   refreshing = false
   set(loading, false)
-  const next = { key, list, ...(cursor ? { nextCursor: cursor } : {}), sources }
+  const next = { key, list, ...(cursor ? { nextCursor: cursor } : {}), sources, ...(mail ? { mail } : {}) }
   if (JSON.stringify(next) !== JSON.stringify(prev)) set(rows, next)
   if (read(loadError)) set(loadError, null)
 }
@@ -196,6 +199,8 @@ function DecisionRow(props: { d: Decision; all: readonly Decision[]; at: number;
   const pkg = native ? 0 : siblings(all, d).length
   // The canonical state stays the initial answer's; a failed follow-up gets its own badge.
   const failedFollowUps = native ? 0 : undeliveredReplies(d).filter((r) => r.kind === 'follow-up').length
+  // Without a supported retry, an undelivered reply is a saved answer waiting for mail: say so.
+  const saved = !actionsOf(d).includes('retry')
   const where = native && !native.workspaceAttributed
     ? 'No workspace attribution'
     : `${d.projectName} · ${d.workspaceName}${d.origin.hostId !== 'local' ? ` · ${d.origin.hostId}` : ''}`
@@ -213,11 +218,11 @@ function DecisionRow(props: { d: Decision; all: readonly Decision[]; at: number;
         <Badge tone={d.priority === 'P0' ? 'danger' : d.priority === 'P1' ? 'warning' : 'neutral'}>{d.priority}</Badge>
         {due && <Badge tone={due.overdue ? 'danger' : 'warning'}>{due.text}</Badge>}
         {native
-          ? <Badge tone={native.itemStatus === 'needs-you' ? 'accent' : 'neutral'}>{nativeStatusLabel(native.itemStatus)}</Badge>
-          : state !== 'awaiting-answer' && <Badge tone={state === 'undelivered' ? 'danger' : 'accent'}>{STATE_LABEL[state]}</Badge>}
+          ? <Badge tone={nativeNeedsYou(native) ? 'accent' : 'neutral'}>{nativeStatusLabel(native.itemStatus)}</Badge>
+          : state !== 'awaiting-answer' && <Badge tone={state === 'undelivered' ? 'danger' : 'accent'}>{state === 'undelivered' && saved ? 'Saved · not delivered' : STATE_LABEL[state]}</Badge>}
         {/* Compact rows carry at most one failed follow-up, so the total is unknown here: name
             the condition, not a count. The review lists every reply. */}
-        {failedFollowUps > 0 && <Badge tone="danger">Follow-up delivery failed</Badge>}
+        {failedFollowUps > 0 && <Badge tone="danger">{saved ? 'Follow-up saved · not delivered' : 'Follow-up delivery failed'}</Badge>}
         {/* Only the loaded page is known; say "shown" unless every package member is loaded. */}
         {pkg > 0 && <Badge>{complete ? `Package · ${pkg + 1} questions` : `Package · ${pkg + 1} shown`}</Badge>}
       </Row>
@@ -228,8 +233,8 @@ function DecisionRow(props: { d: Decision; all: readonly Decision[]; at: number;
 
 const SOURCE_NAME: Record<SourceStatus['source'], string> = { plugin: 'Chat decisions', 'native-item': 'Bot Items' }
 /**
- * One callout per source that is not fully available, saying what still works. A failing source
- * never hides the other source's rows.
+ * Read coverage, one callout per source that was not fully read, saying what still works. A
+ * failing source never hides the other source's rows. Mail delivery is reported separately.
  */
 function SourceNotices(props: { sources: readonly SourceStatus[] }) {
   return (
@@ -239,7 +244,9 @@ function SourceNotices(props: { sources: readonly SourceStatus[] }) {
         const title = x.state === 'partial' ? `Some ${SOURCE_NAME[x.source]} could not be read` : `${SOURCE_NAME[x.source]} are unavailable`
         const what = x.source === 'native-item'
           ? 'Check Bot Items in Orca directly.'
-          : 'Chat decisions cannot be answered here until this is fixed; existing drafts are kept.'
+          : x.state === 'partial'
+            ? 'The Chat decisions shown can still be answered.'
+            : 'Chat decisions cannot be listed or answered here right now; saved drafts are kept.'
         return (
           <Callout key={x.source} tone="warning" title={title}>
             {`${x.message ? `${x.message} ` : ''}${what} ${other} below are not affected.`}
@@ -247,6 +254,16 @@ function SourceNotices(props: { sources: readonly SourceStatus[] }) {
         )
       })}
     </Stack>
+  )
+}
+
+/** Delivery, not reading: answers still save when no mail sender exists. */
+function MailNotice(props: { mail?: MailStatus }) {
+  if (props.mail?.state !== 'unavailable') return null
+  return (
+    <Callout tone="neutral" title="Answers are saved, not delivered yet">
+      {`Answers to Chat decisions are saved in Decision Inbox. Orca mail from this plugin is unavailable on this host, so saved answers are not delivered to the chat yet.${props.mail.message ? ` ${props.mail.message}` : ''}`}
+    </Callout>
   )
 }
 
@@ -339,6 +356,7 @@ export default function Panel() {
       {oe && <Callout tone="danger" title={oe.title}>{oe.text}</Callout>}
 
       <SourceNotices sources={sources} />
+      {all && loaded && <MailNotice mail={loaded.mail} />}
       {body}
       {more && (
         <Button size="sm" variant="outline" disabled={read(loading) === 'more'} onPress={() => load(true)}>

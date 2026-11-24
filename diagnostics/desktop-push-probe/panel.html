@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Desktop Push Probe</title>
+</head>
+<body>
+  <form id="probe">
+    <p><label>Disposable Orca Chat address <input name="target" placeholder="orca_session_id:…" required></label></p>
+    <p><label><input name="confirmed" type="checkbox" required> I created this Chat for the passive push experiment.</label></p>
+    <button type="submit">Send one synthetic message</button>
+  </form>
+  <pre id="report" role="status" aria-live="polite"></pre>
+  <script type="module" src="./panel.mjs"></script>
+</body>
+</html>
