@@ -13,6 +13,41 @@
       "description": "Private development builds of Decision Inbox",
       "releases": [
         {
+          "version": "0.2.1",
+          "commit": "ae8dc28606e8de13d388b78ba483603cd80b62e3",
+          "contentHash": "24997085723ebd4946d65aaa9dc0a5973f7c94fab8dcca542006394622cd724d",
+          "execution": "trusted-worker",
+          "minimumOrca": "1.4.248",
+          "name": "Decision Inbox",
+          "contributes": [
+            {
+              "kind": "panels",
+              "name": "Decision Inbox"
+            },
+            {
+              "kind": "customEditors",
+              "name": "Decision Review",
+              "detail": ".orca-decision"
+            },
+            {
+              "kind": "newFiles",
+              "name": "Decision Inbox dashboard",
+              "detail": ".orca-decision"
+            }
+          ],
+          "capabilities": [
+            "storage:own",
+            "workspace:read",
+            "workspace:write"
+          ],
+          "fileTypes": [
+            "orca-decision"
+          ],
+          "editorFileTypes": [
+            "orca-decision"
+          ]
+        },
+        {
           "version": "0.1.2",
           "commit": "4d7b7b3bd62156e81f8fe823a47b95167bc1fe5d",
           "contentHash": "8acb23265631fa413fb825936e79607884fcef24dd159690fafed6100ac76c52",
