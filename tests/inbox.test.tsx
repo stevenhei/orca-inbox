@@ -1,12 +1,12 @@
 import { assert, hostError, mockHost, mount, test } from 'orca/testing'
 import type { MockRequests, TestPanel } from 'orca/testing'
-import * as panel from './panel'
+import * as panel from '../src/panel'
 import { decisions, historyExample, clock as fixtureClock, origins } from '../fixtures/decisions'
-import { actionsOf, dayKey, deadlineLabel, group, isActionable, nativeStatusLabel, order, receiptMatches, searchText, shownState, visible, workspaceKey } from './model'
-import { clock, reconcile } from './client'
-import { workspaceValue } from './workspace-scope'
-import type { Decision, ListDecisions, Result, SubmitReply, Workspace } from './contract'
-import type { DecisionPage, DraftRecord, InboxSettings, SourceAvailability, WorkspaceOptions } from './backend-protocol'
+import { actionsOf, dayKey, deadlineLabel, group, isActionable, nativeStatusLabel, order, receiptMatches, searchText, shownState, visible, workspaceKey } from '../src/model'
+import { clock, reconcile } from '../src/client'
+import { workspaceValue } from '../src/workspace-scope'
+import type { Decision, ListDecisions, Result, SubmitReply, Workspace } from '../src/contract'
+import type { DecisionPage, DraftRecord, InboxSettings, SourceAvailability, WorkspaceOptions } from '../src/backend-protocol'
 
 // Fixtures, the fixed clock and UTC are injected here only; production reads the live clock and
 // the desktop zone (see the last test).
@@ -591,7 +591,7 @@ test('panel: a note is added in the panel with the wide tab refused; exact words
     const at = sched.description.indexOf('Rooms A', 1)
     assert.deepEqual(n1, { kind: 'selection', anchor: { kind: 'question', field: 'description', revision: sched.revision }, start: at, end: at + 7, quote: 'Rooms A', text: 'the second one' }, 'raw description offsets of the chosen occurrence')
     assert.ok(!view.find({ label: 'Note on' }), 'the composer closes after saving')
-    assert.ok(view.find({ text: /Note saved with your draft \(1\)\. Not sent yet/ }))
+    assert.ok(view.find({ text: /^Note saved\.$/ }))
     assert.ok(!view.find({ text: /^1\. Description/ }), 'saved notes stay collapsed behind Notes (n)')
     await view.press({ text: 'Add note' })
     await view.select({ label: 'Note on' }, 'image:plan:2')
@@ -1193,7 +1193,7 @@ const LIVE = ['listDecisionPage', 'workspace.options', 'workspace.resolve', 'ret
 const liveCalls = (view: TestPanel) => LIVE.reduce((n, name) => n + requestsOf(view, name).length, 0)
 
 test('source status: typed coverage is one line per kind, failed reads are named in the summary, nothing is promised', async () => {
-  const { sourceStatus, replyReach } = await import('./source-status')
+  const { sourceStatus, replyReach } = await import('../src/source-status')
   assert.equal(sourceStatus(allAvailable), null, 'nothing to say when every source was read')
   const v = sourceStatus([
     { source: 'plugin', state: 'partial', coverage: [

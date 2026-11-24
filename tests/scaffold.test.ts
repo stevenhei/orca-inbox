@@ -1,5 +1,5 @@
 import { assert, mount, test } from 'orca/testing'
-import * as panel from './panel'
+import * as panel from '../src/panel'
 import { decisions, historyExample, reviewReply } from '../fixtures/decisions'
 
 test('sidebar renders scaffold status', async () => {

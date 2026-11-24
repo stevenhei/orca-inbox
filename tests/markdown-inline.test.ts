@@ -1,5 +1,5 @@
 import { assert, test } from 'orca/testing'
-import { autolinkForMarkdown, tokenizeInline, type InlineToken } from './markdown-inline'
+import { autolinkForMarkdown, tokenizeInline, type InlineToken } from '../src/markdown-inline'
 
 /** Links as [href, text] and the plain text around them, for readable assertions. */
 const view = (s: string) => {

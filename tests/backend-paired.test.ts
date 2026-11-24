@@ -1,10 +1,10 @@
 import { assert, hostError, mockHost, mount, mountWorker, test } from 'orca/testing'
-import type { Decision, Result } from './contract.ts'
-import type { DecisionPageInput } from './backend-protocol.ts'
-import { nativeDetail, nativePage } from './backend-orca.ts'
-import { registerDesktopWorker } from './worker.ts'
-import { workspaceValue } from './workspace-scope.ts'
-import * as panel from './panel.tsx'
+import type { Decision, Result } from '../src/contract.ts'
+import type { DecisionPageInput } from '../src/backend-protocol.ts'
+import { nativeDetail, nativePage } from '../src/backend-orca.ts'
+import { registerDesktopWorker } from '../src/worker.ts'
+import { workspaceValue } from '../src/workspace-scope.ts'
+import * as panel from '../src/panel.tsx'
 
 const localWorkspace = { hostId: 'local', workspaceId: 'identity:shared-workspace' }
 const pairedWorkspace = { hostId: 'runtime:paired-a', workspaceId: localWorkspace.workspaceId }
@@ -43,7 +43,7 @@ test('paired native reads isolate equal host IDs, verify attribution, preserve s
   let denyPaired = false
   const worker = await mountWorker({ default(orca) {
     registerDesktopWorker(orca, {
-      hints: async () => [], removeHint: async () => {},
+      scanHints: async () => ({ names: [], truncated: false }), removeHint: async () => {},
       async cli(args, selector, runtimeId) {
         calls.push({ args, selector, runtimeId })
         if (args.join(' ') === 'environment list') {
@@ -209,7 +209,7 @@ test('workspace scope preserves a unique host-qualified focus and rejects a coll
   const worker = await mountWorker({ default(orca) {
     registerDesktopWorker(orca, {
       cli: async () => { throw new Error('Focus resolution must not guess a host with the CLI.') },
-      hints: async () => [], removeHint: async () => {}
+      scanHints: async () => ({ names: [], truncated: false }), removeHint: async () => {}
     })
   } }, { host })
   const collision = await worker.request('workspace.resolve', { workspaceId: focused }, caller)
@@ -239,7 +239,7 @@ test('workspace options expose the authorized host inventory, including empty an
         if (args.join(' ') === 'bot list') return { bots: [] }
         throw new Error('Options must not discover hosts or list decisions.')
       },
-      hints: async () => [], removeHint: async () => {}
+      scanHints: async () => ({ names: [], truncated: false }), removeHint: async () => {}
     })
   } }, { host })
   try {
@@ -292,7 +292,7 @@ test('registered paging distinguishes removed workspaces from authorized empty s
   let hintReads = 0
   const worker = await mountWorker({ async default(orca) {
     const backend = registerDesktopWorker(orca, {
-      hints: async () => { hintReads++; return [] },
+      scanHints: async () => { hintReads++; return { names: [], truncated: false } },
       removeHint: async () => {},
       async cli(args) {
         cliCalls++

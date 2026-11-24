@@ -1,14 +1,14 @@
 import { assert, hostError, mockHost, mountWorker, test } from 'orca/testing'
 import { decisions, reviewReply } from '../fixtures/decisions.ts'
 import { richContext } from '../fixtures/rich-context.ts'
-import { localInboxBoundary, processChatHint } from './backend-orca.ts'
-import { InboxBackend } from './backend.ts'
-import { orcaStorage } from './backend-storage.ts'
+import { localInboxBoundary, processChatHint } from '../src/backend-orca.ts'
+import { InboxBackend } from '../src/backend.ts'
+import { orcaStorage } from '../src/backend-storage.ts'
 import type { JsonValue, PanelRequestContext } from 'orca/worker'
-import type { AgentCaller, DeliveryTarget, InboxBoundary, InboxStorage, SendOutcome } from './backend.ts'
-import type { OwnerCaller } from './backend-protocol.ts'
-import type { Annotation, Decision, Result, SubmitDecision, SubmitReply } from './contract.ts'
-import activate, { registerDesktopWorker, registerWorker } from './worker.ts'
+import type { AgentCaller, DeliveryTarget, InboxBoundary, InboxStorage, SendOutcome } from '../src/backend.ts'
+import type { OwnerCaller } from '../src/backend-protocol.ts'
+import type { Annotation, Decision, Result, SubmitDecision, SubmitReply } from '../src/contract.ts'
+import activate, { registerDesktopWorker, registerWorker } from '../src/worker.ts'
 
 const owner: OwnerCaller = { kind: 'owner', id: 'owner', workspaces: decisions.map(d => d.origin), repos: ['library', 'studio'] }
 const secondOwner: OwnerCaller = { ...owner, id: 'second-owner' }
@@ -668,7 +668,7 @@ test('desktop ingress uses only one matching assistant record from a resolved lo
   const references: unknown[] = []
   const worker = await mountWorker({ default(orca) {
     registerDesktopWorker(orca, {
-      hints: async () => removed ? [] : [hint],
+      scanHints: async () => ({ names: removed ? [] : [hint], truncated: false }),
       removeHint: async name => { assert.equal(name, hint); removed = true },
       async cli(args) {
         if (args[0] === 'agent' && args[1] === 'show') return { kind: 'chat', places, orcaSessionId: session }
@@ -739,9 +739,9 @@ test('desktop ingress uses only one matching assistant record from a resolved lo
   assert.ok(!(await readPage()).rows.some(row => row.questionId === questionId))
   assert.equal(reads, priorReads)
   places[0].hostId = 'local'
-  // Only the latest assistant response is considered. Identical lines
-  // in that response are one idempotent submission.
-  addResponse(marker() + '\n' + marker())
+  // Reordered fields in the latest response name the same canonical submission.
+  const { requestId, ...rest } = request
+  addResponse(marker() + '\n' + marker({ ...rest, requestId }))
   const imported = await readPage()
   assert.ok(imported.rows.some(row => row.questionId === questionId))
   assert.deepEqual(imported.sources?.find(src => src.source === 'plugin'), { source: 'plugin', state: 'available' })
@@ -808,7 +808,7 @@ test('wide navigation reports a sanitized failure stage and preserves independen
       return method === 'editor.open' && returnNotOpened ? { opened: false } : response
     }) as typeof orca.host.call
     registerDesktopWorker({ ...orca, host: { ...orca.host, call } }, {
-      hints: async () => [], removeHint: async () => {},
+      scanHints: async () => ({ names: [], truncated: false }), removeHint: async () => {},
       async cli(args) {
         if (args.join(' ') === 'bot list') return { bots: [{ id: 'test-bot' }] }
         if (args[2] === 'list') return { items: [item] }
@@ -884,7 +884,7 @@ test('the dashboard uses the authorized review editor contribution for Inbox dat
         handler(input, { ...context, panel: { ...context.panel, surface } })
       ])) as typeof orca.panels.handle
     backend = registerDesktopWorker({ ...orca, panels: { ...orca.panels, handle } }, {
-      hints: async () => [], removeHint: async () => {},
+      scanHints: async () => ({ names: [], truncated: false }), removeHint: async () => {},
       async cli(args) {
         if (args.join(' ') === 'environment list') return { environments: [] }
         if (args.join(' ') === 'bot list') return { bots: [] }
@@ -1072,7 +1072,7 @@ test('local image intake reports missing staging while a verified link-only Chat
   let removed = false
   const worker = await mountWorker({ default(orca) {
     registerDesktopWorker(orca, {
-      hints: async () => removed ? [] : [hint],
+      scanHints: async () => ({ names: removed ? [] : [hint], truncated: false }),
       removeHint: async () => { removed = true },
       async cli(args) {
         if (args.join(' ') === 'bot list') return { bots: [] }
@@ -1135,7 +1135,7 @@ test('ordinary detail retains explicit recommendations and exposes only recogniz
 })
 
 test('native metadata examples stay inert in both sections while top-level metadata still applies', async () => {
-  const { nativeDetail, nativePage } = await import('./backend-orca.ts')
+  const { nativeDetail, nativePage } = await import('../src/backend-orca.ts')
   const example = '~~~text\r\nORCA-DECISION-META {"priority":"P0"}\r\n## Background\r\n~~~\r\n'
   const item = {
     uid: 'fenced-item', title: 'Synthetic Item', status: 'needs_you', createdAt: 1, description: example,
@@ -1189,17 +1189,40 @@ test('a local Chat raw worktree ID resolves to the authorized desktop identity b
   }
   let saved: unknown
   const backend = new InboxBackend({ read: async () => saved, write: async state => { saved = state } }, localInboxBoundary(cli))
-  assert.equal(await processChatHint(cli, backend, desktop, name), false)
+  assert.equal(await processChatHint(cli, backend, desktop, name), 'pending-verification')
   worktree.identity.key = 'stable-room'
   worktree.hostId = 'other-host'
-  assert.equal(await processChatHint(cli, backend, desktop, name), false)
+  assert.equal(await processChatHint(cli, backend, desktop, name), 'pending-verification')
   worktree.hostId = 'local'
   worktree.id = 'wrong-worktree'
-  assert.equal(await processChatHint(cli, backend, desktop, name), false)
+  assert.equal(await processChatHint(cli, backend, desktop, name), 'pending-verification')
   assert.equal(reads, 0); assert.equal(saved, undefined)
   worktree.id = 'raw-room'
-  assert.equal(await processChatHint(cli, backend, desktop, name), true)
+  assert.equal(await processChatHint(cli, backend, desktop, name), 'accepted')
   assert.equal(reads, 1)
   const detail = await backend.getDecision(desktop, { questionId: 'schedule' })
   assert.ok(detail.ok && detail.value.origin.workspaceId === workspace.workspaceId)
+})
+
+test('column sorting orders the full authorized queue before slicing each page', async () => {
+  const h = harness()
+  const base = question('schedule')
+  const original = Array.from({ length: 62 }, (_, index) => ({
+    ...base, questionId: `q-${index}`, title: `Room ${index + 1}`,
+    background: `**Zone ${62 - index}**`, deadline: index === 5 ? '2030-07-01T01:00:00+02:00'
+      : index === 6 ? '2030-07-01T00:00:00Z' : undefined
+  }))
+  const request = { scope, includeHistory: true }
+  for (const direction of ['asc', 'desc']) {
+    const sort = { column: 'background', direction }
+    const first = value(await h.backend.listDecisionPage(owner, { ...request, sort }, original))
+    const second = value(await h.backend.listDecisionPage(owner, { ...request, sort, cursor: first.nextCursor }, original))
+    const labels = [...first.rows, ...second.rows].map(d => d.backgroundPreview)
+    assert.equal(first.rows.length, 50)
+    assert.equal(second.nextCursor, undefined)
+    assert.deepEqual(labels, original.map((_, i) => `Zone ${direction === 'asc' ? i + 1 : 62 - i}`))
+    const byDue = value(await h.backend.listDecisionPage(owner, { ...request, sort: { column: 'due', direction } }, original))
+    assert.deepEqual(byDue.rows.slice(0, 2).map(d => d.questionId), direction === 'asc' ? ['q-5', 'q-6'] : ['q-6', 'q-5'])
+  }
+  assert.equal(code(await h.backend.listDecisionPage(owner, { ...request, sort: { column: 'unknown', direction: 'asc' } })), 'invalid')
 })

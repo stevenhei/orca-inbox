@@ -871,19 +871,19 @@ function PanelNotes(props: { d: Decision }) {
           <Button size="sm" variant="ghost" disabled={sending} onPress={() => { set(pNoteSaved, false); editDraft({ annotations: read(cDraft).annotations.filter((x) => x !== n) }) }}>{`Remove note ${i + 1}`}</Button>
         </Row>
       ))}
-      {read(pNoteSaved) && draft.annotations.length > 0 && !open && <Text muted size="xs">{isPractice(d) ? `Note saved with your practice draft (${draft.annotations.length}).` : `Note saved with your draft (${draft.annotations.length}). Not sent yet: notes go with your reply.`}</Text>}
+      {read(pNoteSaved) && draft.annotations.length > 0 && !open && <Text muted size="xs">Note saved.</Text>}
       {open ? (
-        <Card title="Add a note" description={isPractice(d) ? 'Notes are saved with your practice draft and answer, on this device only.' : 'Notes are saved with your draft and sent with your reply, not before.'}>
+        <Card title="Add a note">
           <Select label="Note on" value={open.target || undefined} placeholder="Choose a paragraph or image…" options={targets.map((t) => ({ value: t.value, label: t.label }))}
             onChange={(v) => editNote({ target: v, phrase: '', occurrence: 0 })} />
           {target?.kind === 'text' && (
-            <Input label="Exact words (optional)" value={open.phrase} placeholder="Leave empty to note the whole paragraph" onChange={(v) => editNote({ phrase: v, occurrence: 0 })} />
+            <Input label="Exact words (optional)" value={open.phrase} onChange={(v) => editNote({ phrase: v, occurrence: 0 })} />
           )}
           {hits > 1 && (
             <Select label="Which occurrence" value={String(open.occurrence)} options={Array.from({ length: hits }, (_, i) => ({ value: String(i), label: `Occurrence ${i + 1} of ${hits}` }))}
               onChange={(v) => editNote({ occurrence: Number(v) })} />
           )}
-          <Textarea label="Note" rows={3} value={open.text} placeholder="Your note (Ctrl+Enter adds it)" invalid={!!open.error}
+          <Textarea label="Note" rows={3} value={open.text} invalid={!!open.error}
             onChange={(v) => editNote({ text: v })} onSubmit={() => { void addPanelNote(d) }} />
           {open.error && <Text size="xs" tone="danger">{open.error}</Text>}
           <Row gap="xs" justify="end">
@@ -897,7 +897,6 @@ function PanelNotes(props: { d: Decision }) {
           {draft.annotations.length > 0 && (
             <Button size="sm" variant="ghost" onPress={() => { set(pNoteSaved, false); set(pNotesList, !read(pNotesList)) }}>{`${read(pNotesList) ? 'Hide notes' : 'Notes'} (${draft.annotations.length})`}</Button>
           )}
-          {draft.annotations.length === 0 && <Text muted size="xs">Comment on a paragraph, exact words or an image. The wide review also lets you select text.</Text>}
         </Row>
       )}
     </Stack>
@@ -945,8 +944,6 @@ function ChatFooter(props: { d: Decision }) {
                 onChange={(v) => editDraft({ optionId: v, kind: 'initial' })} />
             )}
             <Textarea label={answered ? 'Follow-up' : 'Reply text'} rows={3} value={draft.text} disabled={sending}
-              placeholder={practice ? (answered ? 'Practice follow-up (Ctrl+Enter saves it here)' : 'Practice answer (Ctrl+Enter saves it here)')
-                : answered ? 'Follow-up to the agent (Ctrl+Enter to send)' : draft.optionId ? 'Optional detail with your option (Ctrl+Enter to submit)' : 'Free-text answer (Ctrl+Enter to submit)'}
               onChange={(v) => editDraft({ text: v })} onSubmit={() => { void send() }} />
             <PanelNotes d={d} />
             <Row gap="xs" align="center" justify="between">

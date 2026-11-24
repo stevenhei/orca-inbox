@@ -6,7 +6,7 @@ import { createInterface } from 'node:readline'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { rasterMime } from './raster-metadata.mjs'
+import { rasterMime } from '../src/local/raster-metadata.mjs'
 
 const images = {
   'png': 'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFklEQVR4nGP8z8DAwMDAxMDAwMDAAAANHQEDasKb6QAAAABJRU5ErkJggg==',
@@ -110,7 +110,7 @@ test('a failed publisher cannot roll back bytes committed by an overlapping CLI 
   const image = join(root, 'image.png')
   const manifest = join(root, 'input.json')
   const evidence = { kind: 'image-snapshot', evidenceId: 'sample', version: 2 }
-  const module = new URL('./local-snapshot.mjs', import.meta.url).href
+  const module = new URL('../src/local/local-snapshot.mjs', import.meta.url).href
   const cli = new URL('../agent/decision-inbox/inbox.mjs', import.meta.url).href
   const home = `
     import os from 'node:os'
@@ -154,8 +154,8 @@ test('a failed publisher cannot roll back bytes committed by an overlapping CLI 
     assert.deepEqual(await completed, [7, null])
     const staged = JSON.parse(second.stdout.slice('ORCA-INBOX-V1 '.length)).input.evidence[0]
     const imported = spawnSync(process.execPath, nodeArgs(`
-      const { hints } = await import(${JSON.stringify(new URL('./backend-local.mjs', import.meta.url).href)})
-      if (!(await hints()).includes(${JSON.stringify(`submit.${session}.${request}`)})) throw new Error('Missing hint')
+      const { scanHints } = await import(${JSON.stringify(new URL('../src/local/backend-local.mjs', import.meta.url).href)})
+      if (!(await scanHints()).names.includes(${JSON.stringify(`submit.${session}.${request}`)})) throw new Error('Missing hint')
       const { readLocalSnapshot } = await import(${JSON.stringify(module)})
       const image = await readLocalSnapshot(${JSON.stringify(session)}, ${JSON.stringify(request)}, ${JSON.stringify(staged)})
       console.log(JSON.stringify(image))
@@ -219,9 +219,9 @@ test('identical CLI retries refresh expired hints and ready images before the fi
       renewed.push(JSON.parse(marker.slice('ORCA-INBOX-V1 '.length)).input)
     }
     const result = node(`
-      const { hints } = await import(${JSON.stringify(new URL('./backend-local.mjs', import.meta.url).href)})
-      const { readLocalSnapshot } = await import(${JSON.stringify(new URL('./local-snapshot.mjs', import.meta.url).href)})
-      const keys = (await hints()).sort()
+      const { scanHints } = await import(${JSON.stringify(new URL('../src/local/backend-local.mjs', import.meta.url).href)})
+      const { readLocalSnapshot } = await import(${JSON.stringify(new URL('../src/local/local-snapshot.mjs', import.meta.url).href)})
+      const keys = (await scanHints()).names.sort()
       const images = []
       for (const { requestId, evidence } of ${JSON.stringify(renewed)}) {
         images.push(await readLocalSnapshot(${JSON.stringify(session)}, requestId, evidence[0]))

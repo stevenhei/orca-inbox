@@ -66,10 +66,6 @@ export async function scanHints() {
   }
 }
 
-export async function hints() {
-  return (await scanHints()).names
-}
-
 export async function removeHint(name) {
   if (hintPattern.test(name)) await rm(join(hintDirectory, name), { force: true })
 }

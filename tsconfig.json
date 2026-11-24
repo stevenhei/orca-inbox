@@ -1,5 +1,5 @@
 {
   "extends": "./.orca/types/tsconfig.json",
   "compilerOptions": { "allowImportingTsExtensions": true },
-  "include": ["src", "fixtures"]
+  "include": ["src", "fixtures", "tests"]
 }

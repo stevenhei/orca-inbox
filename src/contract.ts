@@ -135,6 +135,7 @@ export interface Decision extends Omit<QuestionInput, 'inlineImages'> {
   requestId: string
   packageId: string
   packageSummary?: string
+  backgroundPreview?: string
   projectName: string
   workspaceName: string
   origin: Origin
@@ -148,7 +149,12 @@ export interface Decision extends Omit<QuestionInput, 'inlineImages'> {
   answerState: AnswerState
 }
 
+export const decisionColumns = ['question', 'background', 'priority', 'status', 'source', 'workspace', 'due'] as const
+export type DecisionColumn = typeof decisionColumns[number]
+export type DecisionSort = { column: DecisionColumn; direction: 'asc' | 'desc' }
+
 export interface ListDecisions {
+  sort?: DecisionSort
   scope: { kind: 'workspace'; workspace: Workspace } | { kind: 'all' }
   query?: string
   includeHistory: boolean

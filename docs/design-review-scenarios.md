@@ -46,10 +46,9 @@ Check at widths 1100 and 600 (the 800px sidebar-to-modal switch must be visible 
 | `layout-conditional` | `layout` | Three options. Choose Grid and write a long conditional detail; it stays intact. |
 | `layout-answered` | `historyExample` | Your answer with accepted time, receipt ID and time ("Agent received"). Add a follow-up: it appends below, original unchanged, own delivery line. A second follow-up marked Undelivered shows the reason, **Retry (same reply ID, same destination)** and **Copy reply**. |
 | `package` | `room-route` and `room-reset` | Sibling chips show the other question and its own state; shared `floor-plan` v2 link; answering one does not change the other. |
-| `images-single` | `image-review` | Seven thumbnails, one large viewer, zoom out, zoom in, reset. Placeholders keep their real aspect ratios (Panorama 1800×600, Tall detail 600×1800). |
-| `images-compare` | `image-review` | **Compare side by side**: Panorama on one side, Front portrait on the other (click for the right pane, Shift-click for the left). Per-image note field on each. |
+| `images-single` | `image-review` | Each image opens above the sheet. Wheel or trackpad scroll zooms at the pointer. Drag to pan, then close to return to the same image. |
 | `images-expired` | `image-review` | Snapshot 6 expired: "Snapshot expired or missing" with **Ask the agent to re-attach**; the other six still work. |
-| `notes-wide` | `image-review` | Select "Paper models" (offsets [0, 12)) in Background: **Add note (Alt+N)** appears; the note shows its quote in the sidebar with its field focused. An image note appears in the same list. Notes are sent together with the reply. |
+| `notes-wide` | `image-review` | Select text, add a note and reopen **Notes (1)** in a narrow sheet inside a wide window. The saved text, Edit and Close must be in view and clickable. |
 | `notes-narrow` | `image-review`, width 600 | The sidebar is gone. **Notes** and Alt+N open a modal composer; Esc closes it and focus returns to the opener. |
 | `states` | any | Awaiting answer, Submitted, Agent received, Undelivered each visible in the four-step strip, with `aria-current="step"` on the current one. |
 | `not-found` | unknown `questionId` | An alert instead of a blank tab. Also show a forbidden and an unavailable variant. |
@@ -58,7 +57,7 @@ Check at widths 1100 and 600 (the 800px sidebar-to-modal switch must be visible 
 
 ## Evidence the owner needs back
 
-For each scenario: a PNG (the `shot` default location is `.orca/shots/`), the width and theme, and the owner's verdict. Record the owner's decisions in [design-handoff.md](design-handoff.md). The evidence-layout choice (one large viewer plus an optional side-by-side compare) is still unconfirmed by the owner; `images-single` and `images-compare` exist to settle it.
+For each scenario: a PNG (the `shot` default location is `.orca/shots/`), the width and theme, and the owner's verdict. Record the owner's decisions in [design-handoff.md](design-handoff.md).
 
 ## Open items for the worker session
 

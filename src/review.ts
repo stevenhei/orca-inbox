@@ -1,10 +1,10 @@
-import type { Annotation, Answer, Decision, Delivery, Evidence, RecordedReply, SubmitReply, VisibleInlineImage, Workspace } from './contract.ts'
+import type { Annotation, Answer, Decision, DecisionColumn, DecisionSort, Delivery, Evidence, RecordedReply, SubmitReply, VisibleInlineImage, Workspace } from './contract.ts'
 import type { DecisionPage, EffectivePolicy, InboxSettings, WorkspaceOptions } from './backend-protocol.ts'
-import { variantDCss } from './dashboard-style.ts'
+import { editorStyles } from './editor/styles.ts'
 import { tokenizeInline, type InlineToken } from './markdown-inline.ts'
 import { noteLabel, notesFate } from './note-anchors.ts'
 import { ScopeTracker, emptyScopeState, lostWorkspace, queueInput, scopeOf, scopeValue, workspaceChoices, workspaceLabel, type Scope, type ScopeState } from './workspace-scope.ts'
-import { STATE_LABEL, actionsOf, deadlineLabel, group, isActionable, isPractice, nativeOf, nativeStatusLabel, order, replyState, shownState, sourceWord, type NativeSource, type ShownState } from './model.ts'
+import { STATE_LABEL, actionsOf, columnText, deadlineLabel, group, isActionable, isPractice, nativeOf, nativeStatusLabel, order, replyState, shownState, sourceWord, type NativeSource, type ShownState } from './model.ts'
 import { replyReach, sourceStatus, type StatusSource } from './source-status.ts'
 import {
   call, clock, draftIsEmpty, emptyDraft, failureText, formatInstant, newReplyId, reconcile, replies,
@@ -16,270 +16,13 @@ import {
 // `{"view": "settings"}` (Inbox Settings). Every decision,
 // draft, reply, snapshot and setting comes from the plugin worker; there is no fixture fallback.
 // Plain DOM, themed only through `--orca-*` (only foreground/background are confirmed, so the rest
-// is derived with color-mix). Notes live in a sticky sidebar; below 800px they move to a modal.
+// is derived with color-mix). Notes open in a native modal dialog at every width.
 //
 // Truthfulness rules: the delivery strip only shows what the worker recorded. A reply is never
 // shown as accepted before `submitReply` returns it, and Agent received needs a receipt that
 // matches the reply, question and exact origin (see `replyState`).
 
-const css = `
-:root{--fg:var(--orca-foreground);--bg:var(--orca-background);
- --line:color-mix(in srgb,var(--fg) 18%,transparent);--soft:color-mix(in srgb,var(--fg) 6%,transparent);
- --mute:color-mix(in srgb,var(--fg) 62%,transparent);--acc:color-mix(in srgb,#3b82f6 80%,var(--fg));
- --bad:color-mix(in srgb,#ef4444 85%,var(--fg));--warn:color-mix(in srgb,#eab308 70%,var(--fg));
- --ring:color-mix(in srgb,#f59e0b 85%,var(--fg))}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.55 system-ui,sans-serif}
-.layout{max-width:1120px;margin:0 auto;padding:16px 20px 48px;display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:24px;align-items:start}
-/* The reader's own width decides its layout (container queries), so a reader beside the dashboard
-   queue drops the Notes sidebar for the Notes dialog even in a wide window. */
-body{container-type:inline-size}
-/* A contained body no longer paints the page canvas: paint the root too, or short pages show white. */
-html{background:var(--orca-background)}
-@container (max-width:820px){.layout{grid-template-columns:minmax(0,1fr);padding:12px 14px 32px}.side{display:none}}
-@container (min-width:821px){.only-narrow{display:none}}
-.layout>main.full{grid-column:1/-1}
-.side{position:sticky;top:12px;border:1px solid var(--line);border-radius:8px;padding:10px;max-height:calc(100vh - 24px);overflow:auto}
-h1{font-size:18px;margin:2px 0 4px;text-wrap:balance}h2{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute);margin:20px 0 6px}
-.meta{color:var(--mute);display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.chip{border:1px solid var(--line);border-radius:99px;padding:0 8px;font-size:11px}
-.chip.bad{background:var(--bad);color:#fff;border-color:transparent}
-button,textarea,input,select{font:inherit;color:inherit}
-button{background:var(--soft);border:1px solid var(--line);border-radius:6px;padding:3px 10px;cursor:pointer;min-block-size:28px;min-inline-size:28px}
-button:hover{background:var(--line)}button.pri{background:var(--acc);color:#fff;border-color:transparent}
-button[aria-disabled=true]{opacity:.55;cursor:not-allowed}
-/* Selected and focused look different: selection is a filled tint and a check mark, focus is an outside ring. */
-button[aria-pressed=true]{background:color-mix(in srgb,var(--acc) 22%,transparent);border-color:var(--acc);font-weight:600}
-button[aria-pressed=true]::before{content:"✓ "}
-:focus-visible{outline:2px solid var(--ring);outline-offset:2px}
-@media(forced-colors:active){:focus-visible{outline-color:Highlight}button[aria-pressed=true]{border:2px solid SelectedItem}}
-textarea,input[type=text]{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 8px}
-.callout{border:1px solid var(--bad);border-radius:6px;padding:6px 10px;margin:10px 0}.callout.warn{border-color:var(--warn)}.callout.info{border-color:var(--line)}
-.opt{display:flex;gap:8px;border:1px solid var(--line);border-radius:6px;padding:8px 10px;margin:4px 0;cursor:pointer}
-.opt:has(input:checked){border-color:var(--acc);background:color-mix(in srgb,var(--acc) 10%,transparent)}
-.opt:has(input:focus-visible){outline:2px solid var(--ring);outline-offset:2px}
-.film{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
-.vp{display:grid;grid-template-columns:minmax(0,1fr);gap:10px}.vp.pair{grid-template-columns:repeat(2,minmax(0,1fr))}
-@media(max-width:640px){.vp.pair{grid-template-columns:minmax(0,1fr)}}
-.view{height:340px;overflow:auto;background:var(--soft);border:1px solid var(--line);border-radius:8px}.vp.pair .view{height:260px}
-dialog .note textarea{margin-top:4px}
-.view img{display:block;height:auto;max-width:none}
-.bar{display:flex;gap:6px;align-items:center;padding:6px 0;flex-wrap:wrap}.bar input{flex:1;min-width:140px}
-.miss{display:grid;place-items:center;height:100%;color:var(--mute);text-align:center;padding:12px}
-.note{border-left:3px solid var(--warn);padding:2px 8px;margin:8px 0}.note q{display:block;color:var(--mute);margin-bottom:2px}.note.stale{border-left-color:var(--bad)}
-.strip{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0;list-style:none;padding:0}
-.step{border:1px solid var(--line);border-radius:6px;padding:3px 9px;color:var(--mute)}
-.step[aria-current=step]{color:var(--fg);border-color:var(--acc);font-weight:600}.step.bad[aria-current=step]{border-color:var(--bad)}
-.pkg{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
-#pop{position:fixed;display:none;z-index:950}
-dialog{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:10px;padding:14px;width:min(440px,92vw)}
-dialog::backdrop{background:color-mix(in srgb,#000 45%,transparent)}
-.rich p{margin:0 0 8px}.rich ul,.rich ol{margin:0 0 8px;padding-left:22px}.rich li{margin:2px 0}.rich a{color:var(--acc)}
-.rich code{font:12px ui-monospace,monospace;background:var(--soft);padding:0 3px;border-radius:3px}
-.ctx{color:var(--mute);margin:0 0 2px}
-.pager{display:flex;gap:6px;align-items:center;color:var(--mute);margin:4px 0}
-details{border-top:1px solid var(--line);padding:6px 0}details>summary{cursor:pointer;color:var(--mute);padding:2px 0}
-.raw{white-space:pre-wrap;border-left:3px solid var(--line);padding:2px 10px;color:var(--mute);margin:6px 0}
-.sr{position:absolute;left:-9999px}
-.reply{border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin:8px 0}
-.reply.fu{margin-left:18px;border-style:dashed}
-.reply h3{margin:0 0 4px;font-size:12px;color:var(--mute);font-weight:600}
-.set{max-width:760px;margin:0 auto;padding:16px 20px 48px}
-.row2{display:grid;grid-template-columns:200px 1fr auto;gap:8px;align-items:start;margin:6px 0}@media(max-width:640px){.row2{grid-template-columns:1fr}}
-.err{color:var(--bad);font-size:12px}
-.prev{border:1px solid var(--line);border-radius:8px;padding:10px;background:var(--soft)}
-`
-/* Variant D additions for this editor: the reader sheet fills the frame, its body scrolls on its own
-   and the reply card sits below it, so a short viewport or an open keyboard shrinks the body, never the
-   card's controls. */
-const dCss = `
-html,body{height:100%}
-body:has(.d-app){overflow:hidden}
-.d-app{height:100dvh;display:flex;flex-direction:column;min-height:0;font-size:13.5px}
-.d-app.d-dash>.d-workspace{flex:1;min-height:0}
-.d-app.d-solo>.d-sheet{flex:1;min-height:0;border-inline-start:0;box-shadow:none;animation:none}
-.d-app .d-sheet-slot{min-width:0;min-height:0;display:flex}.d-app .d-sheet-slot>.d-sheet{flex:1}
-.d-app .d-sheet-slot[hidden]{display:none}
-.d-app h1{font-size:17px;line-height:1.4;margin:0 0 6px;text-wrap:balance;overflow-wrap:anywhere;font-weight:650}
-.d-app h1:focus{outline:none}
-.d-app .d-sec-h{font-size:12px;letter-spacing:0;text-transform:none;color:var(--muted);font-weight:600;margin:18px 0 6px}
-.d-app .d-meta{border:1px solid var(--line-soft);border-radius:8px;padding:8px 12px;background:var(--surface)}
-.d-app .d-pill.d-p-P0{color:var(--danger)}.d-app .d-pill.d-p-P1{color:var(--warn)}.d-app .d-pill.d-p-P2{color:var(--info)}
-.d-app .d-tabs-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-.d-app .d-tab{all:unset;cursor:pointer;padding:4px 12px;border-radius:6px;font-size:13px;display:inline-flex;gap:6px;align-items:center;min-height:28px}
-.d-app .d-tab[aria-selected=true]{background:var(--raised);font-weight:600}
-.d-app .d-tab:focus-visible{outline:2px solid var(--accent)}
-.d-app .d-tab .d-n{font-size:11.5px;color:var(--muted)}
-.d-app .d-ws-pick{margin-inline-start:auto}
-.d-app .d-ws-select{height:30px;max-width:min(300px,60vw);background:var(--bg);border:1px solid var(--line);border-radius:var(--r);padding:0 8px}
-.d-app .d-results{flex:1;min-height:0;display:flex;flex-direction:column}
-.d-app .d-results>.d-table-wrap{flex:1}
-.d-app .d-results>[data-k=dash-more]{align-self:center;margin:8px 0}
-.d-app .d-c-wsh,.d-app .d-c-ws{display:none}@container (min-width:900px){.d-app .d-c-wsh,.d-app .d-c-ws{display:table-cell}}
-.d-app tr.d-row{cursor:pointer}
-.d-app tr.d-row[data-sel]{background:var(--sel);box-shadow:inset 3px 0 0 var(--sel-line)}
-.d-app .d-title .qt{display:block}
-.d-app button.qrow{all:unset;cursor:pointer;font-weight:600;font-size:13.5px;line-height:1.45;display:block;overflow-wrap:anywhere}
-.d-app button.qrow:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-/* Narrative context: readable measure, headings, inert code, figures with captions. */
-.d-app .rich{max-width:72ch;line-height:1.6}
-.d-app .rich .rich-h{font-size:14.5px;margin:16px 0 6px;font-weight:650;letter-spacing:0;text-transform:none;color:var(--fg)}
-.d-app .rich h3.rich-h{font-size:15.5px}
-.d-app .rich p{margin:0 0 10px}
-.d-app .rich a{color:var(--accent-text)}
-.d-app .codeblock{position:relative;margin:8px 0 12px}
-.d-app .codeblock pre{margin:0;padding:10px 12px;background:var(--surface);border:1px solid var(--line-soft);border-radius:var(--r);overflow:auto;font:12.5px/1.5 var(--mono);white-space:pre}
-.d-app .codeblock pre code{font:inherit;background:none;padding:0}
-.d-app .code-copy{position:absolute;top:4px;right:4px;min-width:28px;min-height:28px;padding:0;background:var(--raised);border:1px solid var(--line);border-radius:var(--r);color:var(--muted)}
-.d-app .fig{margin:10px 0 14px;max-width:72ch}
-.d-app .fig img{display:block;max-width:100%;height:auto;border:1px solid var(--line-soft);border-radius:var(--r)}
-.d-app .fig .miss{border:1px dashed var(--line);border-radius:var(--r);min-height:72px;height:auto}
-.d-app .fig figcaption{display:flex;gap:8px;align-items:flex-start;font-size:12.5px;color:var(--muted);margin-top:4px}
-.d-app .fig figcaption span:first-child{flex:1}
-.d-app .fig figcaption button{position:relative;padding:0;background:none;border:1px solid transparent}
-.d-app .fig .nb{position:absolute;top:-6px;right:-6px;background:var(--note);color:#000;border-radius:99px;font-size:10px;min-width:15px;line-height:15px}
-.d-app .d-images,.d-app .d-details{border:1px solid var(--line-soft);border-radius:8px;background:var(--surface);padding:4px 10px;margin:12px 0 4px}
-.d-app .d-details+.d-details{margin-top:6px}
-.d-app .d-rail{margin:4px 0}
-.d-app .d-rail .strip{margin:2px 0 8px;padding:0 6px}
-/* Reply card: pager and recommendation at the top, then options, the text box and the actions. */
-.d-app .d-dock{max-height:58%;overflow:auto;overscroll-behavior:contain}
-.d-app .d-dock{min-height:min(196px,50dvh)}
-.d-app .d-dock-head{justify-content:space-between;min-height:30px}
-.d-app .d-dock-head .d-rec-label{font-size:12px;color:var(--muted);font-weight:600}
-.d-app .d-pager{display:inline-flex;gap:2px;align-items:center;border:1px solid var(--line);border-radius:var(--r);padding:0 2px;font-size:12.5px;color:var(--fg);margin:0}
-.d-app .d-pager .d-icon-btn{min-width:28px;height:28px;padding:0;border:0;background:none}
-.d-app .d-pager .d-icon-btn[aria-disabled=true]{opacity:.35}
-.d-app .d-rec{border-inline-start:3px solid var(--accent);background:var(--raised);border-radius:0 var(--r) var(--r) 0;padding:6px 10px;font-size:13px}
-.d-app .d-rec-head{display:flex;justify-content:space-between;align-items:center}
-.d-app .d-rec .d-rec-label{font-size:12px;font-weight:650}
-.d-app .d-rec .d-rec-more{min-width:24px;height:24px;padding:0;border:0;background:none}
-.d-app .d-rec-head{gap:4px 6px;flex-wrap:wrap}.d-app .d-rec-head .d-spacer{flex:1}
-/* Nothing in the card may widen it past the sheet (380px minimum): one shrinkable column. */
-.d-app .d-dock{grid-template-columns:minmax(0,1fr)}
-/* A narrow card (the 380px sheet): the hint takes its own line, Notes and Submit stay together on the right. */
-.d-app .d-dock{container-type:inline-size}
-@container (max-width:520px){.d-app .d-dock .d-dock-foot .d-hint{flex-basis:100%}.d-app .d-dock .d-dock-foot .d-notes-btn{margin-inline-start:auto}}
-.d-app .d-sheet-body h2.d-sec-h{font-size:13.5px;line-height:1.4;color:var(--fg);font-weight:650;margin:20px 0 6px;padding-top:12px;border-top:1px solid var(--line-soft);text-transform:none;letter-spacing:0}
-.d-app .d-meta>div{min-width:0}
-.d-app .d-images>summary{cursor:pointer;color:var(--muted);padding:4px 0}
-.d-app .d-rec .rich{display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
-.d-app .d-rec.open .rich{display:block;max-height:26vh;overflow:auto}
-.d-app .d-rec .rich p{margin:0 0 4px}
-.d-app .d-ws-label{font-size:12px;color:var(--muted);margin-inline-end:8px}
-.d-app .code-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:11.5px;color:var(--muted);padding:2px 0 4px}
-.d-app .codeblock .code-copy{position:static}
-.d-app .d-opts{display:flex;flex-wrap:wrap;gap:6px}
-.d-app .d-opt{display:inline-flex;align-items:center;gap:6px;margin:0;padding:3px 12px;border-radius:99px;min-height:30px;border:1px solid var(--line);background:var(--bg);font-size:12.5px}
-.d-app .d-opt input{position:absolute;opacity:0;width:1px;height:1px}
-.d-app label.d-opt:has(input:checked){background:var(--sel);border-color:var(--accent);font-weight:600}
-.d-app label.d-opt:has(input:checked)::before{content:"✓";color:var(--accent-text)}
-.d-app .d-opt .meta{display:inline;font-weight:400}
-.d-app .d-dock textarea{width:100%;resize:none;field-sizing:content;min-height:3.4em;max-height:9em;background:var(--bg);border:1px solid var(--line);border-radius:var(--r);padding:7px 9px;line-height:1.55}
-.d-app .d-dock .callout{margin:0}
-.d-app .d-dock-foot{display:flex;gap:8px 10px;align-items:center;flex-wrap:wrap}
-.d-app .d-dock-foot .d-hint{flex:1 1 180px;font-size:11.5px;color:var(--muted);min-width:0}
-.d-app .d-btn{height:32px;padding:0 12px;border-radius:var(--r);border:1px solid var(--line);background:var(--raised)}
-.d-app .d-btn.d-primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
-.d-app .d-btn[aria-disabled=true]{opacity:.5}
-.d-app .d-notes-panel{z-index:4}
-.d-app .d-notes-panel[hidden]{display:none}
-.d-app .d-notes-head{display:flex;justify-content:flex-end;margin-bottom:-28px}
-.d-app .d-notes-panel .side,.d-app .d-notes-panel{position:absolute}
-.d-app .d-sheet .side{max-height:min(52dvh,420px)}
-/* Owner annotations: progress card, source actions, PM recommendation, image viewer, title-only rows. */
-.d-app .d-progress{border:1px solid var(--line-soft);border-radius:8px;background:var(--surface);padding:6px 10px;margin:6px 0 4px}
-.d-app .d-progress-head{display:flex;gap:4px 10px;align-items:center;flex-wrap:wrap}
-.d-app .d-state-pill{display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:99px;padding:1px 10px;font-size:12px;font-weight:600;color:var(--accent-text)}
-.d-app .d-state-pill.bad{color:var(--danger);border-color:color-mix(in oklab,var(--danger) 55%,transparent)}
-.d-app .d-progress-say{font-size:12.5px}
-.d-app .d-milestones{list-style:none;margin:4px 0 0;padding:0;display:flex;flex-wrap:wrap;gap:2px 16px;font-size:12px;color:var(--muted)}
-.d-app .d-milestones b{color:var(--fg);font-weight:600}.d-app .d-milestones .d-next{color:var(--accent-text)}
-.d-app .d-proposed,.d-app .d-confirm{background:var(--sel);border:1px solid var(--accent);border-radius:var(--r);padding:4px 8px;font-size:12.5px}
-.d-app .d-proposed>span,.d-app .d-confirm>span{flex:1 1 200px}
-.d-app tr.d-row[data-sel]{box-shadow:inset 4px 0 0 var(--sel-line)}.d-app .d-progress-head .d-bad{color:var(--danger)}
-.d-app .d-srcline{align-items:center}
-.d-app .d-src-act{display:inline-flex;align-items:center;gap:2px;font-size:12px;min-height:26px;padding:0 8px;border:1px solid var(--line);border-radius:99px;background:var(--bg);color:var(--fg);text-decoration:none}
-.d-app .d-src-act:hover{background:var(--hover)}
-.d-app .d-btn.d-sm{height:26px;padding:0 8px;font-size:12px}
-.d-app .d-rec-head .d-btn.d-sm{margin-inline-start:6px}
-.d-app .d-fig-open{all:unset;cursor:zoom-in;display:block;max-width:100%}.d-app .d-fig-open:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
-.d-zoom{position:fixed;inset:0;z-index:1000;height:100dvh;display:flex;flex-direction:column;background:color-mix(in oklab,var(--bg) 92%,#000)}
-.d-zoom .d-zoom-bar{display:flex;gap:6px;align-items:center;padding:6px 12px;border-bottom:1px solid var(--line)}
-.d-zoom .d-zoom-bar .d-spacer{flex:1}.d-zoom .d-zoom-level{font-size:12px;color:var(--muted);min-width:3.5em}
-.d-zoom .d-icon-btn{min-width:36px;height:36px;font-size:16px}
-.d-zoom-stage{flex:1;min-height:0;overflow:hidden;display:grid;place-items:center;padding:12px;touch-action:none}
-.d-zoom-stage img{max-width:100%;max-height:100%;object-fit:contain;transform-origin:center;user-select:none}
-.d-zoom-stage.zoomed{cursor:grab}
-.d-app .d-c-src{display:none}@container (min-width:900px){.d-app .d-c-src{display:table-cell}}
-.d-app .d-filters-btn{display:none}
-/* Grouping: a labelled view control set apart from the filters, and group headings as clear bands. */
-.d-app .d-toolbar .d-groupby{margin-inline-start:auto;padding-inline-start:12px;border-inline-start:1px solid var(--line)}
-.d-app .d-toolbar .d-groupby>span{color:var(--fg);font-weight:600}
-.d-app .d-toolbar .d-groupby select{height:32px;min-width:120px;background:var(--raised);border:1px solid var(--line);border-radius:var(--r);padding:0 8px;font-weight:600}
-.d-app tr.d-group th{padding:18px 12px 6px;background:var(--bg);border-top:1px solid var(--line);border-bottom:2px solid var(--line);font-size:13px;font-weight:650;color:var(--fg)}
-.d-app tbody tr.d-group:first-child th{padding-top:10px;border-top:0}
-.d-app tr.d-group .d-gc{display:inline-grid;place-items:center;min-width:22px;height:20px;padding:0 6px;margin-inline-start:8px;border-radius:99px;background:var(--raised);border:1px solid var(--line);font-size:11.5px;font-weight:600;color:var(--fg)}
-@media (max-width:899px){.d-app .d-toolbar .d-groupby{margin-inline-start:0;border:0;padding:0;flex:1 1 140px}.d-app .d-toolbar .d-groupby select{width:100%}}
-/* Resizable sheet: a 0-width grid track holding a 12px hit area over the boundary. */
-.d-app .d-workspace.d-has-sheet{grid-template-columns:minmax(0,1fr) 0 var(--sheet-w,clamp(460px,40vw,780px))}
-.d-app .d-divider{display:none}
-.d-app .d-workspace.d-has-sheet>.d-divider{display:block;position:relative;z-index:5;width:0;cursor:col-resize;touch-action:none}
-.d-app .d-divider::before{content:"";position:absolute;inset:0 -6px;}
-.d-app .d-divider::after{content:"";position:absolute;top:50%;left:-2px;width:4px;height:40px;margin-top:-20px;border-radius:2px;background:var(--line);transition:background .12s}
-.d-app .d-divider:hover::after,.d-app .d-divider.d-dragging::after,.d-app .d-divider:focus-visible::after{background:var(--accent);height:72px;margin-top:-36px}
-.d-app .d-divider:focus-visible{outline:none}
-.d-app .d-divider:focus-visible::before{outline:2px solid var(--accent);outline-offset:-4px;border-radius:4px}
-@media (max-width:899px){.d-app .d-workspace.d-has-sheet{grid-template-columns:minmax(0,1fr)}.d-app .d-workspace.d-has-sheet>.d-divider,.d-app .d-wide-only{display:none}}
-/* Note composer and saved notes. */
-.d-nc{position:fixed;z-index:900;height:auto;width:min(360px,calc(100vw - 16px));background:var(--bg);border:1px solid var(--line);border-radius:8px;box-shadow:0 12px 32px -12px rgb(0 0 0 / .6);padding:10px 12px;display:flex;flex-direction:column;gap:6px}
-.d-nc.d-nc-sheet{left:0;right:0;bottom:0;top:auto;width:auto;border-radius:10px 10px 0 0;max-height:70dvh;overflow:auto}
-.d-nc .d-nc-quote{margin:0;padding:4px 8px;border-inline-start:3px solid var(--note);background:var(--note-bg);font-size:12.5px;max-height:6em;overflow:auto;white-space:pre-wrap}
-.d-nc textarea{width:100%;resize:vertical;min-height:4.2em;background:var(--bg);border:1px solid var(--line);border-radius:var(--r);padding:6px 8px}
-.d-nc>*{flex-shrink:0}
-.d-nc .d-nc-thumb{display:block;max-width:100%;max-height:96px;margin:2px 0 0;border-radius:4px;align-self:flex-start}
-.d-app mark.d-n{cursor:pointer}
-.d-nc .d-nc-err{margin:0;color:var(--danger);font-size:12px}
-.d-nc .d-nc-foot{display:flex;gap:8px;align-items:center}.d-nc .d-nc-foot .d-hint{flex:1;font-size:11.5px;color:var(--muted)}
-.d-app .d-note-saved{font-size:12.5px;color:var(--muted)}.d-app .d-note-saved>span{flex:1 1 200px}
-.d-app mark.d-n{background:var(--note-bg);color:inherit;border-bottom:2px solid var(--note);border-radius:2px}
-.d-app mark.d-n.d-flash{outline:3px solid var(--note);outline-offset:2px}
-@media (max-width:899px){.d-app tr.d-row td.d-c-ws,.d-app tr.d-row td.d-c-src,.d-app tr.d-row td.d-c-meta{display:inline-block;font-size:12px;color:var(--muted);padding:0 8px 8px 0;border:0}
- .d-app tr.d-row th{border:0;padding-bottom:4px}.d-app tr.d-row{border-bottom:1px solid var(--line-soft);padding:8px 12px}.d-app tr.d-row td.d-no-due{display:none}
- .d-app .d-filters-btn{display:inline-flex;align-items:center}.d-app .d-toolbar .d-field.d-grow{flex:1 1 140px}}
-@media (max-width:899px){.d-app .d-dock{max-height:58dvh}.d-app .d-tabs-row{flex-wrap:nowrap}.d-app .d-ws-label{display:none}.d-app .d-ws-pick{min-width:0;flex:0 1 auto}.d-app .d-ws-select{max-width:100%;width:100%}.d-app .d-tab{padding:4px 8px}}
-@media (max-height:560px){.d-app .d-dock{max-height:72dvh;gap:5px;padding-block:6px 8px;min-height:0}.d-app .d-rec{padding:4px 8px}.d-app .d-rec .rich{-webkit-line-clamp:2}
- .d-app .d-dock textarea{min-height:2.4em;max-height:5em}.d-app .d-use-rec .d-hint,.d-app .d-dock-foot .d-hint{display:none}.d-app .d-dock-foot{justify-content:flex-end}
- .d-app .d-btn{height:30px}.d-app .d-opt{min-height:28px}}
-/* Inbox / Practice switch: always visible above the queue, also when the sheet covers it (narrow). */
-.d-app .d-mode{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:2px 0 8px}
-.d-app .d-mode-seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
-.d-app .d-mode-seg button{appearance:none;border:0;background:transparent;color:var(--fg);font:inherit;font-size:12.5px;padding:5px 12px;cursor:pointer;display:inline-flex;gap:6px;align-items:center}
-.d-app .d-mode-seg button+button{border-inline-start:1px solid var(--line)}
-.d-app .d-mode-seg button[aria-pressed="true"]{background:var(--sel);font-weight:600}
-.d-app .d-mode-seg button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
-.d-app .d-mode-seg .d-practice-tag{font-size:10.5px;font-weight:600;letter-spacing:.02em;border-radius:999px;padding:0 6px;border:1px solid var(--info,#6b8cff);color:var(--info,#8aa4ff)}
-.d-app .d-mode-say{font-size:12px;color:var(--muted);min-width:0}
-.d-app .d-practice-note{border:1px solid color-mix(in oklab,var(--info,#6b8cff) 55%,var(--line));background:color-mix(in oklab,var(--info,#6b8cff) 8%,var(--bg));border-radius:8px;padding:7px 10px;margin:4px 0 8px;font-size:12.5px;display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
-.d-app .d-practice-note b{font-weight:600}
-.d-app .d-ws-static{font-size:12.5px;color:var(--muted);white-space:nowrap}
-/* One collapsible source status instead of a banner per source. */
-.d-app .d-srcstat{border:1px solid var(--line-soft);border-radius:8px;margin:4px 0 8px;font-size:12.5px}
-.d-app .d-srcstat.warn{border-color:color-mix(in oklab,var(--warn) 70%,var(--line))}
-.d-app .d-srcstat>summary{cursor:pointer;padding:5px 10px;color:var(--muted);list-style-position:inside}
-.d-app .d-srcstat.warn>summary{color:var(--fg)}
-.d-app .d-srcstat>summary::marker{color:var(--muted)}
-.d-app .d-srcstat ul{margin:0;padding:2px 12px 8px 28px;display:grid;gap:4px}
-.d-app .d-srcstat li b{font-weight:600}
-.d-app .d-srcstat li.warn b{color:var(--warn)}
-.d-app .d-srcstat .d-srcstat-act{margin:0 10px 8px}
-/* Where an answer goes, said at the reply; stays visible on short and narrow windows. */
-.d-app .d-reach{font-size:11.5px;color:var(--muted);margin:0}
-.d-app .d-reach.d-reach-local{color:var(--fg)}
-.d-app .d-reach.d-reach-local::before{content:'◆ ';color:var(--info,#8aa4ff)}
-.d-app .d-try-practice{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12px;color:var(--muted);margin:0}
-`
-document.head.append(Object.assign(document.createElement('style'), { textContent: css + variantDCss + dCss }))
+document.head.append(Object.assign(document.createElement('style'), { textContent: editorStyles }))
 // Variant D's light palette: follow Orca's background luminance.
 {
   const probe = typeof getComputedStyle !== 'function' ? '' : getComputedStyle(document.documentElement).getPropertyValue('--orca-background').trim()
@@ -364,7 +107,7 @@ function rich(raw: string, attrs: K = {}, images: readonly VisibleInlineImage[] 
       const copyBtn = el('button', { type: 'button', class: 'code-copy', 'aria-label': `Copy ${f[2] ? `${f[2]} ` : ''}code`, title: 'Copy',
         onclick: () => copy(text.join('\n'), 'Code') }, '⧉')
       // Inert: shown as text, never run. Copy only.
-      box.append(el('div', { class: 'codeblock' }, el('div', { class: 'code-head' }, el('span', {}, `${f[2] || 'text'} · copy only, never run by Inbox`), copyBtn), el('pre', { tabindex: 0 }, code)))
+      box.append(el('div', { class: 'codeblock' }, el('div', { class: 'code-head' }, el('span', {}, f[2] || 'text'), copyBtn), el('pre', { tabindex: 0 }, code)))
       fence = { mark: f[1][0].repeat(3), code, text }; para = null; list = null; continue
     }
     const h = /^ {0,3}(#{1,4})\s+(.*?)\s*#*\s*$/.exec(line.text)
@@ -405,13 +148,11 @@ function figure(p: VisibleInlineImage, x?: Decision): HTMLElement {
       onclick: (e: Event) => openZoom(ev, snap.url, e.currentTarget as HTMLElement) },
       el('img', { src: snap.url, alt: ev.alt, width: ev.width, height: ev.height, loading: 'lazy' }))
     : snap.state === 'loading' ? el('div', { class: 'miss', style: `aspect-ratio:${ev.width}/${ev.height}` }, `Loading ${ev.label}…`)
-    : el('div', { class: 'miss' }, snap.f.code === 'forbidden' ? 'You do not have access to this image.' : 'Image unavailable.')
+    : snapshotFailure(ev, snap.f)
   return el('figure', { class: 'fig', 'data-evidence': ev.evidenceId },
     media,
     el('figcaption', {},
       el('span', {}, p.caption ?? ev.label),
-      ...(snap.state === 'ok' ? [el('button', { type: 'button', class: 'icon', 'data-k': `fig-full-${ev.evidenceId}`, 'aria-label': `Open ${ev.label} full screen`, title: 'Full screen',
-        onclick: (e: Event) => openZoom(ev, snap.url, e.currentTarget as HTMLElement) }, '⤢')] : []),
       el('button', { type: 'button', class: 'icon', 'data-k': `fig-note-${ev.evidenceId}`, 'aria-label': `Add a note on ${ev.label}${notesHere ? `, ${notesHere} note${notesHere > 1 ? 's' : ''}` : ''}`, title: 'Add note',
         onclick: (e: Event) => noteOnImage(ev, e.currentTarget as HTMLElement, p.caption ?? ev.label) }, '✎', ...(notesHere ? [el('span', { class: 'nb' }, String(notesHere))] : []))))
 }
@@ -450,19 +191,11 @@ let ref: Ref = readRef(session?.value ?? '')
 const root = el('div', { class: 'layout' })
 const pop = el<HTMLButtonElement>('button', { id: 'pop', class: 'pri', type: 'button', onclick: () => addQuoteNote(),
   // Keep the text selection while pressing the button.
-  onpointerdown: (e: Event) => e.preventDefault() }, 'Add note (Alt+N)')
+  onpointerdown: (e: Event) => e.preventDefault(), 'aria-keyshortcuts': 'Alt+N' }, 'Add note')
 const live = el('div', { class: 'sr', role: 'status', 'aria-live': 'polite' })
 const composer = el<HTMLDialogElement>('dialog', { 'aria-labelledby': 'cmp-h' })
 document.body.append(root, pop, live, composer)
-const narrow = matchMedia('(max-width: 800px)')
-narrow.addEventListener('change', () => render())
 const say = (m: string) => { live.textContent = m }
-/** Notes use the dialog when the reader is too narrow for its sidebar (window or container). */
-const notesInDialog = () => {
-  if (narrow.matches) return true
-  const side = root.querySelector('aside.side')
-  return !!side && typeof getComputedStyle === 'function' && getComputedStyle(side).display === 'none'
-}
 
 // ---- background re-renders wait for the owner ---------------------------------------------------
 // render() rebuilds the DOM. Background causes (worker invalidations, the minute clock, snapshot
@@ -491,7 +224,17 @@ const released = () => { pointerDown = false; flushSoon() }
 document.addEventListener('pointerup', released, true)
 document.addEventListener('pointercancel', released, true)
 root.addEventListener('focusout', () => flushSoon())
-composer.addEventListener('close', () => render())
+// Closing re-renders the page; focus goes back to the Notes button (the browser's own return target is replaced).
+/** Go to in Notes: the note whose highlighted text gets focus once the dialog has closed. */
+let goToNote: number | null = null
+composer.addEventListener('close', () => {
+  const mark = goToNote; goToNote = null
+  render()
+  const m = mark === null ? null : root.querySelector<HTMLElement>(`mark[data-note-mark~="${mark}"]`)
+  if (!m) return root.querySelector<HTMLElement>('[data-k="notes-open"]')?.focus({ preventScroll: true })
+  m.scrollIntoView?.({ block: 'center' }); m.focus({ preventScroll: true })
+  m.classList.add('d-flash'); setTimeout(() => m.classList.remove('d-flash'), 1500)
+})
 
 /** role="alert" only when the alert is new, so a re-render does not announce it again. */
 let shownAlerts = new Set<string>()
@@ -514,17 +257,12 @@ let notice: Notice | null = null
 let sending = false
 let seq = 0
 const snaps = new Map<string, Snap>()
-let a = 0 // primary snapshot index
-let b: number | null = null // optional second snapshot for side-by-side
-let target: 'left' | 'right' = 'right'
-const zoom = new Map<string, number>()
 /** The question fields a text note can anchor to (raw UTF-16 offsets into that field's text). */
 type NoteField = 'background' | 'description' | 'recommendation'
 const NOTE_FIELDS: readonly NoteField[] = ['background', 'description', 'recommendation']
 const FIELD_LABEL: Record<NoteField, string> = { background: 'Background', description: 'Description', recommendation: 'Recommendation' }
 type Quote = { field: NoteField; text: string; start: number; end: number }
 let quote: Quote | null = null
-let focusNote: number | null = null
 
 /** What the owner is told about a recorded reply: only its actual state and receipt. */
 function recordedNotice(r: RecordedReply, x: Decision, own: boolean): Notice {
@@ -567,7 +305,7 @@ async function loadReview(questionId: string, keepNotice = false, passive = fals
     if (passive && d) return
     d = null; loadFail = dr; render(); return
   }
-  if (d?.questionId !== questionId) { snaps.clear(); a = 0; b = null; zoom.clear() }
+  if (d?.questionId !== questionId) snaps.clear()
   d = dr.value; loadFail = null
   let changed = JSON.stringify(d) !== before
   if (wr) {
@@ -695,11 +433,6 @@ function staleNote(n: Annotation, x: Decision): string | null {
   if (ref && !x.evidence.some((e) => e.evidenceId === ref.evidenceId && e.version === ref.version)) return 'This evidence version is no longer attached.'
   return null
 }
-function addSelection(note: string) {
-  if (!d || !quote) return
-  draft.annotations.push({ kind: 'selection', anchor: { kind: 'question', field: quote.field, revision: d.revision }, start: quote.start, end: quote.end, quote: quote.text, text: note })
-  scheduleSave()
-}
 function addQuoteNote() {
   const q = quote
   if (!q || (d && nativeOf(d))) { pop.style.display = 'none'; return }
@@ -707,11 +440,6 @@ function addQuoteNote() {
   try { const sel = getSelection(); rect = sel && sel.rangeCount ? sel.getRangeAt(0).getBoundingClientRect?.() ?? null : null } catch { rect = null }
   openNoteComposer({ kind: 'text', q, rect })
 }
-/**
- * Narrow layout (no sidebar): a native modal that lists every note for review, editing and
- * removal, plus a new note for the current selection when there is one. The browser handles the
- * inert page, focus containment, Esc and focus return; closing re-renders the page.
- */
 /**
  * Ctrl+Enter (Cmd+Enter on macOS) in a note field saves that note and nothing else: it never
  * reaches the reply shortcut, and is ignored while an input method is composing.
@@ -722,27 +450,23 @@ function noteShortcut(ev: KeyboardEvent, save: () => void) {
   if (ev.isComposing || composing) return
   save()
 }
-function openComposer(quoted: Quote | null) {
-  fillComposer(quoted)
+/**
+ * Notes (n): a native modal dialog in the top layer at every width, so it is always visible and on
+ * top of the sheet. The browser makes the page inert, contains focus and closes on Esc.
+ */
+function openNotes(focus = -1) {
+  noteSaved = null
+  fillNotes()
   if (!composer.open) composer.showModal()
+  composer.querySelector<HTMLElement>(focus >= 0 ? `[data-dialog-note="${focus}"]` : '[data-dialog-note], [data-k="notes-done"]')?.focus()
 }
-function fillComposer(quoted: typeof quote) {
+function fillNotes() {
   const x = d; if (!x) return
-  const ta = el<HTMLTextAreaElement>('textarea', { rows: 3, 'aria-label': 'New note', placeholder: 'Your note (Ctrl+Enter adds it)', autofocus: true })
-  const add = () => {
-    const text = ta.value
-    if (!text.trim()) return say('Write the note first')
-    quote = quoted; addSelection(text); quote = null; say('Note added'); fillComposer(null)
-  }
-  ta.addEventListener('keydown', (ev) => noteShortcut(ev, add))
   composer.replaceChildren(
     el('h3', { id: 'cmp-h', style: 'margin:0 0 6px' }, `Notes (${draft.annotations.length})`),
-    ...(draft.annotations.length ? draft.annotations.map((n, i) => noteEditor(n, i, x, 'dialog'))
-      : [el('p', { class: 'meta' }, 'No notes yet. Select text in Background, Description or the Recommendation and choose Add note (Alt+N), or use ✎ on an image.')]),
-    ...(quoted ? [el('h3', { style: 'margin:10px 0 4px' }, 'Add a note'), el('div', { class: 'raw' }, quoted.text), ta,
-      el('div', { style: 'display:flex;justify-content:flex-end;margin-top:6px' }, el('button', { type: 'button', class: 'pri', onclick: add }, 'Add note'))] : []),
+    ...(draft.annotations.length ? draft.annotations.map((n, i) => noteEditor(n, i, x)) : [el('p', { class: 'meta' }, 'No notes yet.')]),
     el('div', { style: 'display:flex;gap:6px;justify-content:flex-end;margin-top:10px' },
-      el('button', { type: 'button', autofocus: !quoted, onclick: () => composer.close() }, 'Done')))
+      el('button', { type: 'button', 'data-k': 'notes-done', onclick: () => composer.close() }, 'Done')))
 }
 /**
  * UTF-16 offsets into the field's text. A selection may start or end outside the paragraph or on an
@@ -801,17 +525,15 @@ document.addEventListener('keydown', (e) => {
   if (e.altKey && (e.code === 'KeyN' || e.key.toLowerCase() === 'n')) {
     e.preventDefault()
     if (quote) addQuoteNote()
-    // Nothing selected: say how a note is made instead of doing nothing.
-    else if (d && !nativeOf(d) && (ref.view === 'review' || (ref.view === 'dashboard' && dashSel))) say('Select text in Background, Description or the Recommendation first, then press Alt+N. For an image, use ✎ under it.')
+    else if (d && !nativeOf(d) && (ref.view === 'review' || (ref.view === 'dashboard' && dashSel))) say('Select text first.')
   }
   if (e.key === 'Escape' && !e.isComposing) {
-    // Esc closes the innermost layer: the note popover, then the notes panel, then the dashboard sheet.
+    // Esc closes the innermost layer: the note popover, then the dashboard sheet (dialogs close themselves).
     if (pop.style.display !== 'none' && pop.style.display) { pop.style.display = 'none'; return }
-    if (notesOpen && ref.view !== 'settings') { notesOpen = false; render(); root.querySelector<HTMLElement>('[data-k="notes-open"]')?.focus(); return }
     if (ref.view === 'dashboard' && dashSel) { e.preventDefault(); closeDashSheet() }
   }
   // The reply shortcut never fires from a note field, the image viewer or while composing.
-  const inNote = (e.target as Element | null)?.closest?.('[data-note], [data-dialog-note], .side, dialog, .d-zoom')
+  const inNote = (e.target as Element | null)?.closest?.('[data-dialog-note], dialog, .d-zoom')
   if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && !e.isComposing && !inNote && (ref.view === 'review' || (ref.view === 'dashboard' && dashSel))) { e.preventDefault(); void send() }
 })
 
@@ -830,12 +552,10 @@ function buildAnswer(x: Decision): Answer | null {
   return text ? { kind: 'text', text } : null
 }
 
-/** Opens the notes that block sending: the dialog on narrow layouts, the sidebar otherwise. */
+/** Opens Notes on the first note that blocks sending. */
 function reviewNotes() {
   const x = d; if (!x) return
-  if (notesInDialog()) return openComposer(null)
-  const i = draft.annotations.findIndex((n) => noteProblem(n, x))
-  notesOpen = true; focusNote = Math.max(0, i); render()
+  openNotes(draft.annotations.findIndex((n) => noteProblem(n, x)))
 }
 
 /**
@@ -944,8 +664,6 @@ async function openOther(questionId: string) {
 }
 
 // ---- evidence -----------------------------------------------------------------------------------
-// PROVISIONAL (proposed by design, not owner-signed): one large viewer with an optional
-// side-by-side compare. Reversible; confirm during owner review.
 type Img = Extract<Evidence, { kind: 'image-snapshot' }>
 const MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
 function ensureSnapshot(e: Img) {
@@ -966,76 +684,26 @@ function snapshotFailure(e: Img, f: Failure) {
   return el('div', { class: 'miss' }, el('div', {}, el('p', { style: 'margin:0 0 6px' }, text),
     ...(f.code === 'unavailable' ? [el('button', { type: 'button', onclick: () => { snaps.delete(e.attachmentId); render() } }, 'Try again')] : [])))
 }
-function viewer(list: Img[], i: number, side: string) {
-  const e = list[i]
-  ensureSnapshot(e)
-  const z = zoom.get(e.evidenceId) ?? 1
-  const s = snaps.get(e.attachmentId)!
-  const v = el('div', { class: 'view', tabindex: 0, 'data-k': `view-${side}`, role: 'group', 'aria-label': `${side} viewer: ${e.label}, v${e.version}, zoom ${Math.round(z * 100)}%` })
-  if (s.state === 'ok') v.append(el('img', { src: s.url, alt: e.alt, width: e.width, height: e.height, style: `width:${Math.round(z * 100)}%` }))
-  else if (s.state === 'loading') v.append(el('div', { class: 'miss', style: `aspect-ratio:${e.width}/${e.height}` }, `Loading ${e.label} (${e.width}×${e.height})…`))
-  else v.append(snapshotFailure(e, s.f))
-  const zb = (label: string, name: string, f: (n: number) => number) => el('button', { type: 'button', 'data-k': `z-${side}-${name}`, 'aria-label': `${name} ${e.label}`, onclick: () => { zoom.set(e.evidenceId, f(z)); render() } }, label)
-  const note = draft.annotations.find((n) => n.kind === 'image' && n.evidence.evidenceId === e.evidenceId && n.evidence.version === e.version)
-  return el('div', {}, v, el('div', { class: 'bar' }, zb('−', 'Zoom out', (n) => Math.max(0.25, n - 0.25)), zb('+', 'Zoom in', (n) => Math.min(4, n + 0.25)), zb('100%', 'Reset zoom', () => 1),
-    field('input', { type: 'text', 'data-k': `note-${e.evidenceId}`, 'aria-label': `Note for ${e.label}`, placeholder: `Note on ${e.label}`,
-      // Commit on every keystroke, as typed (trimmed only when sent). No re-render on blur, so a
-      // click that moves focus away (Submit, Remove) is never swallowed by a rebuilt button.
-      oninput: (ev: Event) => {
-        const before = draft.annotations.length
-        setImageNote(e, (ev.target as HTMLInputElement).value); scheduleSave()
-        if (draft.annotations.length > before && !notesInDialog()) { notesOpen = true; root.querySelector('#notesPanel')?.removeAttribute('hidden') }
-        refreshNotes()
-      } }, note?.text ?? '')))
-}
-
-/**
- * One note per image version, kept in place so the sidebar order stays stable while typing. The
- * text is stored exactly as typed ("Check the " keeps its space); clearing the field removes it.
- */
-function setImageNote(e: Img, text: string) {
-  const i = draft.annotations.findIndex((n) => n.kind === 'image' && n.evidence.evidenceId === e.evidenceId)
-  const note: Annotation = { kind: 'image', evidence: { evidenceId: e.evidenceId, version: e.version }, text }
-  if (i < 0) { if (text.trim()) draft.annotations.push(note) }
-  else if (text.trim()) draft.annotations[i] = note
-  else draft.annotations.splice(i, 1)
-}
-
 /** Notes that would block sending: empty, or no longer matching the decision. */
 const noteProblem = (n: Annotation, x: Decision) => (!n.text.trim() ? 'This note is empty. Write it or remove it.' : staleNote(n, x))
 const notesLabel = (x: Decision) => {
   const bad = draft.annotations.filter((n) => noteProblem(n, x)).length
   return `Notes (${draft.annotations.length})${bad ? ` · ${bad} need${bad > 1 ? '' : 's'} attention` : ''}`
 }
-/**
- * Updates note counts and the sidebar in place after a note edit, without rebuilding the page.
- * The sidebar is rebuilt only when focus is not inside it.
- */
+/** Updates the Notes (n) label in place after a note edit, without rebuilding the page. */
 function refreshNotes() {
   const x = d; if (!x) return
   root.querySelectorAll('[data-k="notes-open"]').forEach((btn) => { btn.textContent = notesLabel(x) })
-  const side = root.querySelector('.side')
-  if (side && !side.contains(document.activeElement)) side.replaceChildren(...notesPanelKids(x))
-}
-/** Notes for this reply, in the reply card: always in the page, shown with the Notes toggle. */
-let notesOpen = false
-const notesPanelKids = (x: Decision) => [
-  el('div', { class: 'd-notes-head' }, el('span', {}, ''), el('button', { type: 'button', class: 'd-icon-btn', 'data-k': 'notes-close', 'aria-label': 'Close notes', title: 'Close notes',
-    onclick: () => { notesOpen = false; render(); root.querySelector<HTMLElement>('[data-k="notes-open"]')?.focus() } }, '✕')),
-  sidebar(x)]
-function notesPanel(x: Decision): HTMLElement {
-  return el('section', { class: 'side d-notes-panel', id: 'notesPanel', 'aria-label': 'Notes', ...(notesOpen ? {} : { hidden: true }) }, ...notesPanelKids(x))
 }
 /**
- * Full-screen image viewer, outside the sheet: fit to screen, zoom in and out, drag or arrow keys to
- * pan when zoomed, 0 or Fit to reset, Esc or Close to leave. Focus returns to the image that opened
+ * Full-screen image viewer on the body, outside the sheet: the wheel (or + and -) zooms at the
+ * cursor, drag or arrow keys pan when zoomed, double-click, 0 or Fit resets, Esc or Close leaves. Focus returns to the image that opened
  * it; the reader's scroll position is untouched because nothing behind it re-renders for it.
  */
 function openZoom(e: Img, url: string, from: HTMLElement) {
   const back = from.getAttribute('data-k')
   let scale = 1, x = 0, y = 0
   const img = el<HTMLImageElement>('img', { src: url, alt: e.alt, draggable: 'false' })
-  const level = el('span', { class: 'd-zoom-level', 'aria-live': 'polite' }, 'Fit')
   const apply = () => {
     if (scale <= 1) { scale = 1; x = 0; y = 0 }
     // Clamp the pan so the image edge never leaves the stage.
@@ -1043,7 +711,6 @@ function openZoom(e: Img, url: string, from: HTMLElement) {
     if (r && bw) { const mx = Math.max(0, (bw * scale - r.width) / 2), my = Math.max(0, (bh * scale - r.height) / 2); x = Math.min(mx, Math.max(-mx, x)); y = Math.min(my, Math.max(-my, y)) }
     img.style.transform = `translate(${x}px, ${y}px) scale(${scale})`
     stage.classList.toggle('zoomed', scale > 1)
-    level.textContent = scale === 1 ? 'Fit' : `${Math.round(scale * 100)}%`
   }
   const zoom = (f: number) => { scale = Math.min(8, Math.max(1, +(scale * f).toFixed(3))); apply() }
   const btn = (label: string, glyph: string, k: string, fn: () => void) => el('button', { type: 'button', class: 'd-icon-btn', 'aria-label': label, title: label, 'data-zk': k, onclick: fn }, glyph)
@@ -1053,9 +720,9 @@ function openZoom(e: Img, url: string, from: HTMLElement) {
     for (const el2 of inertOn) el2.removeAttribute('inert')
     ;(root.querySelector<HTMLElement>(`[data-k="${CSS.escape(back ?? '')}"]`) ?? from).focus({ preventScroll: true })
   }
-  const overlay = el('div', { class: 'd-app d-zoom', role: 'dialog', 'aria-modal': 'true', 'aria-label': `Image: ${e.label}` },
-    el('div', { class: 'd-zoom-bar' }, el('strong', {}, e.label), level, el('span', { class: 'd-spacer' }),
-      btn('Zoom out', '−', 'out', () => zoom(1 / 1.5)), btn('Zoom in', '+', 'in', () => zoom(1.5)), btn('Fit to screen', '⤢', 'fit', () => { scale = 1; apply() }), btn('Close image', '✕', 'close', close)),
+  const overlay = el('div', { class: 'd-app d-zoom', role: 'dialog', 'aria-modal': 'true', 'aria-label': `Image: ${e.label}`, 'aria-keyshortcuts': '+ - 0 Escape' },
+    el('div', { class: 'd-zoom-bar' }, el('strong', {}, e.label), el('span', { class: 'd-spacer' }),
+      btn('Fit to screen', '⤢', 'fit', () => { scale = 1; apply() }), btn('Close image', '✕', 'close', close)),
     stage)
   // Pan by dragging while zoomed.
   let drag: { px: number; py: number; x: number; y: number } | null = null
@@ -1144,7 +811,7 @@ function openNoteComposer(t: NoteTarget) {
   const body = root.querySelector<HTMLElement>('[data-k="sheet-body"]')
   ncBack = { k: t.kind === 'image' ? t.from.getAttribute('data-k') : 'notes-open', scroll: body?.scrollTop ?? 0 }
   const editing = t.edit !== undefined ? draft.annotations[t.edit] : undefined
-  const ta = el<HTMLTextAreaElement>('textarea', { rows: 3, 'aria-label': editing ? 'Edit note' : 'New note', placeholder: 'Your note. Ctrl+Enter adds it.', 'data-nc': '' })
+  const ta = el<HTMLTextAreaElement>('textarea', { rows: 3, 'aria-label': editing ? 'Edit note' : 'New note', 'aria-keyshortcuts': 'Control+Enter Meta+Enter', 'data-nc': '' })
   if (editing) ta.value = editing.text
   const err = el('p', { class: 'd-nc-err', role: 'alert', hidden: true })
   const addLabel = editing ? 'Save note' : 'Add note'
@@ -1176,10 +843,10 @@ function openNoteComposer(t: NoteTarget) {
       err.textContent = `The note was not saved. ${draftFail ? failureText(draftFail) : 'Try again.'}`; err.hidden = false; ta.focus()
       return
     }
-    quote = null; notesOpen = false; showNoteSaved(x.questionId)
+    quote = null; showNoteSaved(x.questionId)
     if (ncBack && n.kind === 'selection') ncBack.mark = draft.annotations.indexOf(n)
     closeNoteComposer(true)
-    say(practiceOpen() ? 'Note saved with your practice draft.' : 'Note saved with your draft. It is sent with your reply, not before.')
+    say('Note saved.')
   }
   const del = async () => {
     if (!editing || d !== x) return
@@ -1201,7 +868,7 @@ function openNoteComposer(t: NoteTarget) {
     ...(t.kind === 'image' && thumb ? [el('img', { class: 'd-nc-thumb', src: thumb, alt: '' })] : []),
     el('blockquote', { class: 'd-nc-quote' }, t.kind === 'text' ? (t.q.text.length > 240 ? `${t.q.text.slice(0, 240)}…` : t.q.text) : t.caption),
     ta, err,
-    el('div', { class: 'd-nc-foot' }, el('span', { class: 'd-hint' }, `${practiceOpen() ? 'Saved with your practice draft' : 'Saved with your draft · not sent'} · Ctrl/Cmd+Enter adds this note only · Esc cancels`),
+    el('div', { class: 'd-nc-foot' },
       ...(editing ? [el('button', { type: 'button', class: 'd-btn d-ghost', 'data-k': 'nc-delete', onclick: () => void del() }, 'Delete')] : []),
       el('button', { type: 'button', class: 'd-btn d-ghost', 'data-k': 'nc-cancel', onclick: () => { closeNoteComposer(true); say(editing ? 'Edit cancelled' : 'Note discarded') } }, 'Cancel'), addBtn))
   nc.addEventListener('keydown', (ev) => {
@@ -1271,45 +938,32 @@ function markNotes(box: Element, field: NoteField) {
       const piece = textAt(t.data.slice(pts[i], pts[i + 1]), at + pts[i])
       const cover = hits.filter(([n]) => n.kind === 'selection' && n.start <= at + pts[i] && n.end >= at + pts[i + 1])
       parts.push(cover.length ? el('mark', { class: 'd-n', tabindex: 0, role: 'button', 'data-note-mark': cover.map(([, j]) => j).join(' '),
-        'aria-label': `${piece.data} — note: ${cover.map(([n]) => n.text).join(' · ')}. Press Enter to edit.`, title: `Note: ${cover.map(([n]) => n.text).join(' · ')} (click to edit)` }, piece) : piece)
+        'aria-label': `${piece.data} — note: ${cover.map(([n]) => n.text).join(' · ')}`, title: `Note: ${cover.map(([n]) => n.text).join(' · ')}` }, piece) : piece)
     }
     t.replaceWith(...parts)
   }
 }
 
-function sidebar(x: Decision) {
-  const list = draft.annotations
-  return el('div', {}, el('h2', { style: 'margin-top:0' }, `Notes (${list.length})`),
-    ...(list.length ? [] : [el('p', { class: 'meta' }, `Select text and press Alt+N, or use ✎ on an image. ${isPractice(x) ? 'Notes are saved with your practice answer.' : 'Notes are sent with your reply.'}`)]),
-    ...list.map((n, i) => noteEditor(n, i, x, 'side')))
-}
-
-/** One note with its anchor, any problem, its text and Remove. Shared by the sidebar and the
- *  narrow-layout notes dialog, so notes that block sending can be fixed at any width. */
-function noteEditor(n: Annotation, i: number, x: Decision, where: 'side' | 'dialog') {
+/** One note in the Notes dialog: its anchor, any problem, its text, Go to and Remove. */
+function noteEditor(n: Annotation, i: number, x: Decision) {
   const name = n.kind === 'image'
     ? `${x.evidence.find((e) => e.evidenceId === n.evidence.evidenceId)?.label ?? n.evidence.evidenceId} · v${n.evidence.version}`
     : n.anchor.kind === 'question' ? FIELD_LABEL[n.anchor.field] : 'Evidence'
   const problem = noteProblem(n, x)
-  const errId = `${where}-note-err-${i}`
+  const errId = `note-err-${i}`
   return el('div', { class: `note${problem ? ' stale' : ''}` },
     el('b', {}, name), ...(n.kind === 'selection' ? [el('q', {}, n.quote)] : []),
     ...(problem ? [el('div', { class: 'err', id: errId }, problem)] : []),
-    field(where === 'side' ? 'input' : 'textarea', {
-      ...(where === 'side' ? { type: 'text', 'data-note': i } : { rows: 2, 'data-dialog-note': i }),
-      'data-k': `${where}-note-${i}`, 'aria-label': `Note text ${i + 1}`, 'aria-describedby': problem ? errId : false,
+    field('textarea', {
+      rows: 2, 'data-dialog-note': i, 'data-k': `dialog-note-${i}`, 'aria-label': `Note text ${i + 1}`, 'aria-describedby': problem ? errId : false,
       oninput: (ev: Event) => { n.text = (ev.target as HTMLInputElement).value; scheduleSave(); refreshNotes() },
       onkeydown: (ev: KeyboardEvent) => noteShortcut(ev, () => { if (!n.text.trim()) return say('Write the note first'); void flushDraft(); say('Note saved') })
     }, n.text),
-    ...(n.kind === 'selection' ? [el('button', { type: 'button', 'aria-label': `Go to the text of note ${i + 1}`, onclick: () => {
-      if (where === 'dialog') composer.close()
-      const m = root.querySelector<HTMLElement>(`mark[data-note-mark~="${i}"]`)
-      if (m) { m.scrollIntoView?.({ block: 'center' }); m.classList.add('d-flash'); setTimeout(() => m.classList.remove('d-flash'), 1500) }
-    } }, 'Go to')] : []),
+    ...(n.kind === 'selection' ? [el('button', { type: 'button', 'aria-label': `Go to the text of note ${i + 1}`, onclick: () => { goToNote = i; composer.close() } }, 'Go to')] : []),
     el('button', { type: 'button', 'aria-label': `Remove note ${i + 1}`, onclick: () => {
       draft.annotations.splice(draft.annotations.indexOf(n), 1); scheduleSave()
       say('Note removed')
-      if (where === 'dialog') fillComposer(null); else render()
+      fillNotes(); composer.querySelector<HTMLElement>('[data-dialog-note], [data-k="notes-done"]')?.focus()
     } }, 'Remove'))
 }
 
@@ -1393,22 +1047,13 @@ function composeArea(x: Decision): HTMLElement[] {
   const label = practice ? (isFollow ? 'Save practice follow-up' : 'Save practice answer') : isFollow ? 'Send follow-up' : 'Submit reply'
   const sendBtn = el<HTMLButtonElement>('button', { type: 'button', class: 'pri', 'data-k': 'send', 'aria-disabled': empty || sending, onclick: () => send() }, sending ? (practice ? 'Saving…' : 'Sending…') : label)
   const ta = field('textarea', {
-    rows: 3, 'data-k': 'reply', 'aria-label': isFollow ? 'Follow-up' : 'Reply text', readonly: sending, 'aria-busy': sending,
-    placeholder: practice ? (isFollow ? 'Practice follow-up (Ctrl+Enter saves it here)' : draft.optionId ? 'Optional detail with your option (Ctrl+Enter saves it here)' : 'Practice answer (Ctrl+Enter saves it here)')
-      : isFollow ? 'Follow-up to the agent (Ctrl+Enter to send)' : draft.optionId ? 'Optional detail with your option (Ctrl+Enter to submit)' : 'Free-text answer (Ctrl+Enter to submit)'
+    rows: 3, 'data-k': 'reply', 'aria-label': isFollow ? 'Follow-up' : 'Reply text', 'aria-keyshortcuts': 'Control+Enter Meta+Enter', readonly: sending, 'aria-busy': sending
   }, draft.text)
   const onEdit = () => { draft.text = ta.value; scheduleSave(); sendBtn.setAttribute('aria-disabled', String(!buildAnswer(x) || sending)) }
   ta.addEventListener('input', onEdit); ta.addEventListener('change', onEdit)
-  const notesBtn = el('button', { type: 'button', class: 'd-btn d-notes-btn', 'data-k': 'notes-open', 'aria-expanded': notesInDialog() ? false : notesOpen, 'aria-controls': 'notesPanel',
-    onclick: () => {
-      noteSaved = null
-      if (notesInDialog()) return openComposer(null)
-      notesOpen = !notesOpen; render()
-      root.querySelector<HTMLElement>(notesOpen ? '#notesPanel input, #notesPanel textarea, [data-k="notes-close"]' : '[data-k="notes-open"]')?.focus()
-    } }, notesLabel(x))
+  const notesBtn = el('button', { type: 'button', class: 'd-btn d-notes-btn', 'data-k': 'notes-open', 'aria-haspopup': 'dialog', onclick: () => openNotes() }, notesLabel(x))
   sendBtn.classList.add('d-btn', 'd-primary')
   return [
-    ...(isFollow ? [el('p', { class: 'meta fu-help', style: 'margin:0' }, 'Add a follow-up. Your first answer stays as recorded.')] : []),
     ta,
     ...(notice ? [el('div', { class: `callout ${notice.tone === 'bad' ? '' : notice.tone}`, ...(notice.tone === 'bad' ? alertRole(`notice:${notice.text}`) : {}) }, notice.text,
       ...(notice.retry && draft.replyId ? [' ', el('button', { type: 'button', 'data-k': 'retry-send', onclick: () => send() }, `Retry (same reply ID ${draft.replyId})`), ' ',
@@ -1418,15 +1063,7 @@ function composeArea(x: Decision): HTMLElement[] {
     // Where this answer goes, at the point of reply (also on short and narrow windows): Practice
     // saves here only; a Chat answer is saved in Decision Inbox and, without plugin mail, stays there.
     el('p', { class: `d-reach${practice || dash.mail?.state !== 'available' ? ' d-reach-local' : ''}`, 'data-k': 'reply-reach', role: 'note' }, replyReach(practice ? 'practice' : 'chat', dash.mail)),
-    el('div', { class: 'd-dock-foot' },
-      // First use: say how a note is made; once there are notes, that they travel with the reply.
-      el('span', { class: 'd-hint', 'data-k': 'reply-hint' }, practice
-        ? (draft.annotations.length ? 'Notes are saved with your practice answer. Ctrl+Enter saves.' : 'Select text, then Add note (Alt+N) to comment on it.')
-        : draft.annotations.length
-        ? 'Notes are saved with your reply. Ctrl+Enter submits.'
-        : 'Select text, then Add note (Alt+N) to comment on it.'),
-
-      notesBtn, sendBtn)
+    el('div', { class: 'd-dock-foot' }, notesBtn, sendBtn)
   ]
 }
 
@@ -1628,32 +1265,13 @@ function progressCard(x: Decision, state: ShownState): HTMLElement {
     el('ul', { class: 'd-milestones', 'aria-label': 'Recorded milestones' }, ...ms.map(([k, v]) => el('li', {}, el('b', {}, k), ` · ${v}`)),
       ...(next ? [el('li', { class: 'd-next' }, `Next: ${next}`)] : [])))
 }
-/** Images: placed inline in the narrative when the agent placed them; all of them (with optional
- *  side-by-side compare and per-image notes) here, collapsed when they already appear inline. */
+/** Images the narrative does not place (or older decisions without placements), inline like placed ones. */
 function imagesNode(x: Decision): HTMLElement[] {
-  const imgs = x.evidence.filter((e): e is Img => e.kind === 'image-snapshot')
-  if (!imgs.length) return []
-  const pair = b !== null && imgs.length > 1
-  if (a >= imgs.length) a = 0
-  if (b !== null && b >= imgs.length) b = null
-  const inner = [
-    el('div', { class: 'film', role: 'group', 'aria-label': 'Snapshots' }, ...imgs.map((e, i) => el('button', {
-      type: 'button', 'data-k': `thumb-${i}`, 'aria-pressed': a === i || b === i,
-      onclick: (ev: MouseEvent) => { if (!pair) a = i; else if (ev.shiftKey || target === 'left') a = i; else b = i; render() }
-    }, `${i + 1} · ${e.label}`))),
-    el('div', { class: 'bar' }, el('button', { type: 'button', 'data-k': 'compare', 'aria-pressed': pair, onclick: () => { b = pair ? null : (a + 1) % imgs.length; target = 'right'; render() } }, 'Compare side by side'),
-      ...(pair ? [el('span', { class: 'meta' }, 'Thumbnails fill:'),
-        el('button', { type: 'button', 'data-k': 'target-left', 'aria-pressed': target === 'left', onclick: () => { target = 'left'; render() } }, 'Left'),
-        el('button', { type: 'button', 'data-k': 'target-right', 'aria-pressed': target === 'right', onclick: () => { target = 'right'; render() } }, 'Right'),
-        el('span', { class: 'meta' }, 'Shift-click fills the left.')] : [])),
-    el('div', { class: `vp${pair ? ' pair' : ''}` }, viewer(imgs, a, pair ? 'Left' : 'Main'), ...(pair ? [viewer(imgs, b!, 'Right')] : []))]
-  const inline = (x.inlineImages ?? []).length > 0
-  return inline
-    ? [el('details', { class: 'd-images', ...(pair || imgsOpen ? { open: true } : {}), ontoggle: (ev: Event) => { imgsOpen = (ev.target as HTMLDetailsElement).open } },
-        el('summary', {}, `All images (${imgs.length}) · compare and annotate`), ...inner)]
-    : [el('h2', { class: 'd-sec-h' }, `Images · ${imgs.length}`), ...inner]
+  const placed = new Set((x.inlineImages ?? []).flatMap((p) => 'unavailable' in p ? [] : [`${p.evidenceId}@${p.version}`]))
+  const rest = x.evidence.filter((e): e is Img => e.kind === 'image-snapshot' && !placed.has(`${e.evidenceId}@${e.version}`))
+  if (!rest.length) return []
+  return [el('h2', { class: 'd-sec-h' }, `Images · ${rest.length}`), ...rest.map((e) => figure({ evidenceId: e.evidenceId, version: e.version, offset: 0 }, x))]
 }
-let imgsOpen = false
 
 function renderReview(questionId: string) {
   const x = d
@@ -1698,19 +1316,11 @@ function renderReview(questionId: string) {
           el('label', { class: 'opt d-opt', title: o.detail ?? '' }, el<HTMLInputElement>('input', { type: 'radio', name: 'opt', 'data-k': `opt-${o.optionId}`, checked: draft.optionId === o.optionId, disabled: sending, onchange: () => { draft.optionId = o.optionId; scheduleSave(); render() } }),
             el('span', {}, o.label, ...(o.detail ? [el('span', { class: 'meta' }, ` — ${o.detail}`)] : [])))))] : []),
     ...(composing ? useRecNode(x) : []),
-    ...(noteSaved === x.questionId && draft.annotations.length ? [el('div', { class: 'd-dock-row d-note-saved', role: 'status' },
-      el('span', {}, isPractice(x) ? `Note saved with your practice draft (${draft.annotations.length}).` : `Note saved with your draft (${draft.annotations.length}). Not sent yet: notes go with your reply.`),
-      el('button', { type: 'button', class: 'd-btn d-ghost', 'data-k': 'notes-edit', onclick: () => {
-        noteSaved = null
-        if (notesInDialog()) return openComposer(null)
-        notesOpen = true; render(); root.querySelector<HTMLElement>('#notesPanel input, [data-k="notes-close"]')?.focus()
-      } }, 'Edit notes'))] : []),
-    ...(canReply ? composeArea(x) : [el('p', { class: 'meta', style: 'margin:0' }, 'Replying here is not available for this decision right now.')]),
-    notesPanel(x))
+    ...(noteSaved === x.questionId && draft.annotations.length ? [el('div', { class: 'd-dock-row d-note-saved', role: 'status' }, el('span', {}, 'Note saved.'))] : []),
+    ...(canReply ? composeArea(x) : [el('p', { class: 'meta', style: 'margin:0' }, 'Replying here is not available for this decision right now.')]))
   readerHost.replaceChildren(sheet(x, body, dock))
   for (const f of NOTE_FIELDS) { const box = readerHost.querySelector(`[data-field="${f}"]`); if (box) markNotes(box, f) }
   shownD = x
-  if (focusNote !== null) { root.querySelector<HTMLInputElement>(`[data-note="${focusNote}"]`)?.focus(); focusNote = null }
 }
 /**
  * "Use PM recommendation": proposes the recommended answer in this question's draft; it is never
@@ -1994,6 +1604,8 @@ const dash = {
   // Inbox (no workspace scope, no live source, nothing delivered); same list, reader and reply card.
   mode: (ref.view === 'dashboard' && ref.mode === 'practice' ? 'practice' : 'inbox') as 'inbox' | 'practice',
   tab: 'pending' as Tab, priority: '', status: '', group: 'priority', term: '',
+  // An explicit column sort: the worker orders the whole queue and the table is flat, in that order.
+  sort: null as DecisionSort | null,
   rows: [] as Decision[], next: undefined as string | undefined, sources: [] as SourceStatus[], mail: undefined as { state: 'available' | 'unavailable'; message?: string } | undefined,
   loading: false as false | 'first' | 'more', fail: null as Failure | null, loaded: false, filtersOpen: false
 }
@@ -2055,7 +1667,7 @@ async function catchUpLive() {
   else if (inventory) await tracker.refreshInventory()
 }
 // Every tab reads history too: Pending / Answered / All split the same rows.
-const pageInput = (scope: Scope, cursor?: string) => queueInput(scope, { query: dash.term, includeHistory: true, timeZone: clock.zone(), cursor })
+const pageInput = (scope: Scope, cursor?: string) => queueInput(scope, { query: dash.term, includeHistory: true, timeZone: clock.zone(), cursor, ...(dash.sort ? { sort: dash.sort } : {}) })
 async function loadQueue(more = false) {
   if (dash.mode === 'practice') return loadPractice(more)
   if (!more) { dash.next = undefined; if (dashScopeKey !== currentKey()) dash.rows = [] } // a new query never reuses another query's cursor or rows
@@ -2107,7 +1719,7 @@ async function refreshQueue() {
   paintQueue()
 }
 // ---- Practice Inbox: the same queue, without a workspace scope ----------------------------------
-const practiceInput = (cursor?: string) => ({ ...(dash.term.trim() ? { query: dash.term.trim() } : {}), includeHistory: true, timeZone: clock.zone(), ...(cursor ? { cursor } : {}) })
+const practiceInput = (cursor?: string) => ({ ...(dash.term.trim() ? { query: dash.term.trim() } : {}), includeHistory: true, timeZone: clock.zone(), ...(cursor ? { cursor } : {}), ...(dash.sort ? { sort: dash.sort } : {}) })
 async function loadPractice(more = false) {
   if (!more) dash.next = undefined
   const mine = ++dashSeq
@@ -2149,7 +1761,7 @@ async function setMode(mode: 'inbox' | 'practice') {
   ++dashSeq; ++seq // list and detail requests in flight belong to the other mode
   if (dashTimer) { clearTimeout(dashTimer); dashTimer = null }
   const kept = keepPendingNote()
-  if (dashSel) { await flushDraft(); dashSel = null; d = null; draftFor = null; draft = emptyDraft(); draftRevision = null; notice = null; notesOpen = false; noteSaved = null; sheetDrawnFor = undefined }
+  if (dashSel) { await flushDraft(); dashSel = null; d = null; draftFor = null; draft = emptyDraft(); draftRevision = null; notice = null; noteSaved = null; sheetDrawnFor = undefined }
   // Each mode keeps its own tab, search and filters: a filtered live queue never hides practice rows.
   modeFilters[dash.mode] = { tab: dash.tab, priority: dash.priority, status: dash.status, term: dash.term }
   const f = modeFilters[mode] ?? { tab: 'pending', priority: '', status: '', term: '' }
@@ -2177,7 +1789,7 @@ async function selectInDashboard(questionId: string) {
   const kept = keepPendingNote()
   if (draftFor && draftFor !== questionId) await flushDraft()
   if (kept && leaving) say(`Your unsaved note was kept with the draft of “${leaving.title}”. Not sent.`)
-  draftFor = null; draft = emptyDraft(); draftRevision = null; draftFail = null; d = null; pkg = []; notice = null; notesOpen = false; recOpen = false; recAsk = null; noteSaved = null
+  draftFor = null; draft = emptyDraft(); draftRevision = null; draftFail = null; d = null; pkg = []; notice = null; recOpen = false; recAsk = null; noteSaved = null
   ++seq // a detail read in flight belongs to the previous decision
   openPractice = dash.mode === 'practice'
   dashSel = questionId
@@ -2190,15 +1802,15 @@ function closeDashSheet() {
   const id = dashSel
   const kept = keepPendingNote()
   void flushDraft()
-  dashSel = null; notesOpen = false; noteSaved = null; sheetDrawnFor = undefined
+  dashSel = null; noteSaved = null; sheetDrawnFor = undefined
   render()
   shell?.list.querySelector<HTMLElement>(`[data-q="${CSS.escape(id)}"]`)?.focus()
   say(kept ? 'Closed. Your unsaved note was kept with the draft. Not sent.' : 'Closed')
 }
 
 // ---- list model ----
-const statusOf = (x: Decision) => { const n = nativeOf(x); return n ? nativeStatusLabel(n.itemStatus) : STATE_LABEL[shownState(x)] }
-const wsLabel = (x: Decision) => { const n = nativeOf(x); return isPractice(x) ? 'Practice Inbox' : n && !n.workspaceAttributed ? 'No workspace attribution' : `${x.projectName} · ${x.workspaceName}` }
+const statusOf = (x: Decision) => columnText(x, 'status')
+const wsLabel = (x: Decision) => columnText(x, 'workspace')
 function inTab(x: Decision, tab: Tab) { return tab === 'all' || (tab === 'pending') === isActionable(x) }
 function visibleRows(tab: Tab = dash.tab) {
   return dash.rows.filter((x) => inTab(x, tab) && (!dash.priority || x.priority === dash.priority) && (!dash.status || statusOf(x) === dash.status))
@@ -2221,7 +1833,6 @@ function grouped(rows: Decision[]): [string, Decision[]][] {
 
 const SRC_NAME: Record<SourceStatus['source'], string> = { plugin: 'Chat decisions', 'native-item': 'Bot Items' }
 function rowNode(x: Decision, now: number): HTMLElement {
-  const n = nativeOf(x)
   const due = deadlineLabel(x, now)
   const sel = dashSel === x.questionId
   const title = el('button', { type: 'button', class: 'd-title qrow', 'data-q': x.questionId, 'data-k': `row-${x.questionId}`, 'aria-current': sel ? 'true' : false,
@@ -2235,10 +1846,10 @@ function rowNode(x: Decision, now: number): HTMLElement {
   })
   const tr = el('tr', { class: 'd-row', ...(sel ? { 'data-sel': '' } : {}) },
     el('th', { scope: 'row' }, title),
-    el('td', { class: 'd-col-bg' }, el('div', { class: 'd-bg-snip' }, x.background.replace(/```[^]*?(```|$)/g, ' ').replace(/\[([^\]\n]+)\]\([^)\s]+\)/g, '$1').replace(/https?:\/\/\S+/g, ' ').replace(/[#*`[\]()>_~-]+/g, ' ').replace(/\s+/g, ' ').trim())),
+    el('td', { class: 'd-col-bg' }, el('div', { class: 'd-bg-snip' }, columnText(x, 'background'))),
     el('td', { class: 'd-c-meta' }, el('span', { class: `d-pill d-p-${x.priority}` }, x.priority)),
     el('td', { class: 'd-c-meta' }, el('span', { class: 'd-pill' }, statusOf(x))),
-    el('td', { class: 'd-c-src d-nm' }, n ? 'Bot Item' : isPractice(x) ? 'Practice' : 'Chat'),
+    el('td', { class: 'd-c-src d-nm' }, columnText(x, 'source')),
 
     el('td', { class: 'd-c-ws d-nm' }, wsLabel(x)),
     el('td', { class: `d-c-meta d-nm d-c-due ${due?.overdue ? 'd-due-over' : ''}${due ? '' : ' d-no-due'}` }, due ? due.text : '—'))
@@ -2283,7 +1894,7 @@ function paintQueue() {
     el('span', { class: 'd-chip' }, t, el('button', { type: 'button', 'aria-label': `Remove filter ${t}`, 'data-k': `chip-${k}`, onclick: () => { clear(); paintQueue(); say('Filter removed') } }, '✕')))))
   const label = practice ? 'Practice Inbox' : !scope ? 'no workspace' : scope.kind === 'all' ? 'all workspaces' : workspaceLabel(scope.workspace, st.inv?.workspaces ?? [])
   kids.push(el('div', { class: 'd-meta-line' },
-    el('span', { role: 'status' }, dash.loading === 'first' ? 'Loading decisions…' : `${rows.length}${more} ${dash.term.trim() ? 'matching ' : ''}decision${rows.length === 1 ? '' : 's'} · ${label}`)))
+    el('span', { role: 'status' }, dash.loading === 'first' ? 'Loading decisions…' : `${rows.length}${more} ${dash.term.trim() ? 'matching ' : ''}decision${rows.length === 1 ? '' : 's'} · ${label}${dash.sort ? ` · sorted by ${COLUMN_NAME[dash.sort.column]} ${dash.sort.direction === 'asc' ? '▲' : '▼'}` : ''}`)))
   const degraded = dash.sources.some((x) => x.state !== 'available')
   if (practice) { /* no workspace inventory in Practice */ } else if (st.invFail) kids.push(el('div', { class: 'callout warn' }, `Could not list your workspaces. ${failureText(st.invFail)} The Workspace list shows only the current choice.`))
   else if (st.inv?.truncated) kids.push(el('div', { class: 'callout info' }, 'Some workspaces could not be listed. The Workspace list shows the ones Orca reported.'))
@@ -2299,17 +1910,45 @@ function paintQueue() {
     kids.push(el('div', { class: 'd-empty' }, el('b', {}, chips.length || dash.term.trim() ? 'No decisions match these filters.' : practice ? (dash.tab === 'pending' ? 'No practice decisions are waiting.' : 'No practice decisions here.') : degraded ? `Nothing found in ${label} from the sources that could be read.` : dash.tab === 'pending' ? `Nothing needs you in ${label}.` : 'Nothing here yet.'),
       chips.length ? 'Remove a filter chip or reset to see more.' : practice ? (dash.tab === 'pending' ? 'Every practice decision has a saved answer. See Answered or All.' : 'Practice decisions appear here.') : scope?.kind === 'workspace' ? 'Choose All workspaces in the Workspace list to see other workspaces. Bot Items without a workspace appear only there.' : 'New questions from agents appear here.'))
   } else if (rows.length) {
+    const sort = dash.sort
     kids.push(el('div', { class: 'd-table-wrap', id: 'panel', role: 'tabpanel', 'aria-labelledby': `tab-${dash.tab}`, 'data-k': 'table-wrap', tabindex: -1 },
-      el('table', {}, el('caption', { class: 'sr' }, `Decisions, grouped by ${dash.group}`),
-        el('thead', {}, el('tr', {}, ...[['Question', ''], ['Background', 'd-col-bg'], ['Priority', ''], ['Status', ''], ['Source', 'd-c-src'], ['Workspace', 'd-c-wsh'], ['Due', '']].map(([t, c]) => el('th', { scope: 'col', class: c }, t)))),
-        el('tbody', {}, ...grouped(rows).flatMap(([k, xs]) => [
+      el('table', {}, el('caption', { class: 'sr' }, sort ? `Decisions, sorted by ${COLUMN_NAME[sort.column]}, ${sort.direction === 'asc' ? 'ascending' : 'descending'}` : `Decisions, grouped by ${dash.group}`),
+        el('thead', {}, el('tr', {}, ...COLUMNS.map(([c, cls]) => {
+          const on = sort?.column === c
+          return el('th', { scope: 'col', class: cls, ...(on ? { 'aria-sort': sort.direction === 'asc' ? 'ascending' : 'descending' } : {}) },
+            el('button', { type: 'button', class: 'd-sort', 'data-k': `sort-${c}`, onclick: () => sortBy(c) }, COLUMN_NAME[c],
+              el('span', { class: 'd-sort-ind', 'aria-hidden': 'true' }, on ? (sort.direction === 'asc' ? ' ▲' : ' ▼') : '')))
+        }))),
+        // A sorted table is flat, in the worker's order; grouping applies only without an explicit sort.
+        el('tbody', {}, ...(sort ? rows.map((x) => rowNode(x, now)) : grouped(rows).flatMap(([k, xs]) => [
           el('tr', { class: 'd-group' }, el('th', { colspan: 7, scope: 'colgroup' }, el('span', { class: 'd-gname' }, k), el('span', { class: 'd-gc', 'aria-label': `${xs.length} decision${xs.length === 1 ? '' : 's'}` }, String(xs.length)))),
-          ...xs.map((x) => rowNode(x, now))])))))
+          ...xs.map((x) => rowNode(x, now))]))))))
   }
   if (dash.next) kids.push(el('button', { type: 'button', class: 'd-btn', 'data-k': 'dash-more', 'aria-disabled': dash.loading === 'more', onclick: () => dash.loading !== 'more' && void loadQueue(true) }, dash.loading === 'more' ? 'Loading more…' : 'Load more'))
   const focusedKey = document.activeElement && shell.list.contains(document.activeElement) ? document.activeElement.getAttribute('data-k') : null
   shell.list.replaceChildren(...kids)
   if (focusedKey) shell.list.querySelector<HTMLElement>(`[data-k="${CSS.escape(focusedKey)}"]`)?.focus({ preventScroll: true })
+}
+const COLUMNS: [DecisionColumn, string][] = [['question', ''], ['background', 'd-col-bg'], ['priority', ''], ['status', ''], ['source', 'd-c-src'], ['workspace', 'd-c-wsh'], ['due', '']]
+const COLUMN_NAME: Record<DecisionColumn, string> = { question: 'Question', background: 'Background', priority: 'Priority', status: 'Status', source: 'Source', workspace: 'Workspace', due: 'Due' }
+/** A column header: the first press sorts ascending, the next toggles. Re-queries from the first page. */
+function sortBy(column: DecisionColumn, direction?: DecisionSort['direction']) {
+  dash.sort = { column, direction: direction ?? (dash.sort?.column === column && dash.sort.direction === 'asc' ? 'desc' : 'asc') }
+  paintGroupBy(); void loadQueue()
+  say(`Sorted by ${COLUMN_NAME[column]}, ${dash.sort.direction === 'asc' ? 'ascending' : 'descending'}`)
+}
+/** Group by shows "None (sorted)" while a column sort is in effect; choosing any group ends the sort.
+ *  The narrow-only Sort select (no column headers below 900px) shows the same sort. */
+function paintGroupBy() {
+  const g = shell?.el.querySelector<HTMLSelectElement>('[data-k="group-by"]'), so = shell?.el.querySelector<HTMLSelectElement>('[data-k="sort-by"]')
+  const pick = (sel: HTMLSelectElement | null | undefined, v: string) => {
+    const opts = Array.from(sel?.querySelectorAll('option') ?? [])
+    for (const o of opts) o.selected = o.getAttribute('value') === v
+    for (const o of opts) o.toggleAttribute('selected', o.getAttribute('value') === v)
+  }
+  const none = g?.querySelector<HTMLOptionElement>('option[value="none"]'); if (none) none.hidden = !dash.sort
+  pick(g, dash.sort ? 'none' : dash.group)
+  pick(so, dash.sort ? `${dash.sort.column}:${dash.sort.direction}` : '')
 }
 /** One collapsible status for the live sources; null when every source was read in full. */
 function sourceStatusNode(sources: readonly StatusSource[]): HTMLElement | null {
@@ -2358,14 +1997,28 @@ function buildShell() {
     onclick: () => { const open = toolbar.classList.toggle('d-open'); filtersBtn.setAttribute('aria-expanded', String(open)) } }, 'Filters')
   // Group by is a view setting, not a filter: its own labelled control at the end of the toolbar.
   const groupBy = el('label', { class: 'd-field d-groupby' }, el('span', {}, 'Group by'),
-    el('select', { 'data-k': 'group-by', onchange: (ev: Event) => { dash.group = (ev.target as HTMLSelectElement).value; paintQueue(); say(`Grouped by ${dash.group}`) } },
-      ...[['urgency', 'Urgency'], ['priority', 'Priority'], ['status', 'Status'], ['workspace', 'Workspace']].map(([v, l]) => el('option', { value: v, selected: dash.group === v }, l))))
+    el('select', { 'data-k': 'group-by', onchange: (ev: Event) => {
+      const v = (ev.target as HTMLSelectElement).value; if (v === 'none') return
+      const sorted = !!dash.sort
+      dash.group = v; dash.sort = null; paintGroupBy()
+      if (sorted) void loadQueue(); else paintQueue() // back to the worker's default order, grouped
+      say(`Grouped by ${dash.group}`)
+    } },
+      el('option', { value: 'none', hidden: !dash.sort, selected: !!dash.sort }, 'None (sorted)'),
+      ...[['urgency', 'Urgency'], ['priority', 'Priority'], ['status', 'Status'], ['workspace', 'Workspace']].map(([v, l]) => el('option', { value: v, selected: !dash.sort && dash.group === v }, l))))
+  const sortSel = el('label', { class: 'd-field d-sortby' }, el('span', {}, 'Sort'),
+    el('select', { 'data-k': 'sort-by', onchange: (ev: Event) => {
+      const v = (ev.target as HTMLSelectElement).value
+      if (v) { const [c, dir] = v.split(':') as [DecisionColumn, DecisionSort['direction']]; return sortBy(c, dir) }
+      dash.sort = null; paintGroupBy(); void loadQueue(); say(`Grouped by ${dash.group}`)
+    } }, el('option', { value: '' }, 'Grouped (default)'),
+      ...COLUMNS.flatMap(([c]) => (['asc', 'desc'] as const).map((dir) => el('option', { value: `${c}:${dir}` }, `${COLUMN_NAME[c]} ${dir === 'asc' ? '▲' : '▼'}`)))))
   const toolbar = el('form', { class: 'd-toolbar', id: 'dFilters', role: 'search', 'aria-label': 'Filter decisions', onsubmit: (ev: Event) => ev.preventDefault() },
     priority, statusLabel, el('label', { class: 'd-field d-grow' }, el('span', {}, 'Search'), search),
     el('button', { type: 'button', class: 'd-btn d-ghost', 'data-k': 'reset', onclick: () => {
       dash.priority = ''; dash.status = ''; dash.term = ''; search.value = ''
-      toolbar.querySelectorAll('select:not([data-k="group-by"])').forEach((s) => { (s as HTMLSelectElement).value = '' }); void loadQueue(); say('Filters reset')
-    } }, 'Reset'), filtersBtn, groupBy)
+      toolbar.querySelectorAll('select:not([data-k="group-by"]):not([data-k="sort-by"])').forEach((s) => { (s as HTMLSelectElement).value = '' }); void loadQueue(); say('Filters reset')
+    } }, 'Reset'), filtersBtn, groupBy, sortSel)
   const list = el('div', { class: 'd-results' })
   // Always discoverable: the Inbox / Practice switch heads the queue in every width.
   const modeBtn = (m: 'inbox' | 'practice', ...label: (Node | string)[]) => el('button', { type: 'button', 'data-mode': m, 'data-k': `mode-${m}`, 'aria-pressed': String(dash.mode === m), onclick: () => void setMode(m) }, ...label)

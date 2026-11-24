@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { prepareLocalSnapshot, publishLocalSnapshots } from '../../src/local-snapshot.mjs'
-import { boundedFile, withFileDescriptor } from '../../src/bounded-file.mjs'
-import { withSubmissionLock } from '../../src/submission-lock.mjs'
-import { privateHintDirectory, hintPattern } from '../../src/backend-local.mjs'
+import { prepareLocalSnapshot, publishLocalSnapshots } from '../../src/local/local-snapshot.mjs'
+import { boundedFile, withFileDescriptor } from '../../src/local/bounded-file.mjs'
+import { withSubmissionLock } from '../../src/local/submission-lock.mjs'
+import { privateHintDirectory, hintPattern } from '../../src/local/backend-local.mjs'
 
 try {
   const [op, inputPath, ...extra] = process.argv.slice(2)

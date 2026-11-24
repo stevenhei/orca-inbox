@@ -5,7 +5,8 @@
 // sessionStorage, so a reload after a source edit keeps them, as worker storage would.
 import { decisions, historyExample, clock, origins } from './build/fixtures/decisions.js'
 import { createPractice, practiceOwner } from './build/src/backend-practice.js'
-import { order } from './build/src/model.js'
+import { projectRow } from './build/src/backend.js'
+import { tableOrder } from './build/src/model.js'
 
 const clone = (v) => (v === undefined ? v : structuredClone(v))
 const ok = (value) => ({ ok: true, value })
@@ -93,15 +94,15 @@ export function createMockOrca({ ref, history = false }) {
     const method = { 'draft.get': 'getDraft', 'draft.save': 'saveDraft', getSnapshot: 'getSnapshot', submitReply: 'submitReply' }[name]
     return method ? practice.backend[method](practiceOwner, input) : err('unavailable', 'This action is unavailable in Practice.')
   }
-  const page = ({ scope, query, includeHistory, cursor }) => {
+  const page = ({ scope, query, includeHistory, cursor, sort }) => {
     const t = (query ?? '').toLocaleLowerCase()
-    const rows = order([...db.values()]).filter((d) => (scope.kind === 'all' ||
+    const rows = tableOrder([...db.values()], sort).filter((d) => (scope.kind === 'all' ||
       (d.origin.hostId === scope.workspace.hostId && d.origin.workspaceId === scope.workspace.workspaceId)) &&
       (includeHistory || d.answerState.state === 'awaiting-answer' || d.source?.kind === 'native-item') &&
       (!t || JSON.stringify(d).toLocaleLowerCase().includes(t)))
     const start = cursor ? Number(cursor) : 0
     const size = 8
-    return ok({ rows: rows.slice(start, start + size).map(clone), ...(start + size < rows.length ? { nextCursor: String(start + size) } : {}),
+    return ok({ rows: rows.slice(start, start + size).map(projectRow), ...(start + size < rows.length ? { nextCursor: String(start + size) } : {}),
       sources: [{ source: 'plugin', state: 'available' }, { source: 'native-item', state: 'available' }],
       mail: { state: 'unavailable', message: 'Answers are saved in Decision Inbox. Orca mail from this plugin is unavailable on this host.' } })
   }

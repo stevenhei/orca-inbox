@@ -7,7 +7,7 @@
 //  * When focus is unknown or ambiguous, or the chosen workspace is no longer in the authorized
 //    inventory, nothing is listed and the owner is asked to choose; the scope is never widened.
 //  * Every authorized workspace is offered, even one with no decisions; equal names show the host.
-import type { ListDecisions, Workspace } from './contract.ts'
+import type { DecisionSort, ListDecisions, Workspace } from './contract.ts'
 import type { DecisionPageInput, WorkspaceOptions } from './backend-protocol.ts'
 import type { Failure } from './client.ts'
 
@@ -73,11 +73,11 @@ export function workspaceChoices(inv: WorkspaceOptions | null, shown: Scope | nu
  * The one queue request both views send: the scope in effect (host-qualified), the worker-side
  * search, history and time zone, and a cursor only for the next page of the same query.
  */
-export function queueInput(scope: Scope, q: { query?: string; includeHistory: boolean; timeZone: string; cursor?: string }): DecisionPageInput {
+export function queueInput(scope: Scope, q: { query?: string; includeHistory: boolean; timeZone: string; cursor?: string; sort?: DecisionSort }): DecisionPageInput {
   const t = q.query?.trim()
   return {
     scope: scope.kind === 'all' ? { kind: 'all' } : { kind: 'workspace', workspace: { hostId: scope.workspace.hostId, workspaceId: scope.workspace.workspaceId } },
-    ...(t ? { query: t } : {}), includeHistory: q.includeHistory, timeZone: q.timeZone, ...(q.cursor ? { cursor: q.cursor } : {})
+    ...(t ? { query: t } : {}), includeHistory: q.includeHistory, timeZone: q.timeZone, ...(q.cursor ? { cursor: q.cursor } : {}), ...(q.sort ? { sort: q.sort } : {})
   }
 }
 

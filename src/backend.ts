@@ -1,9 +1,9 @@
-import { practicePrefix } from './contract.ts'
+import { decisionColumns, practicePrefix, type DecisionSort } from './contract.ts'
 import type { AcknowledgeReply, Annotation, Decision, Delivery, Evidence, Origin, RecordedReply, Result, SubmitDecision, SubmitReply, Workspace } from './contract.ts'
 import type { DecisionPage, InboxSettings, OwnerCaller, PrivateSnapshot, ReplyDraft } from './backend-protocol.ts'
 import type { InboxErrorCode } from './backend-validation.ts'
 import { annotations, id, InboxError, list, object, reply, requireInput, string, submission, validateNotes } from './backend-validation.ts'
-import { isActionable, order, searchText } from './model.ts'
+import { columnText, isActionable, tableOrder, searchText } from './model.ts'
 
 export type AgentCaller = {
   kind: 'agent'
@@ -137,7 +137,7 @@ export function decisionSourceMetadata(links: Decision['sourceLinks'], sessionId
   }
 }
 
-function projectRow({ description: _description, packageSummary: _summary, activity: _activity, nativeLinks: _nativeLinks, inlineImages: _inlineImages, workItemLinks: _workItemLinks, originalSessionId: _session, ...d }: Decision): Decision {
+export function projectRow({ description: _description, packageSummary: _summary, activity: _activity, nativeLinks: _nativeLinks, inlineImages: _inlineImages, workItemLinks: _workItemLinks, originalSessionId: _session, ...d }: Decision): Decision {
   const minimalReply = (r: RecordedReply): RecordedReply => ({
     ...r, answer: { kind: 'text', text: '' }, annotations: []
   })
@@ -146,7 +146,7 @@ function projectRow({ description: _description, packageSummary: _summary, activ
         followUps: d.answerState.followUps.filter(r => r.delivery.state === 'undelivered').slice(0, 1).map(minimalReply) }
     : d.answerState
   return {
-    ...d, title: d.title.slice(0, 4096), background: '', recommendation: '', options: [],
+    ...d, title: d.title.slice(0, 4096), background: '', backgroundPreview: columnText(d, 'background'), recommendation: '', options: [],
     projectName: d.projectName.slice(0, 1024), workspaceName: d.workspaceName.slice(0, 1024),
     blockedWork: d.blockedWork.slice(0, 12).map(item => item.slice(0, 512)),
     evidence: [], sourceLinks: [], access: { participantIds: [], attachmentReaderIds: {} }, answerState
@@ -328,12 +328,19 @@ export class InboxBackend {
     const zone = input.timeZone === undefined ? this.timeZone : id(input.timeZone, 'time zone')
     try { new Intl.DateTimeFormat('en', { timeZone: zone }) }
     catch { return fail('invalid', 'Invalid reviewing desktop time zone.') }
+    let sort: DecisionSort | undefined
+    if (input.sort !== undefined) {
+      const requested = object(input.sort)
+      const column = decisionColumns.find(key => key === requested.column)
+      requireInput(column && (requested.direction === 'asc' || requested.direction === 'desc'), 'Invalid decision sort.')
+      sort = { column, direction: requested.direction }
+    }
     return this.transaction(state => {
       const rows = [...state.decisions.filter(d => mayRead(caller, d)), ...nativeRows].filter(d =>
         (!filter || (d.source?.kind !== 'native-item' || d.source.workspaceAttributed) && sameWorkspace(filter, d.origin)) &&
         (input.includeHistory || isActionable(d)) && (!query || (input.includeHistory ? searchText(d)
           : searchText({ ...d, answerState: { state: 'awaiting-answer' } })).includes(query)))
-      return order(rows)
+      return tableOrder(rows, sort)
     })
   }
 

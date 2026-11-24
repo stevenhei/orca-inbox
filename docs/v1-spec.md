@@ -8,7 +8,7 @@ Rows show question, project, workspace, priority P0–P3, optional deadline, and
 
 ## Review and project record
 
-Wide review shows background, recommendation, options, and source links. Owners can enlarge multiple images, compare them side by side, annotate individual images and selected text, and submit an option or free-text answer with comments in one operation. Relay annotations with stable evidence IDs and versions. Text anchors carry the quote and versioned source range. Private screenshots are immutable snapshots subject to attachment access. External evidence stays linked. Scheduled cleanup is deferred.
+Wide review shows background, recommendation, options, and source links. Owners can open inline images in a scroll-to-zoom overlay, annotate individual images and selected text, and submit an option or free-text answer with comments in one operation. Relay annotations with stable evidence IDs and versions. Text anchors carry the quote and versioned source range. Private screenshots are immutable snapshots subject to attachment access. External evidence stays linked. Scheduled cleanup is deferred.
 
 Each decision has a stable link and source issue or spec link where available. The source agent records the summary and Inbox link in the existing project record when repo rules require it. One-off answers apply to one decision. Only the owner can explicitly promote an answer to a standing rule.
 

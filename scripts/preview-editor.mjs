@@ -223,12 +223,43 @@ async function runShots(dir, wsUrl) {
     files.push(await shot(`narrative-${label}`))
     check(`note 4 (${label}): focused reply box and Submit not clipped`, !!g.reply && g.reply.top >= 0 && g.reply.bottom <= h && !!g.send && g.send.bottom <= h + 1 && g.dock.top >= 0 && !g.pageScrolls, { reply: g.reply, send: g.send, dock: g.dock })
   }
-  // Notes open in the reply card (wide) and as a dialog (narrow).
-  await open('?ref=preview-narrative', 1280, 820)
-  await evalJs(`document.querySelector('[data-k="notes-open"]').click()`); await wait(300)
-  const notes = await evalJs(`(() => { const p = document.querySelector('#notesPanel'); const b = p?.getBoundingClientRect(); return { open: !!p && !p.hidden, expanded: document.querySelector('[data-k="notes-open"]').getAttribute('aria-expanded'), inDock: !!p?.closest('.d-dock'), top: b && Math.round(b.top), bottom: b && Math.round(b.bottom) } })()`)
-  files.push(await shot('narrative-1280-notes'))
-  check('notes panel opens from the reply card, above it', notes.open && notes.expanded === 'true' && notes.inDock && notes.top >= 0, notes)
+  // Owner report: Practice visitor question, a text note, then Notes (1) by a real pointer. The notes
+  // dialog must be in the top layer, inside the viewport and under the pointer, with keyboard editing,
+  // both with a ~500px sheet in a wide window and in a 529px window.
+  const pointer = async (x, y) => {
+    await s('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y })
+    await s('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 })
+    await s('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 })
+  }
+  const centre = (sel) => evalJs(`(() => { const b = document.querySelector(${JSON.stringify(sel)}).getBoundingClientRect(); return { x: Math.round(b.left + b.width / 2), y: Math.round(b.top + b.height / 2) } })()`)
+  for (const [w, h, label, sheet] of [[1280, 820, 'desktop-1280-sheet-500', 500], [529, 820, 'window-529', null]]) {
+    await open('?ref=practice', w, h); await evalJs('sessionStorage.clear()'); await open('?ref=practice', w, h)
+    await evalJs(`[...document.querySelectorAll('.qrow')].find((b) => b.textContent.includes('訪客')).click()`); await wait(900)
+    if (sheet) {
+      await evalJs(`document.querySelector('[data-k="divider"]').focus()`); await key('Home', 'Home', 36)
+      for (let i = 0; i < (sheet - 380) / 24; i++) await key('ArrowLeft', 'ArrowLeft', 37)
+      await wait(200)
+    }
+    const sw = await evalJs(`Math.round(document.querySelector('.d-sheet').getBoundingClientRect().width)`)
+    await evalJs(`(() => { const p = document.querySelector('[data-field="background"] p'); const t = [...p.childNodes].find((n) => n.nodeType === 3); const r = document.createRange(); r.setStart(t, 0); r.setEnd(t, 4); getSelection().removeAllRanges(); getSelection().addRange(r) })()`); await wait(300)
+    const pp = await centre('#pop'); await pointer(pp.x, pp.y); await wait(300)
+    await evalJs(`document.querySelector('[aria-label="New note"]').focus()`); await s('Input.insertText', { text: '訪客 note' })
+    await evalJs(`document.querySelector('[data-k="nc-add"]').click()`); await wait(700)
+    const nb = await centre('[data-k="notes-open"]')
+    const label0 = await evalJs(`document.querySelector('[data-k="notes-open"]').textContent`)
+    await pointer(nb.x, nb.y); await wait(400)
+    const dl = await evalJs(`(() => { const d = document.querySelector('dialog[open]'); if (!d) return { open: false }; const b = d.getBoundingClientRect(); const cx = b.left + b.width / 2, cy = b.top + b.height / 2
+      const ta = d.querySelector('[data-dialog-note]'), tb = ta?.getBoundingClientRect()
+      return { open: true, modal: d.matches(':modal'), box: [Math.round(b.left), Math.round(b.top), Math.round(b.right), Math.round(b.bottom)], onTop: d.contains(document.elementFromPoint(cx, cy)), noteHit: !!tb && d.contains(document.elementFromPoint(tb.left + 8, tb.top + 8)) && tb.width > 50 && tb.height > 10,
+        focus: document.activeElement === ta, value: ta?.value, text: d.textContent } })()`)
+    files.push(await shot(`notes-dialog-${label}`))
+    check(`Notes (1) (${label}, sheet ${sw}px): a pointer click opens a modal dialog on top, inside the viewport, focus in the note`, label0 === 'Notes (1)' && dl.open && dl.modal && dl.onTop && dl.noteHit && dl.focus && dl.box[0] >= 0 && dl.box[1] >= 0 && dl.box[2] <= w && dl.box[3] <= h && dl.value === '訪客 note' && !/Ctrl|Alt\+N|Select text/.test(dl.text), { sw, label0, dl })
+    await s('Input.insertText', { text: ' edited' }); await wait(700)
+    const saved = await evalJs(`({ value: document.querySelector('dialog[open] [data-dialog-note]')?.value })`)
+    await key('Escape', 'Escape', 27); await wait(400)
+    const back = await evalJs(`({ open: !!document.querySelector('dialog[open]'), focus: document.activeElement?.getAttribute('data-k'), sheet: !!document.querySelector('.d-sheet') })`)
+    check(`Notes (1) (${label}): typing edits the note; Esc closes the dialog only and focus returns to Notes`, saved.value === '訪客 note edited' && !back.open && back.focus === 'notes-open' && back.sheet, { saved, back })
+  }
   // ---- second round of owner annotations (2–6) in real Chrome ----
   for (const [w, h, label] of [[1280, 820, 'desktop-1280'], [390, 844, 'narrow-390']]) {
     await open('?ref=preview-narrative', w, h)
@@ -264,13 +295,18 @@ async function runShots(dir, wsUrl) {
       return { overlay: [Math.round(zr.left), Math.round(zr.top), Math.round(zr.width), Math.round(zr.height)], viewport: [innerWidth, innerHeight], sheetW: Math.round(sh.width), natural: i.naturalWidth, img: [Math.round(ir.left), Math.round(ir.top), Math.round(ir.right), Math.round(ir.bottom)], focus: document.activeElement.getAttribute('aria-label'), outside: !z.closest('.d-sheet') } })()`)
     check(`annotation 4 (${label}): viewer covers the viewport (not the sheet), image pixels fit inside`, fit.outside && fit.overlay[0] === 0 && fit.overlay[1] === 0 && fit.overlay[2] === w && fit.overlay[3] === h && fit.natural > 0 && fit.img[0] >= 0 && fit.img[1] >= 0 && fit.img[2] <= w && fit.img[3] <= h && fit.focus === 'Close image', fit)
     files.push(await shot(`zoom-${label}-fit`))
-    await evalJs(`document.querySelector('[data-zk="in"]').click(); document.querySelector('[data-zk="in"]').click()`); await wait(200)
-    const z1 = await evalJs(`(() => { const i = document.querySelector('.d-zoom img').getBoundingClientRect(); return { w: Math.round(i.width), level: document.querySelector('.d-zoom-level').textContent, t: document.querySelector('.d-zoom img').style.transform } })()`)
+    const chrome = await evalJs(`({ buttons: [...document.querySelectorAll('.d-zoom button')].map((b) => b.getAttribute('aria-label')), level: !!document.querySelector('.d-zoom-level'), pct: /\\d+%/.test(document.querySelector('.d-zoom').textContent) })`)
+    check(`annotation 4 (${label}): viewer chrome is Fit and Close only, no percentage`, JSON.stringify(chrome.buttons) === '["Fit to screen","Close image"]' && !chrome.level && !chrome.pct, chrome)
+    for (let i = 0; i < 4; i++) await s('Input.dispatchMouseEvent', { type: 'mouseWheel', x: Math.round(w / 2), y: Math.round(h / 2), deltaX: 0, deltaY: -120 })
+    await wait(200)
+    const z1 = await evalJs(`(() => { const i = document.querySelector('.d-zoom img').getBoundingClientRect(); return { w: Math.round(i.width), t: document.querySelector('.d-zoom img').style.transform } })()`)
     await s('Input.dispatchMouseEvent', { type: 'mousePressed', x: Math.round(w / 2), y: Math.round(h / 2), button: 'left', clickCount: 1 })
     await s('Input.dispatchMouseEvent', { type: 'mouseMoved', x: Math.round(w / 2) + 60, y: Math.round(h / 2) + 40, button: 'left', buttons: 1 })
     await s('Input.dispatchMouseEvent', { type: 'mouseReleased', x: Math.round(w / 2) + 60, y: Math.round(h / 2) + 40, button: 'left', clickCount: 1 }); await wait(200)
     const z2 = await evalJs(`({ t: document.querySelector('.d-zoom img').style.transform, pageScroll: document.documentElement.scrollWidth > innerWidth || document.documentElement.scrollHeight > innerHeight })`)
-    check(`annotation 4 (${label}): zoom in to 225% and drag to pan, no page overflow`, z1.level === '225%' && z1.w > fit.img[2] - fit.img[0] && z2.t !== z1.t && !/translate\(0px, 0px\)/.test(z2.t) && !z2.pageScroll, { z1, z2 })
+    await s('Input.dispatchMouseEvent', { type: 'mouseWheel', x: Math.round(w / 2), y: Math.round(h / 2), deltaX: 0, deltaY: 120 }); await wait(200)
+    const z3 = await evalJs(`document.querySelector('.d-zoom img').style.transform`)
+    check(`annotation 4 (${label}): the wheel zooms in, drag pans, the wheel zooms out; no page overflow`, /scale\(2\.44/.test(z1.t) && /scale\(1\.95/.test(z3) && z1.w > fit.img[2] - fit.img[0] && z2.t !== z1.t && !/translate\(0px, 0px\)/.test(z2.t) && !z2.pageScroll, { z1, z2, z3 })
     files.push(await shot(`zoom-${label}-panned`))
     await key('Escape', 'Escape', 27); await wait(400)
     const closed = await evalJs(`({ overlay: !!document.querySelector('.d-zoom'), sheet: !!document.querySelector('.d-sheet'), focus: document.activeElement?.getAttribute('data-k'), top: Math.round(document.querySelector('.d-sheet-body').scrollTop), was: Math.round(window.__top) })`)
@@ -292,9 +328,9 @@ async function runShots(dir, wsUrl) {
     await evalJs(`(() => { const t = document.querySelector('[aria-label="New note"]'); t.value = 'count them'; t.dispatchEvent(new Event('input', { bubbles: true })) })()`)
     await s('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, modifiers: 2, text: '\r' })
     await s('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, modifiers: 2 }); await wait(700)
-    const after = await evalJs(`(() => { const dk = document.querySelector('.d-dock').getBoundingClientRect(); return { composer: !!document.querySelector('.d-nc'), panelHidden: document.querySelector('#notesPanel').hidden, mark: document.querySelector('mark.d-n')?.textContent, saved: document.querySelector('.d-note-saved')?.textContent, focus: document.activeElement?.matches('mark.d-n') ? 'mark' : document.activeElement?.getAttribute('data-k'), top: Math.round(document.querySelector('.d-sheet-body').scrollTop), was: Math.round(window.__top), state: document.querySelector('.d-state-pill').textContent, dockIn: dk.bottom <= innerHeight + 1 } })()`)
+    const after = await evalJs(`(() => { const dk = document.querySelector('.d-dock').getBoundingClientRect(); return { composer: !!document.querySelector('.d-nc'), dialog: !!document.querySelector('dialog[open]'), mark: document.querySelector('mark.d-n')?.textContent, saved: document.querySelector('.d-note-saved')?.textContent, focus: document.activeElement?.matches('mark.d-n') ? 'mark' : document.activeElement?.getAttribute('data-k'), top: Math.round(document.querySelector('.d-sheet-body').scrollTop), was: Math.round(window.__top), state: document.querySelector('.d-state-pill').textContent, dockIn: dk.bottom <= innerHeight + 1 } })()`)
     files.push(await shot(`notes-${label}-saved`))
-    check(`note composer (${label}): Ctrl+Enter saves, composer and panel close, highlight + quiet confirmation, focus on the highlighted text, scroll restored, nothing sent`, !after.composer && after.panelHidden && after.mark === 'seven views' && /Not sent yet/.test(after.saved ?? '') && after.focus === 'mark' && Math.abs(after.top - after.was) <= 2 && after.state === '● Awaiting answer' && after.dockIn, after)
+    check(`note composer (${label}): Ctrl+Enter saves, the composer closes, highlight + quiet confirmation, focus on the highlighted text, scroll restored, nothing sent`, !after.composer && !after.dialog && after.mark === 'seven views' && after.saved === 'Note saved.' && after.focus === 'mark' && Math.abs(after.top - after.was) <= 2 && after.state === '● Awaiting answer' && after.dockIn, after)
     // Image note from ✎, cancel with Esc keeps nothing; then add.
     const notesBefore = await evalJs(`document.querySelector('[data-k="notes-open"]').textContent`)
     await evalJs(`(() => { const b = document.querySelector('[data-k="fig-note-model-3"]'); b.scrollIntoView({ block: 'center' }); b.click() })()`); await wait(300)
@@ -332,6 +368,32 @@ async function runShots(dir, wsUrl) {
       check(`grouping (${label}, ${g}): labelled control in the toolbar; ${m.groups} groups, each heading closer to its rows than to the previous group`, m.inToolbar && m.label && m.value === g && m.groups >= 2 && m.counts && m.titleOnly && m.gaps.every((x) => x.after === null || x.before > x.after), m)
     }
   }
+  // Column sort: header buttons by pointer and keyboard, aria-sort, a flat table in the worker's order;
+  // Group by restores the grouped default. Below 900px a compact Sort select stands in for the headers.
+  await open('?ref=dashboard&history=1', 1280, 820)
+  await evalJs(`(() => { const s = document.querySelector('[data-k="ws-select"]'); s.value = 'all'; s.dispatchEvent(new Event('change', { bubbles: true })); document.querySelector('[data-k="tab-all"]').click() })()`); await wait(800)
+  const sortState = () => evalJs(`({ sort: [...document.querySelectorAll('thead th[aria-sort]')].map((t) => [t.textContent.replace(/[▲▼\s]/g, ''), t.getAttribute('aria-sort')]), groups: document.querySelectorAll('tr.d-group').length,
+    titles: [...document.querySelectorAll('.qrow .qt')].map((t) => t.textContent), group: document.querySelector('[data-k="group-by"]').value, focus: document.activeElement?.getAttribute('data-k'),
+    compact: getComputedStyle(document.querySelector('[data-k="sort-by"]').closest('label')).display })`)
+  const srt0 = await sortState()
+  const qh = await centre('[data-k="sort-question"]'); await pointer(qh.x, qh.y); await wait(800)
+  const srt1 = await sortState()
+  const cmp = new Intl.Collator('zh-Hant', { sensitivity: 'base', numeric: true })
+  check('sort: a pointer click on Question sorts ascending, flat, aria-sort set; no compact Sort control on desktop',
+    srt0.groups > 0 && !srt0.sort.length && srt0.compact === 'none' && JSON.stringify(srt1.sort) === '[["Question","ascending"]]' && srt1.groups === 0 && srt1.group === 'none' && JSON.stringify(srt1.titles) === JSON.stringify([...srt1.titles].sort(cmp.compare)) && srt1.titles.length === srt0.titles.length, { srt0, srt1 })
+  files.push(await shot('sort-1280-question-asc'))
+  await evalJs(`document.querySelector('[data-k="sort-question"]').focus()`); await key('Enter', 'Enter', 13, '\r'); await wait(800)
+  const srt2 = await sortState()
+  check('sort: Enter on the focused header toggles to descending; focus stays on it', JSON.stringify(srt2.sort) === '[["Question","descending"]]' && JSON.stringify(srt2.titles) === JSON.stringify([...srt1.titles].reverse()) && srt2.focus === 'sort-question', srt2)
+  await evalJs(`(() => { const s = document.querySelector('[data-k="group-by"]'); s.value = 'priority'; s.dispatchEvent(new Event('change', { bubbles: true })) })()`); await wait(800)
+  const srt3 = await sortState()
+  check('sort: choosing Group by priority restores the grouped default order', !srt3.sort.length && srt3.groups > 0 && srt3.group === 'priority' && JSON.stringify(srt3.titles) === JSON.stringify(srt0.titles), srt3)
+  await open('?ref=dashboard&history=1', 390, 844)
+  const nar0 = await evalJs(`({ heads: getComputedStyle(document.querySelector('thead')).display, compact: getComputedStyle(document.querySelector('[data-k="sort-by"]').closest('label')).display })`)
+  await evalJs(`(() => { const s = document.querySelector('[data-k="sort-by"]'); s.value = 'due:desc'; s.dispatchEvent(new Event('change', { bubbles: true })) })()`); await wait(800)
+  const nar1 = await evalJs(`({ groups: document.querySelectorAll('tr.d-group').length, group: document.querySelector('[data-k="group-by"]').value, say: document.querySelector('.d-meta-line').textContent })`)
+  files.push(await shot('sort-390-compact'))
+  check('sort (narrow-390): headers hidden, the compact Sort select sorts the same way', nar0.heads === 'none' && nar0.compact !== 'none' && nar1.groups === 0 && nar1.group === 'none' && /sorted by Due ▼/.test(nar1.say), { nar0, nar1 })
   // Resizable sheet: keyboard and pointer, limits, reset; table stays usable; narrow is full screen.
   await open('?ref=dashboard', 1280, 820)
   await evalJs(`document.querySelector('.qrow').click()`); await wait(800)
@@ -459,7 +521,7 @@ async function runShots(dir, wsUrl) {
   await wait(6000)
   const after = await evalJs(`({ reloaded: !window.__beforeReload, text: document.querySelector('[aria-label="Reply text"]')?.value })`)
   check('editing a source reloads the page and keeps the draft', after.reloaded && after.text === 'Tuesday after 3pm', after)
-  // Seven images with compare, light theme, and settings, for the record.
+  // Seven images, light theme, and settings, for the record.
   await open('?ref=image-review', 1280, 820); files.push(await shot('images-1280'))
   await open('?ref=preview-narrative&theme=light', 1280, 820); files.push(await shot('narrative-1280-light'))
   await open('?ref=dashboard&theme=light', 1280, 820); files.push(await shot('dashboard-1280-light'))

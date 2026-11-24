@@ -1,9 +1,9 @@
 import type { OrcaWorkerApi, PanelRequestContext } from 'orca/worker'
 import { decisionSourceMetadata, jsonBytes, type AgentCaller, type InboxBackend, type InboxBoundary } from './backend.ts'
 import type { CoverageNotice, OwnerCaller, SourceAvailability } from './backend-protocol.ts'
-import type { AcknowledgeReply, Decision, Priority, Workspace } from './contract.ts'
-import { clearLocalSnapshots, isLocalSnapshotId, readLocalSnapshot } from './local-snapshot.mjs'
-import { hintPattern } from './backend-local.mjs'
+import type { AcknowledgeReply, Decision, Priority, SubmitDecision, Workspace } from './contract.ts'
+import { clearLocalSnapshots, isLocalSnapshotId, readLocalSnapshot } from './local/local-snapshot.mjs'
+import { hintPattern } from './local/backend-local.mjs'
 import { InboxError, submission } from './backend-validation.ts'
 
 type Cli = (args: string[], environment?: string, runtimeId?: string) => Promise<unknown>
@@ -14,6 +14,7 @@ const text = (x: unknown, size = 4096) => typeof x === 'string' ? x.slice(0, siz
 const activityId = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/
 const marker = 'ORCA-INBOX-V1 '
 export const nativePrefix = 'bot-item:'
+export const missingStagedImage = 'A staged local image is missing or invalid. Stage it again or use a source link.'
 const localOwner = 'decision-inbox-local-desktop'
 const unavailable = (message: string) => new InboxError('unavailable', message)
 
@@ -57,7 +58,7 @@ export function localInboxBoundary(cli: Cli): InboxBoundary {
         })))
         return { participantIds: [caller.id, localOwner], snapshots }
       } catch {
-        throw new InboxError('unavailable', 'A staged local image is missing or invalid. Stage it again or use a source link.')
+        throw unavailable(missingStagedImage)
       }
     },
     async canReadSnapshot(caller, { origin, evidence }) {
@@ -107,6 +108,8 @@ async function localChatWorkspace(cli: Cli, place: RecordValue, session: string,
   return local.find(w => w.workspaceId === 'identity:' + key)
 }
 
+type ChatRecord = { op: 'submit'; input: SubmitDecision } | { op: 'ack'; input: RecordValue }
+
 async function findChatRecord(cli: Cli, session: string, op: string, lookupId: string, ack?: AcknowledgeReply) {
   const history = record(await cli(['agent', 'read', 'orca_session_id:' + session, '--limit', '20']))
   if (history.kind !== 'chat' || history.source !== 'chat' || history.orcaSessionId !== session || history.state !== 'done') return
@@ -118,7 +121,7 @@ async function findChatRecord(cli: Cli, session: string, op: string, lookupId: s
   if (!entries.some(item => item.kind === 'message' && item.role === 'user') ||
     entry?.kind !== 'message' || entry.role !== 'assistant' || typeof entry.text !== 'string' ||
     entry.text.length > 32_768 || entry.shortened === true) return
-  const matches = new Map<string, RecordValue>()
+  const matches = new Map<string, ChatRecord>()
   for (const line of entry.text.split(/\r?\n/)) {
     if (!line.startsWith(marker)) continue
     try {
@@ -126,46 +129,47 @@ async function findChatRecord(cli: Cli, session: string, op: string, lookupId: s
       const input = record(parsed.input)
       if (parsed.op !== op || (op === 'submit' ? input.requestId : input.receiptId) !== lookupId) continue
       if (ack && (input.questionId !== ack.questionId || input.replyId !== ack.replyId)) continue
-      const canonical = op === 'submit' ? submission(input) : input
-      matches.set(JSON.stringify(canonical), canonical as unknown as RecordValue)
+      const match: ChatRecord = op === 'submit' ? { op, input: submission(input) } : { op: 'ack', input }
+      matches.set(JSON.stringify(match.input), match)
     } catch { /* An incomplete or invalid record cannot authorize an operation. */ }
   }
   if (matches.size === 1) return matches.values().next().value
 }
 
-export async function processChatHint(cli: Cli, backend: InboxBackend, owner: OwnerCaller, name: string): Promise<boolean> {
+type HintOutcome = 'accepted' | 'pending-verification' | 'attachment-invalid'
+
+export async function processChatHint(cli: Cli, backend: InboxBackend, owner: OwnerCaller, name: string): Promise<HintOutcome> {
   const hint = hintPattern.exec(name)
-  if (!hint) return false
+  if (!hint) return 'pending-verification'
   const [, op, session, lookupId] = hint
   const shown = record(await cli(['agent', 'show', 'orca_session_id:' + session]))
   const places = array(shown.places)
   const place = places[0]
-  if (shown.kind !== 'chat' || shown.orcaSessionId !== session || places.length !== 1) return false
+  if (shown.kind !== 'chat' || shown.orcaSessionId !== session || places.length !== 1) return 'pending-verification'
   const workspace = await localChatWorkspace(cli, place, session, owner.workspaces)
-  if (!workspace) return false
-  const input = await findChatRecord(cli, session, op, lookupId)
-  if (!input) return false
+  if (!workspace) return 'pending-verification'
+  const match = await findChatRecord(cli, session, op, lookupId)
+  if (!match) return 'pending-verification'
   const caller: AgentCaller = { kind: 'agent', id: session, origin: {
     hostId: 'local', workspaceId: workspace.workspaceId, sessionId: session
   }, projectName: text(place.repo), workspaceName: text(place.workspace), repo: text(place.repo), policyOwnerId: localOwner }
-  if (op === 'submit') {
-    const request = submission(input)
-    if (request.questions.some(q => q.questionId.startsWith(nativePrefix))) return false
+  if (match.op === 'submit') {
+    const request = match.input
+    if (request.questions.some(q => q.questionId.startsWith(nativePrefix))) return 'pending-verification'
     const accepted = await backend.submitDecision(caller, request)
-    if (!accepted.ok && accepted.message.startsWith('A staged local image is missing or invalid.')) {
-      throw new InboxError('unavailable', accepted.message)
-    }
-    if (accepted.ok) await clearLocalSnapshots(session, lookupId, request.evidence).catch(() => {})
-    return accepted.ok
+    if (!accepted.ok) return accepted.message === missingStagedImage ? 'attachment-invalid' : 'pending-verification'
+    await clearLocalSnapshots(session, lookupId, request.evidence).catch(() => {})
+    return 'accepted'
   }
   // A transcript statement can confirm an actual submitted mail only. A locally
   // saved or failed reply cannot be promoted by a prewritten acknowledgement.
+  const input = match.input
   const decision = await backend.getDecision(caller, input)
-  if (!decision.ok || decision.value.answerState.state !== 'answered') return false
+  if (!decision.ok || decision.value.answerState.state !== 'answered') return 'pending-verification'
   const { initial, followUps } = decision.value.answerState
   const reply = [initial, ...followUps].find(r => r.replyId === input.replyId)
-  if (reply?.delivery.state !== 'submitted' || !reply.delivery.transport) return false
-  return (await backend.acknowledgeReply(caller, input)).ok
+  if (reply?.delivery.state !== 'submitted' || !reply.delivery.transport) return 'pending-verification'
+  return (await backend.acknowledgeReply(caller, input)).ok ? 'accepted' : 'pending-verification'
 }
 
 function metadata(json?: string) {
@@ -181,7 +185,7 @@ function metadata(json?: string) {
 
 type NativeHost = { id: string; label: string; selector?: string; runtimeId?: string }
 type NativeItem = { host: NativeHost; botId: string; item: RecordValue }
-type NativePage = { rows: Decision[]; source: SourceAvailability; hasPairedCoverage: boolean }
+type NativePage = { rows: Decision[]; source: SourceAvailability }
 const localHost: NativeHost = { id: 'local', label: 'Local Orca' }
 const hostLimit = 4
 
@@ -473,7 +477,7 @@ export async function nativePage(cli: Cli, workspaces: readonly Workspace[] = []
   const state = !pages.some(page => page.available) ? 'unavailable'
     : notices.length || requestedHost && attribution.length ? 'partial' : 'available'
   const coverage = [...notices, ...attribution].slice(0, 12)
-  return { rows: pages.flatMap(page => page.rows), hasPairedCoverage: hosts.some(host => host.id !== 'local'), source: {
+  return { rows: pages.flatMap(page => page.rows), source: {
     source: 'native-item', state, ...(coverage.length ? { coverage, message: coverage.map(entry => entry.message).join(' ').slice(0, 2048) } : {})
   } }
 }

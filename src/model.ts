@@ -1,6 +1,6 @@
 // Pure view-model for the Decision Inbox. No Orca imports, so FE tests and the worker can share it.
 // Types come from the shared contract; nothing here invents new domain shapes.
-import type { Decision, DecisionAction, DecisionSource, Priority, RecordedReply, Workspace } from './contract.ts'
+import type { Decision, DecisionAction, DecisionColumn, DecisionSort, DecisionSource, Priority, RecordedReply, Workspace } from './contract.ts'
 
 /** What the owner sees for a question. Four distinct states; never merged. */
 export type ShownState = 'awaiting-answer' | 'submitted' | 'agent-received' | 'undelivered' | 'local-only'
@@ -128,6 +128,43 @@ export function order(list: readonly Decision[], _now?: number, _zone?: string):
       Date.parse(a.createdAt) - Date.parse(b.createdAt) ||
       (a.questionId < b.questionId ? -1 : a.questionId > b.questionId ? 1 : 0)
   )
+}
+
+const tableCollator = new Intl.Collator('zh-Hant', { sensitivity: 'base', numeric: true })
+
+/** Display and sort use the same labels, including compact rows returned by the worker. */
+export function columnText(d: Decision, column: DecisionColumn): string {
+  const native = nativeOf(d)
+  switch (column) {
+    case 'question': return d.title
+    case 'background': return d.backgroundPreview ?? d.background.replace(/```[^]*?(```|$)/g, ' ')
+      .replace(/\[([^\]\n]+)\]\([^)\s]+\)/g, '$1').replace(/https?:\/\/\S+/g, ' ')
+      .replace(/[#*`[\]()>_~-]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160)
+    case 'priority': return d.priority
+    case 'status': return native ? nativeStatusLabel(native.itemStatus) : STATE_LABEL[shownState(d)]
+    case 'source': return native ? 'Bot Item' : isPractice(d) ? 'Practice' : 'Chat'
+    case 'workspace':
+      if (isPractice(d)) return 'Practice Inbox'
+      if (native) return native.workspaceAttributed ? d.workspaceName : 'No workspace attribution'
+      return [...new Set([d.projectName, d.workspaceName].filter(Boolean))].join(' · ')
+    case 'due': return d.deadline ?? ''
+  }
+}
+
+/** The default queue order also resolves ties when sorting on a single table column. */
+export function tableOrder(list: readonly Decision[], sort?: DecisionSort): Decision[] {
+  const rows = order(list)
+  if (!sort) return rows
+  const direction = sort.direction === 'asc' ? 1 : -1
+  const keyed = rows.map(row => ({ row, key: sort.column === 'due' ? deadlineTime(row) : columnText(row, sort.column) }))
+  return keyed.sort((a, b) => {
+    const missingA = a.key === Infinity || a.key === ''
+    const missingB = b.key === Infinity || b.key === ''
+    if (missingA || missingB) return Number(missingA) - Number(missingB)
+    const difference = typeof a.key === 'number' && typeof b.key === 'number'
+      ? a.key - b.key : tableCollator.compare(String(a.key), String(b.key))
+    return direction * difference
+  }).map(entry => entry.row)
 }
 
 /** Title, background, recommendation, options, reply text, and IDs. Case-folded; CJK matches as-is. */

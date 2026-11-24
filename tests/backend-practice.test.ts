@@ -1,9 +1,9 @@
 import { assert, hostError, mockHost, mountWorker, test } from 'orca/testing'
-import { registerDesktopWorker } from './worker.ts'
-import { InboxBackend } from './backend.ts'
-import { localInboxBoundary } from './backend-orca.ts'
-import { orcaStorage } from './backend-storage.ts'
-import type { Annotation, Result, SubmitDecision } from './contract.ts'
+import { registerDesktopWorker } from '../src/worker.ts'
+import { InboxBackend } from '../src/backend.ts'
+import { localInboxBoundary } from '../src/backend-orca.ts'
+import { orcaStorage } from '../src/backend-storage.ts'
+import type { Annotation, Result, SubmitDecision } from '../src/contract.ts'
 
 function value<T>(result: Result<T>): T {
   if (!result.ok) throw new Error(result.message)
@@ -20,7 +20,7 @@ test('practice worker seeds exactly eight questions once and persists private dr
     throw new Error('Practice must never call a live source.')
   }
   const mount = () => mountWorker({ default(orca) {
-    registerDesktopWorker(orca, { cli: failSource, hints: failSource, removeHint: failSource }, failSource)
+    registerDesktopWorker(orca, { cli: failSource, scanHints: failSource, removeHint: failSource }, failSource)
   } }, { host })
   const panel = { panel: 'inbox' }
   const unknownPanel = { panel: 'unrelated' }
@@ -95,25 +95,34 @@ test('practice worker seeds exactly eight questions once and persists private dr
 
 test('bounded hint lookup and lookup directory failure are surfaced separately from mail', async () => {
   let scanFails = false
+  let onRefreshStarted!: () => void
+  let finishRefresh!: () => void
+  const refreshStarted = new Promise<void>(resolve => { onRefreshStarted = resolve })
+  const refreshGate = new Promise<void>(resolve => { finishRefresh = resolve })
   const host = mockHost({ capabilities: ['storage:own', 'workspace:read'], results: {
     'workspace.list': { workspaces: [], truncated: false }
   } })
   const worker = await mountWorker({ default(orca) {
     registerDesktopWorker(orca, {
-      async cli(args) {
+      async cli(args, selector) {
         if (args[0] === 'environment') return { environments: [{ id: 'paired', name: 'Paired', runtimeId: 'remote' }] }
-        return { bots: [] }
+        if (args[2] === 'list') return { items: [{ uid: 'request', title: 'Question', status: 'needs_you' }] }
+        return { bots: selector ? [] : [{ id: 'bot' }] }
       },
-      async hints() { throw new Error('Use the scanner reporting the limit.') },
       async scanHints() {
-        if (scanFails) throw new Error('Cannot inspect directory')
+        if (scanFails) {
+          onRefreshStarted()
+          await refreshGate
+          throw new Error('Cannot inspect directory')
+        }
         return { names: [], truncated: true }
       },
       async removeHint() {}
     })
   } }, { host })
   try {
-    const page = async () => value(await worker.request('listDecisionPage', { scope: { kind: 'all' }, includeHistory: false }, { panel: 'inbox' }))
+    const page = async (cursor?: string) => value(await worker.request('listDecisionPage',
+      { scope: { kind: 'all' }, includeHistory: false, cursor }, { panel: 'inbox' }))
     const limited = await page()
     const coverage = limited.sources?.find(source => source.source === 'plugin')
     assert.equal(coverage?.state, 'partial')
@@ -121,7 +130,13 @@ test('bounded hint lookup and lookup directory failure are surfaced separately f
     assert.match(coverage?.message ?? '', /scan limit/)
     assert.equal(limited.mail?.state, 'unavailable')
     scanFails = true
-    const failure = (await page()).sources?.find(source => source.source === 'plugin')
+    const refreshing = page()
+    await refreshStarted
+    try {
+      const next = await page(limited.rows[0].questionId)
+      assert.deepEqual(next.sources?.find(source => source.source === 'plugin'), coverage)
+    } finally { finishRefresh() }
+    const failure = (await refreshing).sources?.find(source => source.source === 'plugin')
     assert.deepEqual(failure?.coverage?.map(notice => notice.kind), ['hint-read-failed'])
     assert.match(failure?.message ?? '', /could not read the local Chat lookup directory/)
     assert.ok(!failure?.message?.includes('Paired Chat'))
@@ -167,7 +182,7 @@ test('a historical live and a practice question sharing the same literal ID rema
   const references: unknown[] = []
   const worker = await mountWorker({ default(orca) {
     backend = registerDesktopWorker(orca, {
-      cli, async hints() { hintCalls++; return [] }, async removeHint() {}
+      cli, async scanHints() { hintCalls++; return { names: [], truncated: false } }, async removeHint() {}
     }, async (_root, reference) => {
       references.push(reference)
       return '.orca-decision-inbox/test.orca-decision'

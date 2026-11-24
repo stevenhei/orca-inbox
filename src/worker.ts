@@ -4,24 +4,32 @@ import type { InboxBoundary } from './backend.ts'
 import { orcaStorage } from './backend-storage.ts'
 import type { Decision } from './contract.ts'
 import type { CoverageNotice, DecisionTarget, OwnerCaller, SourceAvailability } from './backend-protocol.ts'
-import { hints, localOrca, removeHint, scanHints, writeReference } from './backend-local.mjs'
-import { desktopOwner, localInboxBoundary, nativeDetail, nativePage, nativePrefix, processChatHint, requireDesktopInbox } from './backend-orca.ts'
+import { localOrca, removeHint, scanHints, writeReference } from './local/backend-local.mjs'
+import { desktopOwner, localInboxBoundary, missingStagedImage, nativeDetail, nativePage, nativePrefix, processChatHint, requireDesktopInbox } from './backend-orca.ts'
+import { workspaceLabel } from './workspace-scope.ts'
 import { createPractice, practiceOwner } from './backend-practice.ts'
 import { id, InboxError, object } from './backend-validation.ts'
 
 type Reference = { questionId: string } | { view: 'settings' }
+
+type LocalSources = {
+  cli: typeof localOrca
+  scanHints: typeof scanHints
+  removeHint: typeof removeHint
+}
 
 export interface WorkerBoundary {
   // Resolve plugin-local desktop scope from the host-supplied request context.
   resolveOwner(context: PanelRequestContext): Promise<OwnerCaller>
   native: InboxBoundary
   openReference(caller: OwnerCaller, reference: Reference): Promise<void>
-  localSources?: {
-    cli: typeof localOrca
-    hints: typeof hints
-    scanHints?: typeof scanHints
-    removeHint: typeof removeHint
-  }
+  localSources?: LocalSources
+}
+
+function namedNativeRow(caller: OwnerCaller, decision: Decision): Decision {
+  if (decision.source?.kind !== 'native-item' || !decision.source.workspaceAttributed) return decision
+  const name = workspaceLabel(decision.origin, caller.workspaceOptions?.workspaces ?? [])
+  return { ...decision, workspaceName: name }
 }
 
 function localActions(decision: Decision): Decision {
@@ -68,6 +76,28 @@ function navigationError(stage: NavigationStage, error: unknown): NavigationErro
 async function navigationStep<T>(stage: NavigationStage, work: () => T | Promise<T>): Promise<T> {
   try { return await work() }
   catch (error) { throw navigationError(stage, error) }
+}
+
+async function readHintCoverage(local: LocalSources, backend: InboxBackend, caller: OwnerCaller): Promise<CoverageNotice[]> {
+  try {
+    const { names, truncated } = await local.scanHints()
+    const outcomes = await Promise.all(names.map(async name => {
+      try {
+        const outcome = await processChatHint(local.cli, backend, caller, name)
+        if (outcome === 'accepted') await local.removeHint(name)
+        return outcome
+      } catch { return 'pending-verification' }
+    }))
+    const notices: CoverageNotice[] = []
+    if (outcomes.includes('pending-verification')) notices.push({ kind: 'pending-verification',
+      message: 'Some local Chat lookup hints could not be verified. Inbox checks a bounded recent exchange; the Chat may still be running, inaccessible, or the submitted marker may no longer be in that exchange.' })
+    if (truncated) notices.push({ kind: 'hint-scan-limited',
+      message: 'The local Chat lookup reached its scan limit. More requests may be waiting for a later refresh.' })
+    if (outcomes.includes('attachment-invalid')) notices.push({ kind: 'attachment-invalid', message: missingStagedImage })
+    return notices
+  } catch {
+    return [{ kind: 'hint-read-failed', message: 'Inbox could not read the local Chat lookup directory.' }]
+  }
 }
 
 export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
@@ -168,34 +198,12 @@ export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
   }))
 
   const local = boundary.localSources
-  let intake: Promise<boolean> | undefined
-  let hintsPending = false
-  let attachmentPending = false
-  let hintsTruncated = false
-  let hintScanFailed = false
-  const syncHints = (caller: OwnerCaller) => {
-    if (!local) return Promise.resolve(false)
-    return intake ??= (async () => {
-      let pending = false
-      attachmentPending = false
-      hintsTruncated = false
-      hintScanFailed = false
-      try {
-        const { names, truncated } = local.scanHints ? await local.scanHints() : { names: await local.hints(), truncated: false }
-        hintsTruncated = truncated
-        await Promise.all(names.map(async name => {
-          try {
-            if (await processChatHint(local.cli, backend, caller, name)) await local.removeHint(name)
-            else pending = true
-          } catch (error) {
-            if (error instanceof InboxError && error.message.startsWith('A staged local image is missing or invalid.')) attachmentPending = true
-            else pending = true
-          }
-        }))
-      } catch { hintScanFailed = true }
-      hintsPending = pending
-      return pending
-    })().finally(() => { intake = undefined })
+  let lastHintCoverage: CoverageNotice[] = []
+  let hintScan: Promise<CoverageNotice[]> | undefined
+  function refreshHints(local: LocalSources, caller: OwnerCaller) {
+    return hintScan ??= readHintCoverage(local, backend, caller)
+      .then(notices => lastHintCoverage = notices)
+      .finally(() => { hintScan = undefined })
   }
 
   orca.panels.handle('listDecisionPage', (input, context) => withOwner(context, async caller => {
@@ -207,23 +215,15 @@ export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
     }
     if (!local) return backend.listDecisionPage(caller, input)
     const remoteScope = Boolean(host && host !== 'local')
-    const [pending, native] = await Promise.all([
-      remoteScope ? false : input?.cursor ? hintsPending : syncHints(caller),
+    const [hintCoverage, native] = await Promise.all([
+      remoteScope ? [] : input?.cursor ? lastHintCoverage : refreshHints(local, caller),
       nativePage(local.cli, caller.workspaces, host)
     ])
-    const page = await backend.listDecisionPage(caller, input, native.rows)
-    const remoteGap = 'Paired Chat submissions cannot be read yet. The local lookup hint is not exposed by Orca’s paired CLI.'
-    const coverage: CoverageNotice[] = []
-    if (pending) coverage.push({ kind: 'pending-verification',
-      message: 'Some local Chat lookup hints could not be verified. Inbox checks a bounded recent exchange; the Chat may still be running, inaccessible, or the submitted marker may no longer be in that exchange.' })
-    if (!remoteScope && hintsTruncated) coverage.push({ kind: 'hint-scan-limited',
-      message: 'The local Chat lookup reached its scan limit. More requests may be waiting for a later refresh.' })
-    if (!remoteScope && hintScanFailed) coverage.push({ kind: 'hint-read-failed',
-      message: 'Inbox could not read the local Chat lookup directory.' })
-    if (!remoteScope && attachmentPending) coverage.push({ kind: 'attachment-invalid',
-      message: 'A staged local image is missing or invalid. Stage it again or use a source link.' })
+    const page = await backend.listDecisionPage(caller, input, native.rows.map(row => namedNativeRow(caller, row)))
+    const coverage = [...hintCoverage]
     if (remoteScope || (!host && caller.workspaces.some(workspace => workspace.hostId !== 'local'))) {
-      coverage.push({ kind: 'paired-unreadable', message: remoteGap })
+      coverage.push({ kind: 'paired-unreadable',
+        message: 'Paired Chat submissions cannot be read yet. The local lookup hint is not exposed by Orca’s paired CLI.' })
     }
     const plugin: SourceAvailability = {
       source: 'plugin', state: remoteScope ? 'unavailable' : coverage.length ? 'partial' : 'available',
@@ -239,7 +239,7 @@ export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
   async function readDecision(caller: OwnerCaller, input: { questionId: string }) {
     const questionId = input?.questionId
     if (local && typeof questionId === 'string' && questionId.startsWith(nativePrefix)) {
-      return result(() => nativeDetail(local.cli, questionId, caller.workspaces))
+      return result(async () => namedNativeRow(caller, await nativeDetail(local.cli, questionId, caller.workspaces)))
     }
     const decision = await backend.getDecision(caller, input)
     return local && decision.ok ? { ...decision, value: localActions(decision.value) } : decision
@@ -276,7 +276,7 @@ export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
 
 export function registerDesktopWorker(
   orca: OrcaWorkerApi,
-  localSources: NonNullable<WorkerBoundary['localSources']> = { cli: localOrca, hints, scanHints, removeHint },
+  localSources: LocalSources = { cli: localOrca, scanHints, removeHint },
   createReference = writeReference
 ) {
   return registerWorker(orca, {

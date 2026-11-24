@@ -34,8 +34,8 @@ const run = (input = manifest) => child(`
 await fs.writeFile(image, Buffer.from(pixel, 'base64'))
 os.homedir = () => root
 syncBuiltinESMExports()
-const { hints } = await import('./backend-local.mjs')
-const { readLocalSnapshot, clearLocalSnapshots } = await import('./local-snapshot.mjs')
+const { scanHints } = await import('../src/local/backend-local.mjs')
+const { readLocalSnapshot, clearLocalSnapshots } = await import('../src/local/local-snapshot.mjs')
 os.homedir = originalHome
 syncBuiltinESMExports()
 
@@ -82,7 +82,7 @@ for (const part of ['hint', 'ready']) {
     }
     syncBuiltinESMExports()
     try {
-      const fresh = await hints()
+      const { names: fresh } = await scanHints()
       assert.ok(intercepted)
       assert.ok(fresh.includes(key))
       assert.ok(!fresh.includes(control))
@@ -118,7 +118,7 @@ for (const part of ['hint', 'ready']) {
       return rm(path, ...args)
     }
     syncBuiltinESMExports()
-    try { await hints() }
+    try { await scanHints() }
     finally {
       fs.rm = rm
       syncBuiltinESMExports()
@@ -127,7 +127,7 @@ for (const part of ['hint', 'ready']) {
     const retry = run()
     assert.equal(retry.status, 0, retry.stderr)
     assert.equal(retry.stdout, marker)
-    assert.ok((await hints()).includes(key))
+    assert.ok((await scanHints()).names.includes(key))
     assert.equal((await readLocalSnapshot(session, requestId, claim)).base64, pixel)
   })
 }
@@ -136,13 +136,13 @@ test('a publisher can recover the same lock after its owner exits in the critica
   const requestId = 'crashed-owner'
   const key = keyFor(requestId)
   const crashed = child(`
-    const { privateHintDirectory } = await import(${JSON.stringify(new URL('./backend-local.mjs', import.meta.url).href)})
-    const { withSubmissionLock } = await import(${JSON.stringify(new URL('./submission-lock.mjs', import.meta.url).href)})
+    const { privateHintDirectory } = await import(${JSON.stringify(new URL('../src/local/backend-local.mjs', import.meta.url).href)})
+    const { withSubmissionLock } = await import(${JSON.stringify(new URL('../src/local/submission-lock.mjs', import.meta.url).href)})
     await withSubmissionLock(await privateHintDirectory(true), ${JSON.stringify(key)}, 0, () => process.exit(17))
   `)
   assert.equal(crashed.status, 17, crashed.stderr)
   assert.ok((await fs.readdir(dir)).includes('.lock.' + key))
   await stage(requestId)
   assert.ok(!(await fs.readdir(dir)).includes('.lock.' + key))
-  assert.ok((await hints()).includes(key))
+  assert.ok((await scanHints()).names.includes(key))
 })

@@ -34,9 +34,11 @@ Put the emitted line in the Chat's visible assistant response, then open or refr
 | [orca-plugin.json](orca-plugin.json) | Sidebar, worker, and isolated custom editor contributions |
 | [Sidebar](src/panel.tsx), [worker](src/worker.ts), [review](src/review.ts) | Minimal Orca entry points |
 | [Shared contract](src/contract.ts) | Domain, operation shapes, origin, and delivery states |
+| [Local host modules](src/local/), [agent CLI](agent/decision-inbox/inbox.mjs) | Node modules for local Orca commands, editor references and the files the CLI stages for the worker |
 | [Fixtures](fixtures/decisions.ts), [sample review file](fixtures/scaffold.orca-decision) | Synthetic cases and a custom editor sample |
-| [Scaffold checks](src/scaffold.test.ts), [TS config](tsconfig.json) | Local panel and fixture tests and strict TypeScript config |
+| [Plugin tests](tests/), [TS config](tsconfig.json) | Worker, panel, model and local file tests discovered by `orca plugin test .` |
 | [FE design handoff](docs/design-handoff.md) | Interaction decisions, state representations, acceptance coverage, open assumptions |
+| [Editor styles](src/editor/styles.ts) | Layout and host theme rules for the sheet, table, dialogs and image overlay |
 | [View-model](src/model.ts), [DOM tests](scripts/dom-smoke.mjs) | Shared sort, search and scope logic; editor tests (`npm run test:dom`) |
 
 ## Local validation
