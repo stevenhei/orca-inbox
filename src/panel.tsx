@@ -1,12 +1,13 @@
 import {
   atom, read, set, on, plugin,
-  Badge, Button, Callout, Checkbox, EmptyState, Heading, IconButton, Input, List,
-  ListItem, RadioGroup, Row, Skeleton, Stack, Text
+  Badge, Button, Callout, Card, Checkbox, EmptyState, Heading, IconButton, Input, KeyValue, List,
+  ListItem, RadioGroup, Row, Select, Skeleton, Stack, Text, Textarea
 } from 'orca'
 import type { PanelContext } from 'orca'
-import type { Decision, Workspace } from './contract.ts'
-import { STATE_LABEL, actionsOf, deadlineLabel, isActionable, nativeNeedsYou, nativeOf, nativeStatusLabel, order, sameWorkspace, shownState, siblings, undeliveredReplies } from './model.ts'
-import { call, clock, failureText, sourcesOf, type Failure, type Requester, type SourceStatus } from './client.ts'
+import type { Answer, Decision, Delivery, RecordedReply, SubmitReply, Workspace } from './contract.ts'
+import type { InboxSettings } from './backend-protocol.ts'
+import { STATE_LABEL, actionsOf, deadlineLabel, replyState, isActionable, nativeNeedsYou, nativeOf, nativeStatusLabel, order, sameWorkspace, shownState, siblings, undeliveredReplies } from './model.ts'
+import { call, clock, draftIsEmpty, emptyDraft, failureText, formatInstant, newReplyId, reconcile, replies, sourcesOf, transportOf, type Draft, type Failure, type Requester, type SourceStatus } from './client.ts'
 import type { DecisionPage } from './backend-protocol.ts'
 type MailStatus = NonNullable<DecisionPage['mail']>
 
@@ -28,7 +29,6 @@ const term = atom('')
 const history = atom(false)
 /** The decision whose review tab the worker last opened, by question ID. Set only on success. */
 const openId = atom<string | null>(null)
-const openError = atom<{ title: string; text: string } | null>(null)
 /** Focused workspace: undefined while unknown, null when none is focused or it cannot be resolved. */
 const current = atom<Workspace | null | undefined>(undefined)
 const focusError = atom<string | null>(null)
@@ -164,17 +164,229 @@ function toggleHistory(v: boolean) {
   void load()
 }
 
-async function openReview(d: Decision) {
-  set(openError, null)
-  const r = await call(req, 'review.open', { questionId: d.questionId })
-  if (r.ok) set(openId, d.questionId)
-  else set(openError, { title: 'Could not open the review tab', text: failureText(r) })
+// ---- in-panel navigation ------------------------------------------------------------------------
+// A row or the gear opens its view inside the panel at once, read through the authorized worker
+// requests (getDecision, drafts, submitReply, settings.*). The wide editor tab is optional: if
+// Orca cannot open it, that failure is reported as a wide-tab problem only. Every async answer is
+// tagged with the navigation it belongs to, so a stale answer can never land on another view.
+type View = { kind: 'list' } | { kind: 'decision'; questionId: string; title: string } | { kind: 'settings' }
+type Loadable<T> = { state: 'loading' } | { state: 'ok'; value: T } | { state: 'fail'; f: Failure }
+type Notice = { tone: 'neutral' | 'warning' | 'danger'; text: string; retry?: boolean; reload?: boolean }
+const view = atom<View>({ kind: 'list' })
+let nav = 0
+const detail = atom<Loadable<Decision>>({ state: 'loading' })
+/** The wide tab for the current view only: opening, opened, or why Orca did not open it. */
+const wide = atom<{ nav: number; state: 'opening' | 'opened' | 'failed'; text?: string } | null>(null)
+
+function openDecision(d: Decision) {
+  void flushDraft()
+  const mine = ++nav
+  set(view, { kind: 'decision', questionId: d.questionId, title: d.title })
+  set(openId, d.questionId)
+  set(detail, { state: 'loading' }); set(wide, null); resetCompose(d.questionId)
+  void loadDetail(mine, d.questionId)
+}
+async function loadDetail(mine: number, questionId: string, passive = false) {
+  const r = await call(req, 'getDecision', { questionId })
+  if (mine !== nav) return // the owner moved on: never overwrite another view
+  if (!r.ok && passive && read(detail).state === 'ok') return // a failed refresh keeps the shown detail
+  set(detail, r.ok ? { state: 'ok', value: r.value } : { state: 'fail', f: r })
+  if (r.ok && !nativeOf(r.value)) await loadDraft(mine, r.value)
+}
+function back() {
+  void flushDraft()
+  nav++
+  set(view, { kind: 'list' }); set(wide, null)
+}
+async function openWide() {
+  const v = read(view); const mine = nav
+  if (v.kind === 'list') return
+  set(wide, { nav: mine, state: 'opening' })
+  const r = v.kind === 'settings' ? await call(req, 'settings.open') : await call(req, 'review.open', { questionId: v.questionId })
+  if (mine !== nav) return
+  set(wide, r.ok ? { nav: mine, state: 'opened' } : { nav: mine, state: 'failed', text: failureText(r) })
 }
 
-async function openSettings() {
-  set(openError, null)
-  const r = await call(req, 'settings.open')
-  if (!r.ok) set(openError, { title: 'Could not open Inbox settings', text: failureText(r) })
+// ---- Chat decision reply in the panel (same semantics as the wide review) -----------------------
+const cDraft = atom<Draft>(emptyDraft())
+const cMeta = atom<{ questionId: string | null; revision: number | null; loaded: boolean }>({ questionId: null, revision: null, loaded: false })
+const cFail = atom<Failure | null>(null)
+const cNotice = atom<Notice | null>(null)
+const cSending = atom(false)
+let saveTimer: ReturnType<typeof setTimeout> | null = null
+let saving: Promise<unknown> = Promise.resolve()
+
+function resetCompose(questionId: string) {
+  set(cDraft, emptyDraft()); set(cMeta, { questionId, revision: null, loaded: false })
+  set(cFail, null); set(cNotice, null); set(cSending, false)
+}
+async function loadDraft(mine: number, d: Decision) {
+  if (read(cMeta).loaded && read(cMeta).questionId === d.questionId) return reconcileDraft(d)
+  const r = await call(req, 'draft.get', { questionId: d.questionId })
+  if (mine !== nav) return
+  if (r.ok) { set(cDraft, r.value.draft ?? emptyDraft()); set(cMeta, { questionId: d.questionId, revision: r.value.revision, loaded: true }); set(cFail, null) }
+  else { set(cMeta, { questionId: d.questionId, revision: null, loaded: true }); set(cFail, r) }
+  reconcileDraft(d)
+}
+/** By reply ID: a recorded attempt clears the draft; a lost initial answer is kept, never converted. */
+function reconcileDraft(d: Decision) {
+  const draft = read(cDraft)
+  const attempted = draft.replyId
+  const rec = reconcile(draft, d)
+  if (rec.kind === 'sent') {
+    const r = replies(d).find((x) => x.replyId === attempted)!
+    set(cDraft, emptyDraft()); void saveDraftNow()
+    set(cNotice, { tone: 'neutral', text: `Your ${r.kind === 'initial' ? 'answer' : 'follow-up'} was recorded (reply ID ${r.replyId}). ${deliveryText(r, d)}` })
+  } else if (rec.kind === 'superseded' && !read(cNotice)) {
+    set(cNotice, { tone: 'warning', text: 'Another answer was recorded first, so yours was not sent. Your unsent answer is kept; nothing else is sent unless you choose to.' })
+  }
+}
+function editDraft(patch: Partial<Draft>) {
+  const d = read(detail)
+  const cur = { ...read(cDraft), ...patch }
+  if (!cur.kind && d.state === 'ok') cur.kind = d.value.answerState.state === 'answered' ? 'follow-up' : 'initial'
+  set(cDraft, cur)
+  if (saveTimer) clearTimeout(saveTimer)
+  saveTimer = setTimeout(() => { saveTimer = null; void saveDraftNow() }, 400)
+}
+/** Compare-and-set save for the draft's own question; resolves true only when durable. */
+function saveDraftNow(): Promise<boolean> {
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null }
+  const meta = read(cMeta)
+  const questionId = meta.questionId
+  if (!questionId || !meta.loaded) return saving.then(() => false)
+  const draft = read(cDraft)
+  const value: Draft | null = draftIsEmpty(draft) && !draft.replyId ? null : draft
+  const p = saving.then(async (): Promise<boolean> => {
+    let revision = read(cMeta).questionId === questionId ? read(cMeta).revision : null
+    if (revision === null) {
+      const g = await call(req, 'draft.get', { questionId })
+      if (!g.ok) { if (read(cMeta).questionId === questionId) set(cFail, g); return false }
+      revision = g.value.revision
+    }
+    const r = await call(req, 'draft.save', { questionId, draft: value, revision })
+    const here = read(cMeta).questionId === questionId
+    if (r.ok) { if (here) { set(cMeta, { ...read(cMeta), revision: r.value.revision }); set(cFail, null) }; return true }
+    if (here && r.code === 'conflict') {
+      const g = await call(req, 'draft.get', { questionId })
+      if (g.ok && read(cMeta).questionId === questionId) {
+        set(cDraft, g.value.draft ?? emptyDraft()); set(cMeta, { ...read(cMeta), revision: g.value.revision })
+        set(cNotice, { tone: 'warning', text: 'This draft was changed in another tab or window, so your latest edit was not saved. The saved draft is shown.' })
+      }
+      return false
+    }
+    if (here) set(cFail, r)
+    return false
+  })
+  saving = p.catch(() => false)
+  return p
+}
+const flushDraft = () => (saveTimer ? saveDraftNow() : saving)
+
+function heldInitial(d: Decision, draft: Draft) {
+  return d.answerState.state === 'answered' && (draft.kind ?? 'initial') === 'initial' && !draftIsEmpty(draft)
+}
+function buildAnswer(d: Decision, draft: Draft): Answer | null {
+  const text = draft.text.trim()
+  if (d.answerState.state !== 'answered' && draft.optionId && d.options.some((o) => o.optionId === draft.optionId))
+    return { kind: 'option', optionId: draft.optionId, ...(text ? { detail: text } : {}) }
+  return text ? { kind: 'text', text } : null
+}
+/** Sends against the decision as shown, with a reply ID saved durably first. */
+async function send() {
+  const shown = read(detail); const mine = nav
+  if (shown.state !== 'ok' || read(cSending)) return
+  const d = shown.value
+  const draft = read(cDraft)
+  const kind: SubmitReply['kind'] = d.answerState.state === 'answered' ? 'follow-up' : 'initial'
+  if (!actionsOf(d).includes(kind === 'initial' ? 'reply' : 'follow-up')) return
+  if (heldInitial(d, draft)) return
+  const answer = buildAnswer(d, draft)
+  if (!answer) { set(cNotice, { tone: 'warning', text: kind === 'initial' ? 'Choose an option or write a reply first.' : 'Write a follow-up first.' }); return }
+  if (draft.annotations.some((n) => !n.text.trim())) {
+    set(cNotice, { tone: 'danger', text: 'A note from the wide review is empty. Open the wide review to fix or remove it, then send again.' }); return
+  }
+  set(cSending, true); set(cNotice, null)
+  const replyId = draft.replyId && draft.kind === kind ? draft.replyId : newReplyId()
+  set(cDraft, { ...draft, replyId, kind })
+  const annotations = draft.annotations.map((n) => ({ ...n, text: n.text.trim() }))
+  if (!(await saveDraftNow())) {
+    set(cSending, false)
+    if (mine === nav && !read(cNotice)) set(cNotice, { tone: 'danger', retry: true, text: 'Not sent. This reply attempt could not be saved first, so a later retry could not reuse its reply ID.' })
+    return
+  }
+  const r = await call(req, 'submitReply', { questionId: d.questionId, replyId, kind, answer, annotations })
+  set(cSending, false)
+  if (mine !== nav) return
+  if (r.ok && r.value.replyId === replyId) {
+    set(cDraft, emptyDraft()); void saveDraftNow()
+    set(cNotice, { tone: 'neutral', text: `Your ${kind === 'initial' ? 'answer' : 'follow-up'} was recorded (reply ID ${replyId}). ${deliveryText(r.value, d)}` })
+  } else if (r.ok) {
+    const { replyId: _id, ...rest } = read(cDraft); set(cDraft, rest); void saveDraftNow()
+    set(cNotice, { tone: 'warning', text: 'Another answer was recorded first, so yours was not sent. The recorded answer is shown below. Your unsent answer is kept; nothing else is sent unless you choose to.' })
+  } else if (r.code === 'conflict') {
+    const { replyId: _id, ...rest } = read(cDraft); set(cDraft, rest); void saveDraftNow()
+    set(cNotice, { tone: 'warning', text: `Reply ID ${replyId} could not be used because a different reply was already recorded. The recorded answer is shown below; your text is kept.` })
+  } else if (r.code === 'unavailable') {
+    set(cNotice, { tone: 'danger', retry: true, text: `Not confirmed. ${failureText(r)} The reply may or may not have been recorded. Your draft and reply ID ${replyId} are kept; Retry sends the same reply ID, so it is recorded at most once.` })
+  } else {
+    set(cNotice, { tone: 'danger', retry: true, text: `Not sent. ${failureText(r)} Your draft and reply ID are kept.` })
+  }
+  await loadDetail(mine, d.questionId, true)
+}
+
+const REASON: Record<Extract<Delivery, { state: 'undelivered' }>['reason'], string> = {
+  'closed-origin': 'The original chat is closed.',
+  disconnected: 'The host is disconnected.',
+  'origin-mismatch': 'The chat no longer matches the original origin.',
+  'delivery-failed': 'Orca could not hand it to that chat.'
+}
+const when = (iso: string) => formatInstant(iso, clock.zone())
+function deliveryText(r: RecordedReply, d: Decision): string {
+  const state = replyState(r, d)
+  if (state === 'agent-received' && r.delivery.state === 'agent-received') return `Agent received · receipt ${r.delivery.receipt.receiptId} · ${when(r.delivery.receipt.receivedAt)}.`
+  if (r.delivery.state === 'undelivered') return `Saved in Decision Inbox, but not delivered to the original chat. ${REASON[r.delivery.reason]}${actionsOf(d).includes('retry') ? ' Retry it from the wide review.' : ' Retry is not available here; paste the reply into that chat yourself if it is needed now.'}`
+  const t = transportOf(r.delivery)
+  return t ? `Mail submitted to the original chat at ${when(t.acceptedAt)} (message ${t.messageId}); waiting for that chat to acknowledge it.`
+    : 'Saved; mail hand-off to the original chat is not reported yet.'
+}
+function answerText(a: Answer, d: Decision) {
+  if (a.kind === 'text') return a.text
+  const label = d.options.find((o) => o.optionId === a.optionId)?.label ?? a.optionId
+  return a.detail ? `${label} — ${a.detail}` : label
+}
+
+// ---- Inbox Settings in the panel ----------------------------------------------------------------
+const sLoad = atom<Loadable<InboxSettings>>({ state: 'loading' })
+const sEdit = atom<InboxSettings | null>(null)
+const sSaved = atom('')
+const sRepos = atom<string[]>([])
+const sNotice = atom<Notice | null>(null)
+const editable = (x: InboxSettings) => JSON.stringify({ defaultTemplate: x.defaultTemplate, exceptions: x.exceptions })
+
+function openSettingsView() {
+  void flushDraft()
+  const mine = ++nav
+  set(view, { kind: 'settings' }); set(wide, null); set(sNotice, null)
+  void loadSettingsView(mine)
+}
+async function loadSettingsView(mine: number) {
+  set(sLoad, { state: 'loading' })
+  const [g, rp] = await Promise.all([call(req, 'settings.get'), call(req, 'settings.repos')])
+  if (mine !== nav) return
+  if (!g.ok) { set(sLoad, { state: 'fail', f: g }); return }
+  set(sLoad, { state: 'ok', value: g.value }); set(sEdit, structuredClone(g.value)); set(sSaved, editable(g.value))
+  set(sRepos, rp.ok ? rp.value : [])
+  if (!rp.ok) set(sNotice, { tone: 'warning', text: `Could not read the repo list, so exceptions cannot be added. ${failureText(rp)}` })
+}
+async function saveSettingsView() {
+  const s = read(sEdit); const mine = nav
+  if (!s || !s.defaultTemplate.trim() || editable(s) === read(sSaved)) return
+  const r = await call(req, 'settings.save', s)
+  if (mine !== nav) return
+  if (r.ok) { set(sEdit, structuredClone(r.value)); set(sSaved, editable(r.value)); set(sLoad, { state: 'ok', value: r.value }); set(sNotice, { tone: 'neutral', text: 'Settings saved.' }) }
+  else if (r.code === 'conflict') set(sNotice, { tone: 'danger', reload: true, text: 'Settings changed elsewhere since you opened them, so nothing was saved. Load the latest settings (your edits are discarded), then edit again.' })
+  else set(sNotice, { tone: 'danger', text: `Not saved. ${failureText(r)}` })
 }
 
 export function setup(ctx: PanelContext) {
@@ -182,11 +394,19 @@ export function setup(ctx: PanelContext) {
     // Each new subscriber first receives the current context.
     on('workspace.changed', ({ context }) => { void focus(context) }),
     // Empty invalidation: refetch through the authenticated request.
-    plugin.on('inbox.changed', invalidated)
+    plugin.on('inbox.changed', () => {
+      invalidated()
+      // The open card follows its decision (receipts, another surface's answer); a failure keeps it.
+      const v = read(view)
+      if (v.kind === 'decision') void loadDetail(nav, v.questionId, true)
+    })
   )
   set(now, clock.now())
   const tick = setInterval(() => set(now, clock.now()), 60_000)
-  ctx.signal.addEventListener('abort', () => { clearInterval(tick); if (searchTimer) clearTimeout(searchTimer); if (refreshTimer) clearTimeout(refreshTimer) })
+  ctx.signal.addEventListener('abort', () => {
+    clearInterval(tick); if (searchTimer) clearTimeout(searchTimer); if (refreshTimer) clearTimeout(refreshTimer)
+    void flushDraft() // never lose a draft when the panel closes
+  })
   // `all` needs no focused workspace; load it now in case the panel starts there.
   if (read(scope) === 'all') void load()
 }
@@ -210,7 +430,7 @@ function DecisionRow(props: { d: Decision; all: readonly Decision[]; at: number;
       title={d.title}
       description={native ? `${item ? `${item} · ` : ''}${where}` : where}
       current={read(openId) === d.questionId}
-      onPress={() => openReview(d)}
+      onPress={() => openDecision(d)}
     >
       <Row gap="xs" wrap>
         {/* The source is text, not color, so it reads the same to everyone. */}
@@ -262,12 +482,203 @@ function MailNotice(props: { mail?: MailStatus }) {
   if (props.mail?.state !== 'unavailable') return null
   return (
     <Callout tone="neutral" title="Answers are saved, not delivered yet">
-      {`Answers to Chat decisions are saved in Decision Inbox. Orca mail from this plugin is unavailable on this host, so saved answers are not delivered to the chat yet.${props.mail.message ? ` ${props.mail.message}` : ''}`}
+      {/* One statement: the worker's message alone when it already says answers are saved, else
+          ours followed by the worker's detail. Never the same sentence twice. */}
+      {props.mail.message && /saved in Decision Inbox/i.test(props.mail.message) ? props.mail.message
+        : `Answers to Chat decisions are saved in Decision Inbox. Orca mail from this plugin is unavailable on this host, so saved answers are not delivered to the chat yet.${props.mail.message ? ` ${props.mail.message}` : ''}`}
     </Callout>
   )
 }
 
+// ---- in-panel views -------------------------------------------------------------------------------
+function WideNotice(props: { what: string }) {
+  const w = read(wide)
+  if (!w || w.nav !== nav) return null
+  if (w.state === 'opening') return <Text muted size="xs">Opening the wide tab…</Text>
+  if (w.state === 'opened') return <Text muted size="xs">Opened in a wide tab.</Text>
+  return (
+    <Callout tone="warning" title="The wide tab did not open">
+      {`${w.text ?? ''} Only the wide tab failed; ${props.what} below ${props.what === 'settings' ? 'are' : 'is'} read from Decision Inbox and works here.`}
+    </Callout>
+  )
+}
+function ViewHeader(props: { title: string; wideLabel: string }) {
+  return (
+    <Stack gap="xs">
+      <Row justify="between" align="center">
+        <Button size="sm" variant="ghost" onPress={back}>← Back to list</Button>
+        <Button size="sm" variant="outline" icon="open-external" disabled={read(wide)?.state === 'opening'} onPress={openWide}>{props.wideLabel}</Button>
+      </Row>
+      <Heading level={2}>{props.title}</Heading>
+    </Stack>
+  )
+}
+const NOTICE_TITLE: Record<Notice['tone'], string> = { neutral: 'Recorded', warning: 'Check before you continue', danger: 'Not sent' }
+
+function NativeDetail(props: { d: Decision }) {
+  const { d } = props
+  const n = nativeOf(d)!
+  const item = [n.botName && `bot “${n.botName}”`, n.itemLabel && `item ${n.itemLabel}`].filter(Boolean).join(', ')
+  return (
+    <Stack gap="sm">
+      <Row gap="xs" wrap>
+        <Badge tone="neutral">Bot Item · read-only</Badge>
+        <Badge tone={nativeNeedsYou(n) ? 'accent' : 'neutral'}>{nativeStatusLabel(n.itemStatus)}</Badge>
+        <Badge tone={d.priority === 'P0' ? 'danger' : 'neutral'}>{d.priority}</Badge>
+      </Row>
+      <Callout tone="neutral" title="Where to answer">
+        {`Answer this in Orca's Bot Items${item ? `: ${item}` : ''}. Decision Inbox shows a read-only copy and cannot answer, resolve or open this item for you.`}
+      </Callout>
+      <KeyValue label="Item" items={[
+        { label: 'Status in Orca', value: nativeStatusLabel(n.itemStatus) },
+        ...(n.observedAt ? [{ label: 'As of', value: when(n.observedAt) }] : []),
+        ...(n.botName ? [{ label: 'Bot', value: n.botName }] : []),
+        ...(n.itemLabel ? [{ label: 'Item', value: n.itemLabel }] : []),
+        { label: 'Workspace', value: n.workspaceAttributed ? `${d.projectName} · ${d.workspaceName}` : 'No workspace attribution' }
+      ]} />
+      {d.background && <Text>{d.background}</Text>}
+      {d.recommendation && <Text muted>{`Recommendation: ${d.recommendation}`}</Text>}
+      {d.options.length > 0 && (
+        <List label="Options offered in Orca">
+          {d.options.map((o) => <ListItem key={o.optionId} title={o.label} description={o.detail} />)}
+        </List>
+      )}
+    </Stack>
+  )
+}
+
+function ChatDetail(props: { d: Decision }) {
+  const { d } = props
+  const draft = read(cDraft); const meta = read(cMeta); const sending = read(cSending); const notice = read(cNotice); const fail = read(cFail)
+  const answered = d.answerState.state === 'answered'
+  const canSend = actionsOf(d).includes(answered ? 'follow-up' : 'reply')
+  const held = heldInitial(d, draft)
+  const answer = buildAnswer(d, draft)
+  const due = deadlineLabel(d, read(now))
+  const thread = replies(d)
+  return (
+    <Stack gap="sm">
+      <Row gap="xs" wrap>
+        <Badge tone="neutral">Chat decision</Badge>
+        <Badge tone={d.priority === 'P0' ? 'danger' : d.priority === 'P1' ? 'warning' : 'neutral'}>{d.priority}</Badge>
+        {due && <Badge tone={due.overdue ? 'danger' : 'warning'}>{due.text}</Badge>}
+        <Badge tone={shownState(d) === 'undelivered' ? 'danger' : 'accent'}>{STATE_LABEL[shownState(d)]}</Badge>
+      </Row>
+      <Text muted size="xs">{`${d.projectName} · ${d.workspaceName}${d.origin.hostId !== 'local' ? ` · host ${d.origin.hostId}` : ''}. Replies go only to the original chat.`}</Text>
+      {d.background && <Text>{d.background}</Text>}
+      {d.recommendation && <Text muted>{`Recommendation: ${d.recommendation}`}</Text>}
+      {d.evidence.length > 0 && <Text muted size="xs">{`${d.evidence.length} evidence item${d.evidence.length > 1 ? 's' : ''}: open the wide review to view them.`}</Text>}
+      {thread.length > 0 && (
+        <List label="Recorded answer and follow-ups">
+          {thread.map((r, i) => (
+            <ListItem key={r.replyId} title={`${i === 0 ? 'Answer' : `Follow-up ${i}`} · accepted ${when(r.acceptedAt)}`} description={answerText(r.answer, d)}>
+              <Text muted size="xs">{deliveryText(r, d)}</Text>
+            </ListItem>
+          ))}
+        </List>
+      )}
+      {notice && (
+        <Callout tone={notice.tone} title={NOTICE_TITLE[notice.tone]}>
+          {notice.text}
+        </Callout>
+      )}
+      {notice?.retry && draft.replyId && <Button size="sm" variant="outline" onPress={send}>{`Retry (same reply ID ${draft.replyId})`}</Button>}
+      {fail && <Callout tone="warning" title="Draft not saved">{`${failureText(fail)} It is kept in this panel only.`}</Callout>}
+      {!meta.loaded ? <Skeleton shape="text" lines={2} label="Loading your draft" />
+        : held ? (
+          <Card title="Your unsent answer" description="Another answer was recorded first, so this was not sent. Nothing is sent unless you choose to.">
+            <Text>{[draft.optionId && `Option: ${d.options.find((o) => o.optionId === draft.optionId)?.label ?? draft.optionId}`, draft.text.trim()].filter(Boolean).join(' — ')}</Text>
+            <Row gap="xs" wrap>
+              <Button size="sm" onPress={() => { const { replyId: _i, optionId: _o, ...rest } = draft; editDraft({ ...rest, optionId: undefined, replyId: undefined, kind: 'follow-up' }); set(cNotice, null) }}>Write a follow-up from this text</Button>
+              <Button size="sm" variant="ghost" onPress={() => { set(cDraft, emptyDraft()); editDraft({}); set(cNotice, null) }}>Discard</Button>
+            </Row>
+          </Card>
+        ) : canSend ? (
+          <Stack gap="xs">
+            {!answered && d.options.length > 0 && (
+              <RadioGroup label="Options" value={draft.optionId ?? ''} disabled={sending}
+                options={d.options.map((o) => ({ value: o.optionId, label: o.label, description: o.detail }))}
+                onChange={(v) => editDraft({ optionId: v, kind: 'initial' })} />
+            )}
+            <Textarea label={answered ? 'Follow-up' : 'Reply text'} rows={4} value={draft.text} disabled={sending}
+              placeholder={answered ? 'Follow-up to the agent (Ctrl+Enter to send)' : draft.optionId ? 'Optional detail with your option' : 'Free-text answer'}
+              onChange={(v) => editDraft({ text: v })} onSubmit={() => { void send() }} />
+            {draft.annotations.length > 0 && <Text muted size="xs">{`${draft.annotations.length} note${draft.annotations.length > 1 ? 's' : ''} from the wide review will be sent with this reply.`}</Text>}
+            <Button disabled={sending || !answer} onPress={send}>{sending ? 'Sending…' : answered ? 'Send follow-up' : 'Submit reply'}</Button>
+          </Stack>
+        ) : <Text muted>Replying here is not available for this decision right now.</Text>}
+    </Stack>
+  )
+}
+
+function DecisionView(props: { title: string }) {
+  const r = read(detail)
+  const d = r.state === 'ok' ? r.value : null
+  return (
+    <Stack gap="sm">
+      <ViewHeader title={d?.title ?? props.title} wideLabel="Open wide review" />
+      <WideNotice what="the decision" />
+      {r.state === 'loading' && <Skeleton shape="block" lines={4} label="Loading decision" />}
+      {r.state === 'fail' && (
+        <Callout tone="danger" title={r.f.code === 'not-found' ? 'Decision not found' : r.f.code === 'forbidden' ? 'No access to this decision' : 'Could not read this decision'}>
+          {r.f.code === 'not-found' ? 'It may have been withdrawn, or you may not have access.' : failureText(r.f)}
+        </Callout>
+      )}
+      {r.state === 'fail' && r.f.code === 'unavailable' && <Button size="sm" variant="outline" onPress={() => { const v = read(view); if (v.kind === 'decision') { set(detail, { state: 'loading' }); void loadDetail(nav, v.questionId) } }}>Try again</Button>}
+      {d && (nativeOf(d) ? <NativeDetail d={d} /> : <ChatDetail d={d} />)}
+    </Stack>
+  )
+}
+
+function SettingsView() {
+  const l = read(sLoad); const s = read(sEdit); const repos = read(sRepos); const notice = read(sNotice)
+  const dirty = !!s && editable(s) !== read(sSaved)
+  const empty = !!s && !s.defaultTemplate.trim()
+  const used = new Set(s?.exceptions.map((e) => e.repo) ?? [])
+  const free = repos.filter((r) => !used.has(r))
+  const change = (f: (x: InboxSettings) => void) => { const next = structuredClone(read(sEdit)!); f(next); set(sEdit, next); set(sNotice, null) }
+  return (
+    <Stack gap="sm">
+      <ViewHeader title="Inbox settings" wideLabel="Open in a wide tab" />
+      <WideNotice what="settings" />
+      {l.state === 'loading' && <Skeleton shape="block" lines={4} label="Loading settings" />}
+      {l.state === 'fail' && (
+        <Callout tone="danger" title={l.f.code === 'forbidden' ? 'No access to Inbox settings' : 'Could not read Inbox settings'}>{failureText(l.f)}</Callout>
+      )}
+      {l.state === 'fail' && <Button size="sm" variant="outline" onPress={() => void loadSettingsView(nav)}>Try again</Button>}
+      {l.state === 'ok' && s && (
+        <Stack gap="sm">
+          <Text muted size="xs">These rules guide agents in supported Orca Chats. Agents also read each repo's AGENTS.md and their role file; those are not edited here.</Text>
+          <Textarea label="Default question template" rows={6} value={s.defaultTemplate} invalid={empty} onChange={(v) => change((x) => { x.defaultTemplate = v })} />
+          {empty && <Text tone="danger" size="xs">The default template cannot be empty.</Text>}
+          <Heading level={3}>{`Repo exceptions (${s.exceptions.length})`}</Heading>
+          {s.exceptions.map((e, i) => (
+            <Card key={`${i}`} title={e.repo}>
+              <Select label={`Repo for exception ${i + 1}`} value={e.repo} options={[e.repo, ...free].map((r) => ({ value: r, label: r }))} onChange={(v) => change((x) => { x.exceptions[i].repo = v })} />
+              <Textarea label={`Template for ${e.repo}`} rows={3} value={e.template} onChange={(v) => change((x) => { x.exceptions[i].template = v })} />
+              <Button size="sm" variant="ghost" onPress={() => change((x) => { x.exceptions.splice(i, 1) })}>{`Remove exception for ${e.repo}`}</Button>
+            </Card>
+          ))}
+          <Button size="sm" variant="outline" disabled={free.length === 0} onPress={() => change((x) => { x.exceptions.push({ repo: free[0], template: x.defaultTemplate }) })}>
+            {free.length ? 'Add exception' : repos.length ? 'Every repo already has an exception' : 'No repos to add'}
+          </Button>
+          {notice && <Callout tone={notice.tone} title={notice.tone === 'neutral' ? 'Saved' : notice.tone === 'warning' ? 'Note' : 'Not saved'}>{notice.text}</Callout>}
+          {notice?.reload && <Button size="sm" variant="outline" onPress={() => void loadSettingsView(nav)}>Load latest settings</Button>}
+          <Row gap="xs" align="center">
+            <Button disabled={!dirty || empty} onPress={saveSettingsView}>Save</Button>
+            <Button variant="ghost" disabled={!dirty} onPress={() => { set(sEdit, { ...l.value, ...JSON.parse(read(sSaved)) }); set(sNotice, null) }}>Revert</Button>
+            <Text muted size="xs">{dirty ? 'Unsaved changes' : 'Saved'}</Text>
+          </Row>
+        </Stack>
+      )}
+    </Stack>
+  )
+}
+
 export default function Panel() {
+  const v = read(view)
+  if (v.kind === 'decision') return <DecisionView title={v.title} />
+  if (v.kind === 'settings') return <SettingsView />
   const sc = read(scope)
   const w = read(current)
   const at = read(now)
@@ -288,7 +699,6 @@ export default function Panel() {
   const complete = !updating && !more && h && !t.trim()
   const need = all ? all.filter(isActionable).length : 0
   const label = sc === 'all' ? 'All workspaces' : 'This workspace'
-  const oe = read(openError)
   const sources = all && loaded ? loaded.sources : []
   // "Nothing needs you" is only true for sources that could be read.
   const degraded = sources.some((x) => x.state !== 'available')
@@ -334,7 +744,7 @@ export default function Panel() {
         <Row gap="xs" align="center">
           {/* While searching, the count covers the matches only; say so. */}
           {all && !updating && <Badge tone={need ? 'accent' : 'neutral'}>{`${need}${more ? '+' : ''} ${t.trim() ? 'matching ' : ''}need you`}</Badge>}
-          <IconButton icon="settings" label="Inbox settings" size="sm" variant="ghost" onPress={openSettings} />
+          <IconButton icon="settings" label="Inbox settings" size="sm" variant="ghost" onPress={openSettingsView} />
         </Row>
       </Row>
 
@@ -353,7 +763,6 @@ export default function Panel() {
         </Callout>
       )}
       {err && !read(loading) && <Button size="sm" variant="outline" onPress={() => load()}>Retry loading</Button>}
-      {oe && <Callout tone="danger" title={oe.title}>{oe.text}</Callout>}
 
       <SourceNotices sources={sources} />
       {all && loaded && <MailNotice mail={loaded.mail} />}

@@ -16,6 +16,12 @@ The [versioned skill and CLI](../agent/decision-inbox/SKILL.md) produce an expli
 
 Orca mail from the installed plugin remains unavailable on the inspected headless host. A saved reply can be undelivered. Mail acceptance remains submitted, and a verified acknowledgement is required to mark it received. See the [current handoff](implementation-handoff.md) and [Phase 2 native parity audit](native-integration-audit.md).
 
+## Wide-tab diagnostics
+
+Review and settings use the focused local workspace from the worker's `workspace.readContext` and require an exact, unique `workspace.list` match. Orca 1.4.271 derives both worker IDs from the same projection. It uses a host-qualified `identity:` key where available and keeps `folder:` keys for folder workspaces. The worker sends the selected ID and a workspace-relative reference path to `editor.open`. Orca resolves that ID again in its desktop window's workspace inventory. [Orca 1.4.271 host API](https://github.com/stablyai/orca/blob/v1.4.271/docs/reference/plugin-host-api.md#editoropen) · [Renderer workspace lookup](https://github.com/stablyai/orca/blob/v1.4.271/src/renderer/src/components/plugins/view/plugin-view-host-actions.ts)
+
+An unsuccessful open returns an `unavailable` result with a sanitized stage and code. The worker logs `[wide-tab] review` or `[wide-tab] settings` with that stage and code, as in `editor.open: not_opened` or `file materialization: EACCES`. On the same desktop runtime, `orca plugin logs PLUGIN_KEY --json` retrieves those lines. The in-panel `getDecision` and `settings.get` requests depend on their existing authorization and do not need editor navigation.
+
 ## Local verification
 
 Run `npm test` for TypeScript, Orca's local plugin harness, plugin checks, and the DOM smoke test. `orca plugin validate . --json` validates the current manifest. The regression suite includes duplicate and concurrent acceptance, crash after transport custody, restart, same-ID retry, paired host routing, invalid and verified receipts, bilingual search, private evidence, draft persistence, and scoped settings.

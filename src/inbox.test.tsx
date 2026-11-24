@@ -4,8 +4,8 @@ import * as panel from './panel'
 import { decisions, historyExample, clock as fixtureClock, origins } from '../fixtures/decisions'
 import { actionsOf, dayKey, deadlineLabel, group, isActionable, nativeStatusLabel, order, receiptMatches, searchText, shownState, visible, workspaceKey } from './model'
 import { clock, reconcile } from './client'
-import type { Decision, ListDecisions, Result } from './contract'
-import type { DecisionPage, SourceAvailability } from './backend-protocol'
+import type { Decision, ListDecisions, Result, SubmitReply } from './contract'
+import type { DecisionPage, InboxSettings, SourceAvailability } from './backend-protocol'
 
 // Fixtures, the fixed clock and UTC are injected here only; production reads the live clock and
 // the desktop zone (see the last test).
@@ -107,6 +107,10 @@ function worker(list: Decision[] = decisions, extra: MockRequests = {}, size = 5
     },
     'review.open': () => ok(null),
     'settings.open': () => ok(null),
+    getDecision: ({ questionId }: { questionId: string }) => {
+      const d = list.find((x) => x.questionId === questionId)
+      return d ? ok(d) : { ok: false, code: 'not-found', message: 'Decision is missing or inaccessible.' }
+    },
     ...extra
   }
 }
@@ -310,25 +314,224 @@ test('panel: inbox.changed refetches through the worker', async () => {
   })
 })
 
-test('panel: a row opens its review by question ID; failures do not mark it open', async () => {
-  let fail = true
-  await withPanel(worker(decisions, { 'review.open': () => fail ? { ok: false, code: 'unavailable', message: 'No supported editor seam.' } : ok(null) }), async (view) => {
-    await view.emit('workspace.changed', ctx('studio-local'))
-    await view.press({ label: 'Pick a rehearsal slot' })
-    assert.deepEqual(requestsOf(view, 'review.open'), [{ questionId: 'schedule' }])
-    assert.ok(view.find({ label: 'Could not open the review tab' }))
-    assert.equal(view.find({ label: 'Pick a rehearsal slot' })?.props.current, false, 'not marked open on failure')
-    fail = false
-    await view.press({ label: 'Pick a rehearsal slot' })
-    assert.ok(!view.find({ label: 'Could not open the review tab' }))
-    assert.equal(view.find({ label: 'Pick a rehearsal slot' })?.props.current, true)
+// ---- in-panel detail and settings (0.1.1 blocker: the wide editor tab may not open) --------------
+const masked = { ok: false as const, code: 'unavailable' as const, message: 'Inbox storage or host integration is unavailable.' }
+/** Draft and settings stores that behave like the worker (compare-and-set revisions). */
+function stores() {
+  const drafts = new Map<string, { draft: unknown; revision: number }>()
+  let settings = { defaultTemplate: 'Ask with options.', exceptions: [] as { repo: string; template: string }[], revision: 1 }
+  const saved: unknown[] = []
+  return {
+    saved, drafts,
+    requests: {
+      'draft.get': ({ questionId }: { questionId: string }) => ok(drafts.get(questionId) ?? { draft: null, revision: 0 }),
+      'draft.save': ({ questionId, draft, revision }: { questionId: string; draft: unknown; revision: number }) => {
+        const cur = drafts.get(questionId) ?? { draft: null, revision: 0 }
+        if (revision !== cur.revision) return { ok: false, code: 'conflict', message: 'Stale draft revision.' }
+        const next = { draft, revision: cur.revision + 1 }; drafts.set(questionId, next); saved.push({ questionId, draft }); return ok(next)
+      },
+      'settings.get': () => ok(structuredClone(settings)),
+      'settings.repos': () => ok(['Paper Studio', 'Seed Catalogue']),
+      'settings.save': (input: typeof settings) => {
+        if (input.revision !== settings.revision) return { ok: false, code: 'conflict', message: 'Stale revision.' }
+        settings = { ...structuredClone(input), revision: settings.revision + 1 }; return ok(structuredClone(settings))
+      }
+    } as MockRequests
+  }
+}
+
+test('panel: a Bot Item card shows its details and options in the panel; a failed wide tab is reported as wide-only', async () => {
+  const item7 = nativeRow({ id: 'bot-item:u7:e20:0', title: 'Item #7 question', status: 'needs_you', attributed: false,
+    options: [{ optionId: 'a', label: 'Ship it' }, { optionId: 'b', label: 'Hold', detail: 'Wait for the next build' }], background: 'Release bot asks whether build 42 can ship.' })
+  const item2 = nativeRow({ id: 'bot-item:u2:e20:0', title: 'Item #2 question', status: 'needs-you', attributed: false })
+  await withPanel(worker([item2, item7], { 'review.open': masked }, 50, allAvailable), async (view) => {
+    await view.select({ label: 'Scope' }, 'all')
+    await view.press({ label: 'Item #7 question' })
+    assert.ok(view.find({ role: 'heading', text: 'Item #7 question' }), 'detail heading')
+    assert.ok(view.find({ label: 'Where to answer' }))
+    assert.ok(view.find({ label: 'Ship it' }) && view.find({ label: 'Hold' }), 'options visible in the panel')
+    assert.ok(view.find({ text: /Release bot asks whether build 42 can ship\./ }))
+    assert.equal(requestsOf(view, 'review.open').length, 0, 'no wide tab needed to read it')
+    assert.ok(!view.summary().some((x) => /danger/.test(x)), 'no error for a readable item')
+    await view.press({ text: 'Open wide review' })
+    assert.ok(view.find({ label: 'The wide tab did not open' }))
+    assert.ok(view.find({ text: /Inbox storage or host integration is unavailable\. Only the wide tab failed; the decision below is read from Decision Inbox and works here\./ }))
+    assert.ok(view.find({ label: 'Ship it' }), 'details stay after the wide-tab failure')
+    await view.press({ text: '← Back to list' })
+    assert.deepEqual(titles(view), ['Item #2 question', 'Item #7 question'])
+    assert.ok(!view.find({ label: 'The wide tab did not open' }), 'wide failure does not follow to the list')
   })
 })
 
-test('panel: settings open through the worker and report failure', () => withPanel(worker(decisions, { 'settings.open': { ok: false, code: 'unavailable', message: 'Not supported.' } }), async (view) => {
-  await view.press({ label: 'Inbox settings' })
-  assert.equal(requestsOf(view, 'settings.open').length, 1)
-  assert.ok(view.find({ label: 'Could not open Inbox settings' }))
+test('panel: every wide-tab failure mode stays wide-only (workspace missing or remote, refused, timeout, no file)', async () => {
+  const no = (code: 'unavailable' | 'forbidden' | 'not-found', message: string) => ({ ok: false as const, code, message })
+  const failures: (Result<null> | (() => never))[] = [
+    no('unavailable', 'No focused local workspace for the review.'),
+    no('unavailable', 'The focused workspace is on a remote host.'),
+    no('unavailable', 'Could not open the wide tab (editor.open: not_opened).'),
+    no('forbidden', 'editor.open: not_permitted.'),
+    () => { throw hostError('timeout', 'Timed out.') },
+    no('not-found', 'The review reference file was not created.')
+  ]
+  for (const failure of failures) {
+    await withPanel(worker(decisions, { 'review.open': failure, 'settings.open': failure, ...stores().requests }), async (view) => {
+      await view.emit('workspace.changed', ctx('studio-local'))
+      await view.press({ label: 'Pick a rehearsal slot' })
+      await view.press({ text: 'Open wide review' })
+      assert.ok(view.find({ label: 'The wide tab did not open' }))
+      assert.ok(view.find({ label: 'Reply text' }), 'the reply form still works in the panel')
+      await view.press({ text: '← Back to list' })
+      await view.press({ label: 'Inbox settings' })
+      await view.press({ text: 'Open in a wide tab' })
+      assert.ok(view.find({ label: 'The wide tab did not open' }))
+      assert.ok(view.find({ label: 'Default question template' }), 'settings controls still work in the panel')
+    })
+  }
+})
+
+test('panel: a Chat decision is answered in the panel with a durable reply ID and its draft survives Back', async () => {
+  const st = stores()
+  await withPanel(worker(decisions, { ...st.requests, 'review.open': masked,
+    submitReply: (input: SubmitReply) => ok({ ...input, acceptedAt: '2030-06-14T12:03:00Z', delivery: { state: 'undelivered' as const, reason: 'delivery-failed' as const } }) }), async (view) => {
+    await view.emit('workspace.changed', ctx('studio-local'))
+    await view.press({ label: 'Pick a rehearsal slot' })
+    await view.select({ label: 'Options' }, 'tue')
+    await view.type({ label: 'Reply text' }, 'after 3pm')
+    await wait(450); await view.settled()
+    assert.deepEqual(st.drafts.get('schedule')?.draft, { text: 'after 3pm', annotations: [], optionId: 'tue', kind: 'initial' }, 'draft saved with its option')
+    await view.press({ text: '← Back to list' })
+    await view.press({ label: 'Pick a rehearsal slot' })
+    assert.equal(view.valueOf({ label: 'Reply text' }), 'after 3pm', 'draft restored after Back')
+    assert.equal(view.valueOf({ label: 'Options' }), 'tue')
+    await view.press({ text: 'Submit reply' })
+    const sent = requestsOf(view, 'submitReply').at(-1) as { replyId: string; kind: string; answer: unknown }
+    assert.match(sent.replyId, /^reply-/); assert.equal(sent.kind, 'initial')
+    assert.deepEqual(sent.answer, { kind: 'option', optionId: 'tue', detail: 'after 3pm' })
+    const saves = st.saved as { draft: { replyId?: string } | null }[]
+    assert.ok(saves.some((x) => x.draft?.replyId === sent.replyId), 'reply ID saved before the attempt')
+    assert.ok(view.find({ text: /saved in Decision Inbox, but not delivered|Saved in Decision Inbox, but not delivered to the original chat\. Orca could not hand it to that chat\. Retry is not available here/ }))
+  })
+})
+
+test('panel: a stored initial draft that lost to another answer is kept, never sent or converted automatically', async () => {
+  const st = stores()
+  st.drafts.set('layout', { draft: { text: 'Grid, but larger labels', optionId: 'grid', kind: 'initial', annotations: [] }, revision: 3 })
+  await withPanel(worker(decisions.map((d) => d.questionId === 'layout' ? historyExample : d), st.requests), async (view) => {
+    await view.emit('workspace.changed', ctx('library-local'))
+    await view.toggle({ label: 'Include history' })
+    await view.press({ label: 'Choose the catalogue layout' })
+    assert.ok(view.find({ label: 'Your unsent answer' }))
+    assert.ok(view.find({ text: /Option: Grid — Grid, but larger labels/ }))
+    assert.ok(!view.find({ label: 'Follow-up' }), 'no follow-up box until the owner chooses')
+    assert.ok(view.find({ text: /Agent received · receipt layout-receipt/ }), 'recorded answer and receipt shown')
+    await view.press({ text: 'Write a follow-up from this text' })
+    assert.equal(view.valueOf({ label: 'Follow-up' }), 'Grid, but larger labels')
+    assert.equal(requestsOf(view, 'submitReply').length, 0, 'nothing sent automatically')
+  })
+})
+
+test('panel: settings are read and saved in the panel when the wide tab cannot open', async () => {
+  const st = stores()
+  await withPanel(worker(decisions, { ...st.requests, 'settings.open': masked }), async (view) => {
+    await view.press({ label: 'Inbox settings' })
+    assert.equal(view.valueOf({ label: 'Default question template' }), 'Ask with options.')
+    await view.type({ label: 'Default question template' }, 'Ask with two options.', { replace: true })
+    assert.ok(view.find({ text: 'Unsaved changes' }))
+    await view.press({ text: 'Add exception' })
+    await view.press({ text: 'Save' })
+    assert.ok(view.find({ label: 'Saved' }))
+    assert.equal((requestsOf(view, 'settings.save').at(-1) as { revision: number }).revision, 1, 'saved against the revision it read')
+    assert.ok(view.find({ label: 'Template for Paper Studio' }), 'exception controls')
+    assert.equal(requestsOf(view, 'settings.open').length, 0, 'no wide tab needed')
+  })
+})
+
+test('panel: stale answers from an earlier click never land on the current view', async () => {
+  const item7 = nativeRow({ id: 'bot-item:u7:e20:0', title: 'Item #7 question', attributed: false })
+  const item2 = nativeRow({ id: 'bot-item:u2:e20:0', title: 'Item #2 question', attributed: false })
+  let release7: () => void = () => {}
+  let releaseSettings: () => void = () => {}
+  await withPanel(worker([item2, item7], {
+    getDecision: ({ questionId }: { questionId: string }) => questionId === item7.questionId
+      ? new Promise((r) => { release7 = () => r(ok(item7)) }) : ok(item2),
+    'settings.get': () => new Promise((r) => { releaseSettings = () => r(masked) }),
+    'settings.repos': ok([])
+  }, 50, allAvailable), async (view) => {
+    await view.select({ label: 'Scope' }, 'all')
+    const p7 = view.press({ label: 'Item #7 question' }) // slow
+    await wait(10)
+    const pBack = view.press({ text: '← Back to list' })
+    await wait(10)
+    const p2 = view.press({ label: 'Item #2 question' })
+    await wait(10)
+    release7()
+    await Promise.all([p7, pBack, p2]); await view.settled()
+    assert.ok(view.find({ role: 'heading', text: 'Item #2 question' }), 'the active card stays #2')
+    assert.ok(!view.find({ role: 'heading', text: 'Item #7 question' }))
+    // A settings read that fails late must not show on a card.
+    const pBack2 = view.press({ text: '← Back to list' })
+    await wait(10)
+    const pGear = view.press({ label: 'Inbox settings' })
+    await wait(10)
+    const pBack3 = view.press({ text: '← Back to list' })
+    await wait(10)
+    const pCard = view.press({ label: 'Item #2 question' })
+    await wait(10)
+    releaseSettings()
+    await Promise.all([pBack2, pGear, pBack3, pCard]); await view.settled()
+    assert.ok(view.find({ role: 'heading', text: 'Item #2 question' }))
+    assert.ok(!view.find({ label: 'Could not read Inbox settings' }), 'no settings error on a card')
+  })
+})
+
+test('panel: a late settings failure from an earlier open never replaces the settings now shown', async () => {
+  const st = stores()
+  let calls = 0
+  let releaseFirst: () => void = () => {}
+  await withPanel(worker(decisions, { ...st.requests,
+    'settings.get': (): Result<InboxSettings> | Promise<Result<InboxSettings>> => (++calls === 1
+      ? new Promise<Result<InboxSettings>>((r) => { releaseFirst = () => r(masked) })
+      : (st.requests['settings.get'] as () => Result<InboxSettings>)())
+  }), async (view) => {
+    const g1 = view.press({ label: 'Inbox settings' }) // first open: slow, will fail
+    await wait(10)
+    const b = view.press({ text: '← Back to list' })
+    await wait(10)
+    const g2 = view.press({ label: 'Inbox settings' }) // second open: answers at once
+    await wait(10)
+    releaseFirst()
+    await Promise.all([g1, b, g2]); await view.settled()
+    assert.ok(view.find({ label: 'Default question template' }), 'settings from the current open stay')
+    assert.ok(!view.find({ label: 'Could not read Inbox settings' }), 'the stale failure is ignored')
+  })
+})
+
+test('panel: a failed read is truthful and Try again recovers; not-found and forbidden are named', async () => {
+  let fails = 1
+  const item7 = nativeRow({ id: 'bot-item:u7:e20:0', title: 'Item #7 question', attributed: false })
+  await withPanel(worker([item7], { getDecision: () => fails-- > 0 ? masked : ok(item7) }, 50, allAvailable), async (view) => {
+    await view.select({ label: 'Scope' }, 'all')
+    await view.press({ label: 'Item #7 question' })
+    assert.ok(view.find({ label: 'Could not read this decision' }), 'a read failure is a read failure, not a wide-tab one')
+    await view.press({ text: 'Try again' })
+    assert.ok(view.find({ label: 'Where to answer' }))
+  })
+  for (const [code, title] of [['not-found', 'Decision not found'], ['forbidden', 'No access to this decision']] as const) {
+    await withPanel(worker([item7], { getDecision: { ok: false, code, message: 'Decision is missing or inaccessible.' } }, 50, allAvailable), async (view) => {
+      await view.select({ label: 'Scope' }, 'all')
+      await view.press({ label: 'Item #7 question' })
+      assert.ok(view.find({ label: title }))
+      assert.ok(!view.find({ text: 'Try again' }))
+    })
+  }
+})
+
+test('panel: the mail notice is one statement', () => withPanel(worker(decisions, {}, 50, allAvailable,
+  { state: 'unavailable', message: 'Answers are saved in Decision Inbox. Orca mail from this plugin is unavailable on this host.' }), async (view) => {
+  await view.emit('workspace.changed', ctx('studio-local'))
+  const n = view.findAll({ label: 'Answers are saved, not delivered yet' })
+  assert.equal(n.length, 1)
+  assert.equal((n[0].text.match(/saved in Decision Inbox/g) ?? []).length, 1, 'no repeated sentence')
 }))
 
 
@@ -446,8 +649,12 @@ test('panel: a needs_you Bot Item without workspace is visible by default in All
     assert.ok(!titles(view).includes('Tag the release?'), 'in_progress is history')
     assert.ok(view.find({ text: 'Needs you' }))
     await view.press({ label: 'Approve release notes?' })
+    assert.deepEqual(requestsOf(view, 'getDecision').at(-1), { questionId: 'bot-item:native-uid:e42:0' })
+    assert.ok(view.find({ role: 'heading', text: 'Approve release notes?' }), 'opens in the panel')
+    await view.press({ text: 'Open wide review' })
     assert.deepEqual(requestsOf(view, 'review.open').at(-1), { questionId: 'bot-item:native-uid:e42:0' })
-    assert.ok(!view.find({ label: 'Could not open the review tab' }))
+    assert.ok(view.find({ text: 'Opened in a wide tab.' }))
+    await view.press({ text: '← Back to list' })
     assert.equal(view.find({ label: 'Approve release notes?' })?.props.current, true)
   })
 })

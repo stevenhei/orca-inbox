@@ -1,4 +1,4 @@
-import { assert, mockHost, mountWorker, test } from 'orca/testing'
+import { assert, hostError, mockHost, mountWorker, test } from 'orca/testing'
 import { decisions, reviewReply } from '../fixtures/decisions.ts'
 import { InboxBackend } from './backend.ts'
 import { orcaStorage } from './backend-storage.ts'
@@ -777,4 +777,87 @@ test('transport acceptance persists mail identity and requires explicit verified
   assert.equal(code(await h.restart().acknowledgeReply(source, proof)), 'forbidden')
   h.proof(proof.receiptId)
   assert.equal(value(await h.restart().acknowledgeReply(source, proof)).delivery.state, 'agent-received')
+})
+
+test('wide navigation reports a sanitized failure stage and preserves independent reads', async () => {
+  const workspaceId = 'identity:local-test'
+  const nativeId = 'bot-item:native-uid:e42:0'
+  const secret = '/private/owner/repo'
+  const context = (id: string) => ({ workspaceId: id, displayName: 'Studio', branch: '', terminals: [] })
+  const row = { id: workspaceId, name: 'Studio', kind: 'worktree', path: secret, branch: null, hostId: 'local' }
+  const inventory = (...workspaces: unknown[]) => ({ workspaces, truncated: false })
+  const host = mockHost({ capabilities: ['workspace:read', 'workspace:write', 'storage:own'], results: {
+    'workspace.readContext': context(workspaceId), 'workspace.list': inventory(row), 'editor.open': { opened: true }
+  } })
+  const item = { uid: 'native-uid', number: 7, owner: { name: 'Test Bot' }, status: 'needs_you', title: 'Synthetic native item',
+    createdAt: 1, question: { eventId: 'e42', decisions: [{ question: 'Which layout?', replies: [{ label: 'Stack' }] }] } }
+  const references: string[] = []
+  let returnNotOpened = true
+  let writeFailure = false
+  let referencePath = '.orca-decision-inbox/wide.orca-decision'
+  const worker = await mountWorker({ default(orca) {
+    // The SDK mock validates opened:true. Inject a raw false after the
+    // mock host records the request to cover a nonconforming response.
+    const call = (async (method: string, ...args: unknown[]) => {
+      const response = await Reflect.apply(orca.host.call, orca.host, [method, ...args])
+      return method === 'editor.open' && returnNotOpened ? { opened: false } : response
+    }) as typeof orca.host.call
+    registerDesktopWorker({ ...orca, host: { ...orca.host, call } }, {
+      hints: async () => [], removeHint: async () => {},
+      async cli(args) {
+        if (args.join(' ') === 'bot list') return { bots: [{ id: 'test-bot' }] }
+        if (args[2] === 'list') return { items: [item] }
+        if (args[2] === 'show') return { item }
+        throw new Error('Unexpected command.')
+      }
+    }, async path => {
+      references.push(path)
+      if (writeFailure) throw Object.assign(new Error('Cannot write ' + secret), { code: 'EACCES' })
+      return referencePath
+    })
+  } }, { host })
+  const panel = { panel: 'inbox' }
+  const review = () => worker.request('review.open', { questionId: nativeId }, panel)
+  const settings = () => worker.request('settings.open', undefined, panel)
+  const expectFailure = (answer: Result<unknown>, stage: string) => assert.deepEqual(answer, {
+    ok: false, code: 'unavailable', message: `Could not open the wide tab (${stage}).`
+  })
+  expectFailure(await review(), 'editor.open: not_opened')
+  returnNotOpened = false
+  assert.deepEqual(host.callsOf('editor.open'), [{ workspaceId, path: referencePath }])
+  host.respond('editor.open', () => { throw hostError('not_permitted', 'Refused ' + secret) })
+  expectFailure(await settings(), 'editor.open: not_permitted')
+  assert.deepEqual(worker.logs.slice(-2), [
+    '[wide-tab] review: editor.open: not_opened', '[wide-tab] settings: editor.open: not_permitted'
+  ])
+  assert.equal(value(await worker.request('getDecision', { questionId: nativeId }, panel)).options[0].label, 'Stack')
+  assert.equal(value(await worker.request('settings.get', undefined, panel)).revision, 0)
+  host.respond('editor.open', () => { throw hostError('action_failed', 'This window does not list ' + secret + '.') })
+  expectFailure(await review(), 'editor.open: workspace_not_found')
+
+  writeFailure = true
+  expectFailure(await settings(), 'file materialization: EACCES')
+  writeFailure = false
+  referencePath = '../outside.orca-decision'
+  expectFailure(await settings(), 'file materialization: invalid_relative_path')
+  const priorReferences = references.length
+  host.respond('workspace.list', inventory({ ...row, hostId: 'runtime:paired' }))
+  expectFailure(await review(), 'workspace selection: local_workspace_required')
+  host.respond('workspace.list', inventory(row, { ...row, hostId: 'runtime:paired' }))
+  expectFailure(await settings(), 'workspace selection: ambiguous_workspace')
+  host.respond('workspace.list', () => { throw hostError('timeout', 'Inventory private detail ' + secret) })
+  expectFailure(await settings(), 'workspace selection: timeout')
+  assert.equal(references.length, priorReferences)
+  assert.equal(host.callsOf('editor.open').length, 3)
+
+  const folderId = 'folder:local-test'
+  host.respond('workspace.list', inventory({ ...row, id: folderId, kind: 'folder', hostId: null }))
+  host.respond('workspace.readContext', context(folderId))
+  host.respond('editor.open', { opened: true })
+  referencePath = '.orca-decision-inbox/wide.orca-decision'
+  value(await settings())
+  assert.deepEqual(host.callsOf('editor.open').at(-1), { workspaceId: folderId, path: referencePath })
+  assert.equal(host.callsOf('workspace.open').length, 0)
+  assert.ok(worker.logs.every(line => !line.includes(secret)))
+  await worker.deactivate()
 })

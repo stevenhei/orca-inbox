@@ -41,7 +41,7 @@ Run everything: `npm test` (typecheck, `orca plugin test`, `orca plugin check`, 
 
 | Topic | Decision |
 | --- | --- |
-| Flow | The panel is a scan list. Selecting a row opens the wide review tab. No inline answering in the panel. |
+| Flow | The panel is a scan list. Selecting a row opens the wide review tab. No inline answering in the panel. **0.1.1 hotfix (needs owner confirmation):** because Orca may refuse to open the wide tab, a row now opens its detail inside the panel (Bot Items read-only with options and where to answer; Chat decisions with options, reply text, drafts and the same reply-ID and first-answer rules), the gear opens settings inside the panel, **← Back to list** returns, and **Open wide review** / **Open in a wide tab** is optional. A wide-tab failure is shown as "The wide tab did not open … Only the wide tab failed", separately from read failures ("Could not read this decision", "Decision not found", "No access to this decision"). |
 | Scope | Segmented control: **This workspace** / **All workspaces**. Opens on This workspace. An explicit All workspaces choice survives focus changes. Scope identity is `hostId` plus `workspaceId`, never `workspaceId` alone. |
 | Actionable rows | Shown by default: **Awaiting answer** and **Undelivered**. **Submitted / awaiting confirmation** and **Agent received** appear only with **Include history**. |
 | One row per question | A package is not one row. Each question is its own row, sorted on its own. Rows from the same package carry a "Package · N questions" badge. |

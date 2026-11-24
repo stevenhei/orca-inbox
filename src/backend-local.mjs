@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs'
 import { lstat, mkdir, open, opendir, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 
 export const hintDirectory = join(homedir(), '.orca-decision-inbox', 'hints')
 
@@ -55,13 +55,15 @@ export function localOrca(args) {
 
 // Store only a review reference, never the decision body, draft or answer.
 export async function writeReference(workspace, reference) {
+  const invalid = code => Object.assign(new Error('Invalid Decision Inbox review reference.'), { code })
+  if (!isAbsolute(workspace)) throw invalid('invalid_workspace_path')
   const root = await realpath(workspace)
   const directory = join(root, '.orca-decision-inbox')
   await mkdir(directory, { mode: 0o700 }).catch(error => {
     if (error.code !== 'EEXIST') throw error
   })
   const folder = await lstat(directory)
-  if (!folder.isDirectory() || await realpath(directory) !== directory) throw new Error('Unsafe review reference directory.')
+  if (!folder.isDirectory() || await realpath(directory) !== directory) throw invalid('unsafe_reference_directory')
   const contents = JSON.stringify(reference)
   const name = createHash('sha256').update(contents).digest('hex') + '.orca-decision'
   const target = join(directory, name)
@@ -70,10 +72,10 @@ export async function writeReference(workspace, reference) {
   } catch (error) {
     if (error.code !== 'EEXIST') throw error
     const existing = await lstat(target)
-    if (!existing.isFile() || existing.size !== Buffer.byteLength(contents)) throw new Error('Invalid review reference file.')
+    if (!existing.isFile() || existing.size !== Buffer.byteLength(contents)) throw invalid('invalid_reference_file')
     const file = await open(target, 'r')
     try {
-      if (await file.readFile('utf8') !== contents) throw new Error('Existing review reference differs.')
+      if (await file.readFile('utf8') !== contents) throw invalid('invalid_reference_file')
     } finally { await file.close() }
   }
   return '.orca-decision-inbox/' + name

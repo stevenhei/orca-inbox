@@ -30,6 +30,44 @@ function localActions(decision: Decision): Decision {
 
 const missing = (feature: string) => new InboxError('unavailable', `${feature} is unavailable on this Orca host.`)
 
+type NavigationStage = 'workspace selection' | 'file materialization' | 'editor.open'
+type NavigationView = 'review' | 'settings'
+
+const hostNavigationCodes = new Set([
+  'invalid_request', 'invalid_params', 'unknown_method', 'capability_denied', 'consent_required',
+  'not_permitted', 'rate_limited', 'unavailable', 'action_failed', 'cancelled', 'timeout', 'conflict', 'too_large'
+])
+const fileNavigationCodes = new Set([
+  'EACCES', 'EPERM', 'EROFS', 'ENOSPC', 'ENOENT', 'ENOTDIR', 'ELOOP', 'EEXIST',
+  'invalid_workspace_path', 'unsafe_reference_directory', 'invalid_reference_file'
+])
+
+class NavigationError extends InboxError {
+  constructor(readonly stage: NavigationStage, readonly reason: string) {
+    super('unavailable', `Could not open the wide tab (${stage}: ${reason}).`)
+  }
+}
+
+function navigationError(stage: NavigationStage, error: unknown): NavigationError {
+  if (error instanceof NavigationError) return error
+  const failure = error as { code?: unknown; message?: unknown } | null
+  const code = failure?.code
+  const message = failure?.message
+  const codes = stage === 'file materialization' ? fileNavigationCodes : hostNavigationCodes
+  // The v1.4.271 renderer sends its workspace-not-listed message through
+  // editor.open's action_failed. Keep the category without the workspace ID.
+  const reason = stage === 'editor.open' && code === 'action_failed' &&
+    typeof message === 'string' && message.startsWith('This window does not list ')
+    ? 'workspace_not_found'
+    : typeof code === 'string' && codes.has(code) ? code : 'unexpected_error'
+  return new NavigationError(stage, reason)
+}
+
+async function navigationStep<T>(stage: NavigationStage, work: () => T | Promise<T>): Promise<T> {
+  try { return await work() }
+  catch (error) { throw navigationError(stage, error) }
+}
+
 export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
   const backend = new InboxBackend(orcaStorage(orca.storage), boundary.native, {
     changed: () => orca.panels.post('inbox.changed', {})
@@ -37,9 +75,34 @@ export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
 
   void backend.recoverInterruptedDelivery()
 
-  async function withOwner<T>(context: PanelRequestContext, action: (owner: OwnerCaller) => Promise<T>) {
-    const verified = await result(() => boundary.resolveOwner(context))
+  function logNavigationFailure(view: NavigationView, error: NavigationError) {
+    try { orca.log(`[wide-tab] ${view}: ${error.stage}: ${error.reason}`) }
+    catch { /* A log failure must preserve the navigation result. */ }
+  }
+
+  async function withOwner<T>(context: PanelRequestContext, action: (owner: OwnerCaller) => Promise<T>, view?: NavigationView) {
+    const verified = await result(async () => {
+      try { return await boundary.resolveOwner(context) }
+      catch (error) {
+        if (!view || error instanceof InboxError) throw error
+        const failure = navigationError('workspace selection', error)
+        logNavigationFailure(view, failure)
+        throw failure
+      }
+    })
     return verified.ok ? action(verified.value) : verified
+  }
+
+  function openWide(caller: OwnerCaller, view: NavigationView, reference: Reference) {
+    return result(async () => {
+      try {
+        await navigationStep('editor.open', () => boundary.openReference(caller, reference))
+      } catch (error) {
+        if (error instanceof NavigationError) logNavigationFailure(view, error)
+        throw error
+      }
+      return null
+    })
   }
 
   orca.panels.handle('workspace.resolve', input => result(async () => {
@@ -117,16 +180,10 @@ export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
   orca.panels.handle('settings.repos', (_input, context) => withOwner(context, caller => result(() => [...new Set(caller.repos)].sort())))
   orca.panels.handle('review.open', (input, context) => withOwner(context, async caller => {
     const decision = await readDecision(caller, input)
-    if (!decision.ok) return decision
-    return result(async () => {
-      await boundary.openReference(caller, { questionId: decision.value.questionId })
-      return null
-    })
-  }))
-  orca.panels.handle('settings.open', (_input, context) => withOwner(context, caller => result(async () => {
-    await boundary.openReference(caller, { view: 'settings' })
-    return null
-  })))
+    return decision.ok ? openWide(caller, 'review', { questionId: decision.value.questionId }) : decision
+  }, 'review'))
+  orca.panels.handle('settings.open', (_input, context) => withOwner(context,
+    caller => openWide(caller, 'settings', { view: 'settings' }), 'settings'))
 
   return backend
 }
@@ -141,22 +198,42 @@ export function registerDesktopWorker(
     native: localInboxBoundary(localSources.cli),
     localSources,
     async openReference(caller, reference) {
-      if (!orca.grantedCapabilities.includes('workspace:write')) throw missing('Approved review editor access')
-      const before = await orca.host.call('workspace.readContext')
-      const workspaceId = before?.workspaceId
-      if (!workspaceId || !caller.workspaces.some(workspace => workspace.workspaceId === workspaceId && workspace.hostId === 'local')) {
-        throw missing('Focused local workspace for the review')
+      if (!orca.grantedCapabilities.includes('workspace:write')) throw new NavigationError('editor.open', 'capability_denied')
+      const focused = async () => (await orca.host.call('workspace.readContext'))?.workspaceId
+      const selectWorkspace = () => navigationStep('workspace selection', async () => {
+        const workspaceId = await focused()
+        if (!workspaceId) throw new NavigationError('workspace selection', 'no_focused_workspace')
+        const { workspaces, truncated } = await orca.host.call('workspace.list')
+        const matches = workspaces.filter(workspace => workspace.id === workspaceId)
+        if (matches.length > 1) throw new NavigationError('workspace selection', 'ambiguous_workspace')
+        const match = matches[0]
+        if (!match) throw new NavigationError('workspace selection', truncated ? 'workspace_list_truncated' : 'workspace_not_listed')
+        const localFolder = match.hostId === null && match.kind === 'folder' && workspaceId.startsWith('folder:')
+        if (match.hostId !== 'local' && !localFolder) throw new NavigationError('workspace selection', 'local_workspace_required')
+        if (!caller.workspaces.some(workspace => workspace.workspaceId === workspaceId && workspace.hostId === 'local')) {
+          throw new NavigationError('workspace selection', 'workspace_out_of_scope')
+        }
+        if (await focused() !== workspaceId) throw new NavigationError('workspace selection', 'focus_changed')
+        return { workspaceId, root: match.path, hostId: match.hostId, kind: match.kind }
+      })
+      const target = await selectWorkspace()
+      const path = await navigationStep('file materialization', async () => {
+        const path = await createReference(target.root, reference)
+        if (path.length > 1024 || /[\\:\u0000-\u001f]/u.test(path) ||
+          path.split('/').some(part => part === '' || part === '.' || part === '..')) {
+          throw new NavigationError('file materialization', 'invalid_relative_path')
+        }
+        return path
+      })
+      const current = await selectWorkspace()
+      if (current.workspaceId !== target.workspaceId) throw new NavigationError('workspace selection', 'focus_changed')
+      if (current.root !== target.root || current.hostId !== target.hostId || current.kind !== target.kind) {
+        throw new NavigationError('workspace selection', 'workspace_changed')
       }
-      const { workspaces } = await orca.host.call('workspace.list')
-      const matches = workspaces.filter(workspace => workspace.id === workspaceId)
-      if (matches.length !== 1 || (matches[0].hostId !== 'local' && matches[0].hostId !== null)) {
-        throw missing('Unambiguous local workspace for the review')
-      }
-      const focused = () => orca.host.call('workspace.readContext')
-      if ((await focused())?.workspaceId !== workspaceId) throw missing('Focused workspace changed')
-      const path = await createReference(matches[0].path, reference)
-      if ((await focused())?.workspaceId !== workspaceId) throw missing('Focused workspace changed')
-      await orca.host.call('editor.open', { workspaceId, path })
+      await navigationStep('editor.open', async () => {
+        const opened = await orca.host.call('editor.open', { workspaceId: target.workspaceId, path })
+        if (opened?.opened !== true) throw new NavigationError('editor.open', 'not_opened')
+      })
     }
   })
 }
