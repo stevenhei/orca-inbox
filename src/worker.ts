@@ -3,9 +3,10 @@ import { InboxBackend, result } from './backend.ts'
 import type { InboxBoundary } from './backend.ts'
 import { orcaStorage } from './backend-storage.ts'
 import type { Decision } from './contract.ts'
-import type { OwnerCaller, SourceAvailability } from './backend-protocol.ts'
-import { hints, localOrca, removeHint, writeReference } from './backend-local.mjs'
-import { desktopOwner, localInboxBoundary, nativeDetail, nativePage, nativePrefix, processChatHint } from './backend-orca.ts'
+import type { CoverageNotice, DecisionTarget, OwnerCaller, SourceAvailability } from './backend-protocol.ts'
+import { hints, localOrca, removeHint, scanHints, writeReference } from './backend-local.mjs'
+import { desktopOwner, localInboxBoundary, nativeDetail, nativePage, nativePrefix, processChatHint, requireDesktopInbox } from './backend-orca.ts'
+import { createPractice, practiceOwner } from './backend-practice.ts'
 import { id, InboxError, object } from './backend-validation.ts'
 
 type Reference = { questionId: string } | { view: 'settings' }
@@ -18,6 +19,7 @@ export interface WorkerBoundary {
   localSources?: {
     cli: typeof localOrca
     hints: typeof hints
+    scanHints?: typeof scanHints
     removeHint: typeof removeHint
   }
 }
@@ -74,6 +76,7 @@ export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
   })
 
   void backend.recoverInterruptedDelivery()
+  const practice = createPractice(orca)
 
   function logNavigationFailure(view: NavigationView, error: NavigationError) {
     try { orca.log(`[wide-tab] ${view}: ${error.stage}: ${error.reason}`) }
@@ -92,6 +95,35 @@ export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
     })
     return verified.ok ? action(verified.value) : verified
   }
+
+  const isPractice = (input: DecisionTarget | undefined) => input?.mode === 'practice'
+
+  async function withPractice<T>(context: PanelRequestContext, action: () => Promise<T>) {
+    const access = await result(() => requireDesktopInbox(context))
+    return access.ok ? action() : access
+  }
+
+  async function practiceData<T>(context: PanelRequestContext, action: () => Promise<T>) {
+    return withPractice(context, async () => {
+      const initialized = await result(() => practice.ready())
+      return initialized.ok ? action() : initialized
+    })
+  }
+
+  function workspaceData<T>(input: DecisionTarget, context: PanelRequestContext,
+    action: (store: InboxBackend, caller: OwnerCaller) => Promise<T>) {
+    return isPractice(input) ? practiceData(context, () => action(practice.backend, practiceOwner))
+      : withOwner(context, caller => action(backend, caller))
+  }
+
+  const practiceDecision = (decision: Decision): Decision => ({
+    ...decision, source: { kind: 'practice' },
+    actions: decision.answerState.state === 'awaiting-answer' ? ['reply'] : ['follow-up']
+  })
+  orca.panels.handle('practice.listDecisionPage', (input, context) => practiceData(context, async () => {
+    const page = await practice.backend.listDecisionPage(practiceOwner, { ...input, scope: { kind: 'all' } })
+    return page.ok ? { ...page, value: { ...page.value, rows: page.value.rows.map(practiceDecision) } } : page
+  }))
 
   function openWide(caller: OwnerCaller, view: NavigationView, reference: Reference) {
     return result(async () => {
@@ -139,23 +171,28 @@ export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
   let intake: Promise<boolean> | undefined
   let hintsPending = false
   let attachmentPending = false
+  let hintsTruncated = false
+  let hintScanFailed = false
   const syncHints = (caller: OwnerCaller) => {
     if (!local) return Promise.resolve(false)
     return intake ??= (async () => {
       let pending = false
       attachmentPending = false
+      hintsTruncated = false
+      hintScanFailed = false
       try {
-        const names = await local.hints()
+        const { names, truncated } = local.scanHints ? await local.scanHints() : { names: await local.hints(), truncated: false }
+        hintsTruncated = truncated
         await Promise.all(names.map(async name => {
           try {
             if (await processChatHint(local.cli, backend, caller, name)) await local.removeHint(name)
             else pending = true
           } catch (error) {
-            pending = true
             if (error instanceof InboxError && error.message.startsWith('A staged local image is missing or invalid.')) attachmentPending = true
+            else pending = true
           }
         }))
-      } catch { pending = true }
+      } catch { hintScanFailed = true }
       hintsPending = pending
       return pending
     })().finally(() => { intake = undefined })
@@ -176,14 +213,22 @@ export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
     ])
     const page = await backend.listDecisionPage(caller, input, native.rows)
     const remoteGap = 'Paired Chat submissions cannot be read yet. The local lookup hint is not exposed by Orca’s paired CLI.'
-    const coverage = [pending ? 'Some Chat submissions are waiting for verification.' : '',
-      !remoteScope && attachmentPending ? 'A staged local image is missing or invalid. Stage it again or use a source link.' : '',
-      native.hasPairedCoverage || (!host && caller.workspaces.some(workspace => workspace.hostId !== 'local')) ? remoteGap : ''
-    ].filter(Boolean)
-    const plugin: SourceAvailability = remoteScope
-      ? { source: 'plugin', state: 'unavailable', message: remoteGap }
-      : coverage.length ? { source: 'plugin', state: 'partial', message: coverage.join(' ') }
-      : { source: 'plugin', state: 'available' }
+    const coverage: CoverageNotice[] = []
+    if (pending) coverage.push({ kind: 'pending-verification',
+      message: 'Some local Chat lookup hints could not be verified. Inbox checks a bounded recent exchange; the Chat may still be running, inaccessible, or the submitted marker may no longer be in that exchange.' })
+    if (!remoteScope && hintsTruncated) coverage.push({ kind: 'hint-scan-limited',
+      message: 'The local Chat lookup reached its scan limit. More requests may be waiting for a later refresh.' })
+    if (!remoteScope && hintScanFailed) coverage.push({ kind: 'hint-read-failed',
+      message: 'Inbox could not read the local Chat lookup directory.' })
+    if (!remoteScope && attachmentPending) coverage.push({ kind: 'attachment-invalid',
+      message: 'A staged local image is missing or invalid. Stage it again or use a source link.' })
+    if (remoteScope || (!host && caller.workspaces.some(workspace => workspace.hostId !== 'local'))) {
+      coverage.push({ kind: 'paired-unreadable', message: remoteGap })
+    }
+    const plugin: SourceAvailability = {
+      source: 'plugin', state: remoteScope ? 'unavailable' : coverage.length ? 'partial' : 'available',
+      ...(coverage.length ? { coverage, message: coverage.map(notice => notice.message).join(' ') } : {})
+    }
     return page.ok ? { ...page, value: {
       ...page.value, rows: page.value.rows.map(localActions), sources: [plugin, native.source],
       mail: { state: 'unavailable' as const, message: 'Answers are saved in Decision Inbox. Orca mail from this plugin is unavailable on this host.' }
@@ -200,19 +245,26 @@ export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
     return local && decision.ok ? { ...decision, value: localActions(decision.value) } : decision
   }
 
-  orca.panels.handle('getDecision', (input, context) => withOwner(context, caller => readDecision(caller, input)))
-  orca.panels.handle('submitReply', (input, context) => withOwner(context, caller => backend.submitReply(caller, input)))
-  orca.panels.handle('retryReply', (input, context) => withOwner(context, caller => local
-    ? result(() => { throw missing('Orca mail from Decision Inbox') })
-    : backend.retryReply(caller, input)))
-  orca.panels.handle('getSnapshot', (input, context) => withOwner(context, caller => backend.getSnapshot(caller, input)))
-  orca.panels.handle('draft.get', (input, context) => withOwner(context, caller => backend.getDraft(caller, input)))
-  orca.panels.handle('draft.save', (input, context) => withOwner(context, caller => backend.saveDraft(caller, input)))
+  orca.panels.handle('getDecision', (input, context) => isPractice(input) ? practiceData(context, async () => {
+    const decision = await practice.backend.getDecision(practiceOwner, input)
+    return decision.ok ? { ...decision, value: practiceDecision(decision.value) } : decision
+  }) : withOwner(context, caller => readDecision(caller, input)))
+  orca.panels.handle('submitReply', (input, context) => workspaceData(input, context, (store, caller) => store.submitReply(caller, input)))
+  orca.panels.handle('retryReply', (input, context) => isPractice(input)
+    ? withPractice(context, () => result(() => { throw missing('Delivery for practice answers') }))
+    : withOwner(context, caller => local
+      ? result(() => { throw missing('Orca mail from Decision Inbox') })
+      : backend.retryReply(caller, input)))
+  orca.panels.handle('getSnapshot', (input, context) => workspaceData(input, context, (store, caller) => store.getSnapshot(caller, input)))
+  orca.panels.handle('draft.get', (input, context) => workspaceData(input, context, (store, caller) => store.getDraft(caller, input)))
+  orca.panels.handle('draft.save', (input, context) => workspaceData(input, context, (store, caller) => store.saveDraft(caller, input)))
   orca.panels.handle('settings.get', (_input, context) => withOwner(context, caller => backend.getSettings(caller)))
   orca.panels.handle('settings.save', (input, context) => withOwner(context, caller => backend.saveSettings(caller, input)))
   orca.panels.handle('settings.effective', (input, context) => withOwner(context, caller => backend.effectivePolicy(caller, input)))
   orca.panels.handle('settings.repos', (_input, context) => withOwner(context, caller => result(() => [...new Set(caller.repos)].sort())))
-  orca.panels.handle('review.open', (input, context) => withOwner(context, async caller => {
+  orca.panels.handle('review.open', (input, context) => isPractice(input)
+    ? withPractice(context, () => result(() => { throw missing('A separate review tab for practice questions') }))
+    : withOwner(context, async caller => {
     const decision = await readDecision(caller, input)
     return decision.ok ? openWide(caller, 'review', { questionId: decision.value.questionId }) : decision
   }, 'review'))
@@ -224,7 +276,7 @@ export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
 
 export function registerDesktopWorker(
   orca: OrcaWorkerApi,
-  localSources = { cli: localOrca, hints, removeHint },
+  localSources: NonNullable<WorkerBoundary['localSources']> = { cli: localOrca, hints, scanHints, removeHint },
   createReference = writeReference
 ) {
   return registerWorker(orca, {

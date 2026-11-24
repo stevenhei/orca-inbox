@@ -1,3 +1,4 @@
+import { practicePrefix } from './contract.ts'
 import type { AcknowledgeReply, Annotation, Decision, Delivery, Evidence, Origin, RecordedReply, Result, SubmitDecision, SubmitReply, Workspace } from './contract.ts'
 import type { DecisionPage, InboxSettings, OwnerCaller, PrivateSnapshot, ReplyDraft } from './backend-protocol.ts'
 import type { InboxErrorCode } from './backend-validation.ts'
@@ -64,6 +65,7 @@ type Options = {
   now?: () => number
   timeZone?: string
   changed?: () => void
+  practice?: boolean
 }
 
 const fresh = (): State => ({ version: 1, decisions: [], packages: [], replies: [], outbox: [], settings: [], drafts: [] })
@@ -102,7 +104,7 @@ function checkDetailBudget(d: Decision) {
     : d
   let bytes = jsonBytes(decision) + (awaiting ? initialContentBudget : 0)
   for (const r of thread(decision)) {
-    if (r.delivery.state === 'agent-received') continue
+    if (r.delivery.state === 'agent-received' || r.delivery.state === 'local-only') continue
     const receipt = largestReceipt(d.origin, r.questionId, r.replyId)
     // Delivery can cycle through failure and submission before a receipt arrives.
     bytes += Math.max(jsonBytes(receipt), jsonBytes(longestFailure)) - jsonBytes(r.delivery)
@@ -271,6 +273,8 @@ export class InboxBackend {
           input.questions.some(q => state.decisions.some(d => q.questionId === d.questionId))) {
           return fail('conflict', 'Package or question ID is already in use.')
         }
+        requireInput(input.questions.every(q => q.questionId.startsWith(practicePrefix) === Boolean(this.options.practice)),
+          'Question ID belongs to another Inbox.')
         const attachmentIds = input.evidence.flatMap(e => e.kind === 'image-snapshot' ? [e.attachmentId] : [])
         requireInput(new Set(attachmentIds).size === attachmentIds.length, 'Each snapshot version needs a distinct attachment ID.')
         if (state.packages.some(p => p.grant.snapshots.some(s => attachmentIds.includes(s.attachmentId)))) {
@@ -436,16 +440,16 @@ export class InboxBackend {
           commit()
           return { id, isNew: false }
         }
-        const recorded: RecordedReply = { ...input, acceptedAt: new Date(this.now()).toISOString(), delivery: { state: 'submitted' } }
+        const recorded: RecordedReply = { ...input, acceptedAt: new Date(this.now()).toISOString(), delivery: { state: this.options.practice ? 'local-only' : 'submitted' } }
         if (d.answerState.state === 'answered') d.answerState.followUps.push(recorded)
         else d.answerState = { state: 'answered', initial: recorded, followUps: [] }
         checkDetailBudget(d)
         state.replies.push({ ownerId: author.id, input, acceptedId: input.replyId })
-        state.outbox.push({ questionId: d.questionId, replyId: input.replyId })
+        if (!this.options.practice) state.outbox.push({ questionId: d.questionId, replyId: input.replyId })
         commit()
         return { id: input.replyId, isNew: true }
       })
-      if (accepted.isNew) await this.deliver(author, input.questionId, accepted.id)
+      if (accepted.isNew && !this.options.practice) await this.deliver(author, input.questionId, accepted.id)
       return this.readReply(author, input.questionId, accepted.id)
     })
   }

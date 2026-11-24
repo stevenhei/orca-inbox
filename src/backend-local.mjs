@@ -26,14 +26,14 @@ const lookupFile = path => lstat(path).catch(error => {
   if (error.code !== 'ENOENT') throw error
 })
 
-export async function hints() {
+export async function scanHints() {
   try {
     const root = await privateHintDirectory()
     const dir = await opendir(root)
     const result = []
     let inspected = 0
     for await (const entry of dir) {
-      if (++inspected > 256 || result.length === 8) break
+      if (++inspected > 256 || result.length === 8) return { names: result, truncated: true }
       if (entry.isDirectory() && (entry.name.startsWith('.lock-candidate.') ||
         (entry.name.startsWith('.lock.') && hintPattern.test(entry.name.slice('.lock.'.length))))) {
         await reapSubmissionLock(root, entry.name)
@@ -59,11 +59,15 @@ export async function hints() {
       })
       if (!stagedKey && checked?.value) result.push(key)
     }
-    return result
+    return { names: result, truncated: false }
   } catch (error) {
-    if (error.code === 'ENOENT') return []
+    if (error.code === 'ENOENT') return { names: [], truncated: false }
     throw error
   }
+}
+
+export async function hints() {
+  return (await scanHints()).names
 }
 
 export async function removeHint(name) {

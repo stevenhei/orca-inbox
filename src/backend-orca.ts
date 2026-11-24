@@ -1,6 +1,6 @@
 import type { OrcaWorkerApi, PanelRequestContext } from 'orca/worker'
 import { decisionSourceMetadata, jsonBytes, type AgentCaller, type InboxBackend, type InboxBoundary } from './backend.ts'
-import type { OwnerCaller, SourceAvailability } from './backend-protocol.ts'
+import type { CoverageNotice, OwnerCaller, SourceAvailability } from './backend-protocol.ts'
 import type { AcknowledgeReply, Decision, Priority, Workspace } from './contract.ts'
 import { clearLocalSnapshots, isLocalSnapshotId, readLocalSnapshot } from './local-snapshot.mjs'
 import { hintPattern } from './backend-local.mjs'
@@ -17,12 +17,16 @@ export const nativePrefix = 'bot-item:'
 const localOwner = 'decision-inbox-local-desktop'
 const unavailable = (message: string) => new InboxError('unavailable', message)
 
-export async function desktopOwner(orca: OrcaWorkerApi, context: PanelRequestContext): Promise<OwnerCaller> {
+export function requireDesktopInbox(context: PanelRequestContext) {
   const { id, surface, contributionId } = context.panel
   if (context.signal.aborted || !id || id === 'orca-cli' ||
     !(surface === 'panel' && contributionId === 'inbox' || surface === 'editor' && contributionId === 'review')) {
     throw new InboxError('forbidden', 'Use the Decision Inbox desktop panel or editor.')
   }
+}
+
+export async function desktopOwner(orca: OrcaWorkerApi, context: PanelRequestContext): Promise<OwnerCaller> {
+  requireDesktopInbox(context)
   const { workspaces, truncated } = await orca.host.call('workspace.list')
   const scoped = workspaces.map(w => ({ ...w, hostId: w.hostId ?? 'local' }))
     .filter((w, _, all) => all.filter(other => other.id === w.id && other.hostId === w.hostId).length === 1)
@@ -69,7 +73,7 @@ export function localInboxBoundary(cli: Cli): InboxBoundary {
         if (response.kind !== 'chat' || response.orcaSessionId !== origin.sessionId) return 'origin-mismatch'
         const places = array(response.places)
         if (!places.length) return 'closed-origin'
-        if (places.length !== 1 || !placeMatches(places[0], origin.sessionId, origin.workspaceId)) return 'origin-mismatch'
+        if (places.length !== 1 || !await localChatWorkspace(cli, places[0], origin.sessionId, [origin])) return 'origin-mismatch'
       } catch {
         return 'disconnected'
       }
@@ -85,9 +89,22 @@ export function localInboxBoundary(cli: Cli): InboxBoundary {
   }
 }
 
-function placeMatches(place: RecordValue, session: string, workspace: string) {
-  return place.kind === 'chat' && place.orcaSessionId === session && place.worktreeId === workspace &&
-    place.hostId === 'local' && (place.agent === 'claude' || place.agent === 'codex')
+async function localChatWorkspace(cli: Cli, place: RecordValue, session: string, allowed: readonly Workspace[]) {
+  const rawId = place.worktreeId
+  if (place.kind !== 'chat' || place.orcaSessionId !== session || place.hostId !== 'local' ||
+    (place.agent !== 'claude' && place.agent !== 'codex') || typeof rawId !== 'string' || !rawId) return
+  const local = allowed.filter(w => w.hostId === 'local')
+  const exact = local.find(w => w.workspaceId === rawId)
+  if (exact) return exact
+  // A desktop workspace can have a stable identity while agent.show still returns its raw worktree ID.
+  // Ask Orca for that exact worktree before comparing its projected identity to the permitted inventory.
+  if (rawId.startsWith('folder:') || !local.some(w => w.workspaceId.startsWith('identity:'))) return
+  const result = record(await cli(['worktree', 'show', '--worktree', 'id:' + rawId]))
+  const row = record(result.worktree)
+  if (row.id !== rawId || row.hostId !== 'local') return
+  const key = record(row.identity).key
+  if (typeof key !== 'string' || !key) return
+  return local.find(w => w.workspaceId === 'identity:' + key)
 }
 
 async function findChatRecord(cli: Cli, session: string, op: string, lookupId: string, ack?: AcknowledgeReply) {
@@ -123,13 +140,13 @@ export async function processChatHint(cli: Cli, backend: InboxBackend, owner: Ow
   const shown = record(await cli(['agent', 'show', 'orca_session_id:' + session]))
   const places = array(shown.places)
   const place = places[0]
-  if (shown.kind !== 'chat' || shown.orcaSessionId !== session || places.length !== 1 ||
-    !owner.workspaces.some(w => w.hostId === 'local' && w.workspaceId === place.worktreeId &&
-      placeMatches(place, session, w.workspaceId))) return false
+  if (shown.kind !== 'chat' || shown.orcaSessionId !== session || places.length !== 1) return false
+  const workspace = await localChatWorkspace(cli, place, session, owner.workspaces)
+  if (!workspace) return false
   const input = await findChatRecord(cli, session, op, lookupId)
   if (!input) return false
   const caller: AgentCaller = { kind: 'agent', id: session, origin: {
-    hostId: 'local', workspaceId: String(place.worktreeId), sessionId: session
+    hostId: 'local', workspaceId: workspace.workspaceId, sessionId: session
   }, projectName: text(place.repo), workspaceName: text(place.workspace), repo: text(place.repo), policyOwnerId: localOwner }
   if (op === 'submit') {
     const request = submission(input)
@@ -340,27 +357,29 @@ async function nativeOrigins(run: ReturnType<typeof hostCommand>, host: NativeHo
     return chat.kind === 'chat' && activityId.test(text(chat.id, 129)) ? [String(chat.id)] : []
   }))
   const origins = new Map<string, Decision['origin']>()
-  if (!candidates.size || !workspaceIds.size) return { origins, incomplete: false }
+  const resolved = new Set<string>()
+  if (!candidates.size || !workspaceIds.size) return { origins, failed: false, unresolved: false }
   try {
     const [agentResult, worktreeResult] = await Promise.all([run(['agent', 'list']), run(['worktree', 'list', '--limit', '100'])])
     const agents = record(agentResult)
     const worktrees = record(worktreeResult)
-    if (!Array.isArray(agents.agents) || !Array.isArray(worktrees.worktrees)) return { origins, incomplete: true }
+    if (!Array.isArray(agents.agents) || !Array.isArray(worktrees.worktrees)) return { origins, failed: true, unresolved: false }
     const localRows = array(worktrees.worktrees).filter(row => row.hostId === 'local' || row.hostId === host.id || row.hostId === undefined || row.hostId === null)
     for (const sessionId of candidates) {
       const matches = array(agents.agents).filter(row => row.orcaSessionId === sessionId && row.kind === 'chat' && (row.hostId === 'local' || row.hostId === host.id))
       if (matches.length !== 1) continue
       const rawId = matches[0].worktreeId
+      if (typeof rawId !== 'string' || !rawId) continue
       const listed = localRows.filter(row => row.id === rawId)
-      if (listed.length > 1) continue
+      if (listed.length > 1 || !listed.length && !workspaceIds.has(rawId) && !rawId.startsWith('folder:')) continue
       const key = text(record(listed[0]?.identity).key, 1024)
-      const workspaceId = key && !String(rawId).startsWith('folder:') ? 'identity:' + key : rawId
-      if (typeof workspaceId === 'string' && workspaceIds.has(workspaceId)) {
-        origins.set(sessionId, { hostId: host.id, workspaceId, sessionId })
-      }
+      const workspaceId = key && !rawId.startsWith('folder:') ? 'identity:' + key : rawId
+      resolved.add(sessionId)
+      if (workspaceIds.has(workspaceId)) origins.set(sessionId, { hostId: host.id, workspaceId, sessionId })
     }
-    return { origins, incomplete: origins.size !== candidates.size || agents.truncated === true || worktrees.truncated === true }
-  } catch { return { origins, incomplete: true } }
+    const unresolved = resolved.size !== candidates.size
+    return { origins, failed: unresolved && (agents.truncated === true || worktrees.truncated === true), unresolved }
+  } catch { return { origins, failed: true, unresolved: false } }
 }
 
 type BotCoverage =
@@ -418,8 +437,9 @@ async function nativeHostPage(cli: Cli, host: NativeHost, workspaces: readonly W
     if (results.length && results.every(entry => entry.status === 'rejected') && !items.length) {
       return { rows: [], notes, available: false, reportedPeers, coverage, rosterComplete }
     }
-    const { origins, incomplete } = await nativeOrigins(run, host, items, workspaces)
-    if (incomplete) notes.push('Workspace attribution could not be fully verified.')
+    const { origins, failed, unresolved } = await nativeOrigins(run, host, items, workspaces)
+    const attribution = failed ? 'The workspace attribution inventory could not be fully read.'
+      : unresolved ? 'Some readable Bot Items have no verified workspace and appear only in All workspaces.' : undefined
     const rows = items.flatMap(entry => {
       const chat = record(entry.item.chat)
       const projected = itemRows(entry, chat.kind === 'chat' ? origins.get(text(chat.id)) : undefined)
@@ -430,7 +450,7 @@ async function nativeHostPage(cli: Cli, host: NativeHost, workspaces: readonly W
       }
       return projected
     })
-    return { rows, notes, available: true, reportedPeers, coverage, rosterComplete }
+    return { rows, notes, attribution, available: true, reportedPeers, coverage, rosterComplete }
   } catch (error) {
     return { rows: [], notes: ['Bot discovery failed (' + cliProblem(error) + ').'], available: false,
       reportedPeers: false, coverage, rosterComplete: false }
@@ -447,9 +467,14 @@ export async function nativePage(cli: Cli, workspaces: readonly Workspace[] = []
     notes.push('Orca reported paired Bot sources but the worker found no usable saved CLI pairing.')
   }
   notes.push(...pages.flatMap(page => [...new Set(page.notes)].map(note => `${page.host.label} (${page.host.id}): ${note}`)))
-  const state = !pages.some(page => page.available) ? 'unavailable' : notes.length ? 'partial' : 'available'
+  const notices: CoverageNotice[] = [...new Set(notes)].map(message => ({ kind: 'native-partial', message }))
+  const attribution = pages.flatMap(page => page.attribution
+    ? [{ kind: 'native-attribution' as const, message: `${page.host.label} (${page.host.id}): ${page.attribution}` }] : [])
+  const state = !pages.some(page => page.available) ? 'unavailable'
+    : notices.length || requestedHost && attribution.length ? 'partial' : 'available'
+  const coverage = [...notices, ...attribution].slice(0, 12)
   return { rows: pages.flatMap(page => page.rows), hasPairedCoverage: hosts.some(host => host.id !== 'local'), source: {
-    source: 'native-item', state, ...(notes.length ? { message: notes.join(' ').slice(0, 2048) } : {})
+    source: 'native-item', state, ...(coverage.length ? { coverage, message: coverage.map(entry => entry.message).join(' ').slice(0, 2048) } : {})
   } }
 }
 

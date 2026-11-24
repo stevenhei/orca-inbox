@@ -1,6 +1,7 @@
 import { assert, hostError, mockHost, mountWorker, test } from 'orca/testing'
 import { decisions, reviewReply } from '../fixtures/decisions.ts'
 import { richContext } from '../fixtures/rich-context.ts'
+import { localInboxBoundary, processChatHint } from './backend-orca.ts'
 import { InboxBackend } from './backend.ts'
 import { orcaStorage } from './backend-storage.ts'
 import type { JsonValue, PanelRequestContext } from 'orca/worker'
@@ -1162,4 +1163,43 @@ test('native metadata examples stay inert in both sections while top-level metad
   assert.deepEqual(mixed.blockedWork, ['Example'])
   assert.equal(mixed.description, example + '\r\n')
   assert.equal(mixed.background, example + 'After.\r\n')
+})
+
+
+test('a local Chat raw worktree ID resolves to the authorized desktop identity before reading its marker', async () => {
+  const session = '00000000-0000-4000-8000-000000000024'
+  const request = packageInput([question('schedule')])
+  const name = 'submit.' + session + '.' + request.requestId
+  const workspace = { hostId: 'local', workspaceId: 'identity:stable-room' }
+  const desktop = { ...owner, id: 'decision-inbox-local-desktop', workspaces: [workspace] }
+  const place = { orcaSessionId: session, kind: 'chat', agent: 'codex', hostId: 'local', worktreeId: 'raw-room' }
+  const worktree = { id: 'raw-room', hostId: 'local', identity: { key: 'other-room' } }
+  let reads = 0
+  async function cli(args: string[]) {
+    if (args[0] === 'worktree') {
+      assert.deepEqual(args, ['worktree', 'show', '--worktree', 'id:raw-room'])
+      return { worktree }
+    }
+    if (args[1] === 'show') return { kind: 'chat', orcaSessionId: session, places: [place] }
+    assert.equal(args[1], 'read'); reads++
+    return { kind: 'chat', source: 'chat', orcaSessionId: session, state: 'done', entries: [
+      { kind: 'message', role: 'user', text: 'Review' },
+      { kind: 'message', role: 'assistant', text: 'ORCA-INBOX-V1 ' + JSON.stringify({ op: 'submit', input: request }) }
+    ] }
+  }
+  let saved: unknown
+  const backend = new InboxBackend({ read: async () => saved, write: async state => { saved = state } }, localInboxBoundary(cli))
+  assert.equal(await processChatHint(cli, backend, desktop, name), false)
+  worktree.identity.key = 'stable-room'
+  worktree.hostId = 'other-host'
+  assert.equal(await processChatHint(cli, backend, desktop, name), false)
+  worktree.hostId = 'local'
+  worktree.id = 'wrong-worktree'
+  assert.equal(await processChatHint(cli, backend, desktop, name), false)
+  assert.equal(reads, 0); assert.equal(saved, undefined)
+  worktree.id = 'raw-room'
+  assert.equal(await processChatHint(cli, backend, desktop, name), true)
+  assert.equal(reads, 1)
+  const detail = await backend.getDecision(desktop, { questionId: 'schedule' })
+  assert.ok(detail.ok && detail.value.origin.workspaceId === workspace.workspaceId)
 })

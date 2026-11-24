@@ -17,6 +17,7 @@ It prints the address, by default `http://127.0.0.1:4870/` (the next free port i
 | `?ref=preview-long` | Long Chinese Chat decision (paragraphs, sticky reply area) |
 | `?ref=image-review` | Seven synthetic images |
 | `?ref=preview-narrative` | Agent narrative: headings, links, inert code with Copy, seven inline images (one unavailable) |
+| `?ref=practice` | Eight bundled Practice questions in the production editor. The preview uses the Practice backend and keeps progress in this browser tab. |
 | `?ref=settings` | Inbox Settings |
 | `&theme=light`, `&zone=Asia/Hong_Kong`, `&history=1` | Light theme, another time zone, answered history fixture |
 

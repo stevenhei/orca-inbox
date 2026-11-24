@@ -16,6 +16,22 @@ On entry, resolve the focused workspace and display its name. Focus can follow O
 
 The worker enforces authorization and per-source visibility. Unattributed native Items appear only under All workspaces. The picker stays populated during empty searches, filter changes and paging. An unavailable source and an empty result have distinct UI states.
 
+### Workspace lifecycle
+
+Both views keep the choice, the focused workspace and the authorized inventory in one `ScopeState`, changed only by `ScopeTracker` in [workspace-scope.ts](../src/workspace-scope.ts). The worker computes `workspace.options` from the caller's authorized set on every request, so the views only need to read it again at these points:
+
+| Entry point | Panel (components) | Dashboard (isolated editor frame) |
+|---|---|---|
+| Focus | `on('workspace.changed')`; the first report is the current context | `orca.on('workspace.changed')` with `workspace:read`; `workspace.readContext` once at start. Each focus report re-reads `workspace.options` with `workspace.resolve` |
+| Orca created or removed a workspace | `on('workspace.created' / 'workspace.removed')` | `orca.on('workspace.created' / 'workspace.removed')` |
+| View returns | — | `visibilitychange` to visible (events may be missed while hidden) |
+| Explicit refresh | **Retry loading** | **Retry loading** |
+| Refusal | A `forbidden` or `not-found` list answer for a workspace scope re-reads the inventory | Same |
+
+Rules: an explicit choice is always pinned, including when it names the workspace focus already shows. A workspace that a complete re-read inventory no longer lists makes the view ask; it never widens to All workspaces, and a pinned choice returns by itself if the workspace returns. A refusal the inventory does not confirm, such as an owner check, is shown as an ordinary error. Each inventory and focus read carries a sequence number, so an older answer that arrives last is dropped. A list page whose scope is no longer in effect is discarded. Scope changes never touch the open decision or its draft.
+
+Limits: Orca documents `workspace.created` / `workspace.removed` for worktree and folder workspaces on this host; paired-host additions and removals are seen only at the next focus report, visibility change, retry or refusal. Whether the isolated editor receives events while its tab is hidden is not desktop-verified. Covered by `orca plugin test` (registered worker paging and mounted panel lifecycle) and the `dashscope` and `dashlife` DOM scenarios.
+
 ## Ownership of the other D interactions
 
 | User action | Implementation boundary |
@@ -25,6 +41,12 @@ The worker enforces authorization and per-source visibility. Unattributed native
 | Add notes or adopt a recommendation | The view manages focus, zoom, selection and the contextual composer. The editor anchors selected text in Background, Description or Recommendation and supports notes on authorized images. The sidebar offers a paragraph or image picker and optional exact words. Both save through the same question-scoped, revisioned draft operation. Saving a note closes its composer and keeps the reply editable. Recommendation changes a draft; explicit Submit records an answer. |
 | Send or check an answer | Core handles first-answer conflicts, append-only follow-ups and reply IDs. The Orca adapter supplies actual actions and delivery evidence. Native Items point to Orca for answering. A saved Chat answer, accepted mail and a confirmed agent receipt remain separate states. |
 | Review an attachment | Render author-ordered Markdown and versioned inline placements. Request bytes through the worker's existing attachment grant. Commands render as copyable text. Retain a usable document when evidence is unavailable. |
+
+## Practice Inbox
+
+Practice is an explicit choice in the installed plugin. Its eight questions use the same decision sheet, question navigation and revision-checked draft and reply operations as live Chat decisions. The worker initializes a separate storage namespace on first use. Reopening a question restores its answer and notes. A practice answer has a local-only delivery state and produces no mail or receipt. The live queue continues to report only the records visible to its caller.
+
+A readable native Bot Item opens a read-only sheet with its bot name, item number and answering location. Its practice entry opens the synthetic queue. Pending Chat verification, missing workspace attribution, source read failures and mail availability have separate meanings. The live queue presents read coverage at the list, and writable decision sheets explain where their reply will be saved.
 
 ## Smallest migration
 

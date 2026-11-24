@@ -83,3 +83,23 @@ export function makeNote(d: Decision, t: NoteTarget, note: string, phrase = '', 
   }
   return { kind: 'selection', anchor: { kind: 'question', field: t.field, revision: d.revision }, start, end, quote: raw.slice(start, end), text: note }
 }
+
+/** What a recorded note is about, for read-only lists: field and a short quote, or the image label. */
+export function noteLabel(n: Annotation, d: Pick<Decision, 'evidence'>): string {
+  if (n.kind === 'image') {
+    const e = d.evidence.find((x) => x.evidenceId === n.evidence.evidenceId)
+    return `Image: ${e?.label ?? n.evidence.evidenceId} · v${n.evidence.version}`
+  }
+  const where = n.anchor.kind === 'question' ? NOTE_FIELD_LABEL[n.anchor.field] : 'Evidence'
+  return `${where}: “${excerpt(n.quote, 48)}”`
+}
+/**
+ * How the notes of a recorded reply travelled. "Sent" only once Orca reported a hand-off (mail
+ * accepted or the chat's receipt); a local-only, merely saved or undelivered reply kept them here.
+ */
+export function notesFate(delivery: { state: string; transport?: unknown }): string {
+  if (delivery.state === 'local-only') return 'saved with this practice answer, on this device only'
+  if (delivery.state === 'agent-received' || (delivery.state === 'submitted' && delivery.transport)) return 'sent with this reply'
+  if (delivery.state === 'undelivered') return 'saved with this reply; not delivered'
+  return 'saved with this reply; not reported as sent'
+}

@@ -2,8 +2,10 @@ import type { Annotation, Answer, Decision, Delivery, Evidence, RecordedReply, S
 import type { DecisionPage, EffectivePolicy, InboxSettings, WorkspaceOptions } from './backend-protocol.ts'
 import { variantDCss } from './dashboard-style.ts'
 import { tokenizeInline, type InlineToken } from './markdown-inline.ts'
-import { effectiveScope, missing, queueInput, sameScope, scopeFromValue, scopeValue, workspaceChoices, workspaceLabel, type Scope } from './workspace-scope.ts'
-import { STATE_LABEL, actionsOf, deadlineLabel, group, isActionable, nativeOf, nativeStatusLabel, order, replyState, shownState, type NativeSource, type ShownState } from './model.ts'
+import { noteLabel, notesFate } from './note-anchors.ts'
+import { ScopeTracker, emptyScopeState, lostWorkspace, queueInput, scopeOf, scopeValue, workspaceChoices, workspaceLabel, type Scope, type ScopeState } from './workspace-scope.ts'
+import { STATE_LABEL, actionsOf, deadlineLabel, group, isActionable, isPractice, nativeOf, nativeStatusLabel, order, replyState, shownState, sourceWord, type NativeSource, type ShownState } from './model.ts'
+import { replyReach, sourceStatus, type StatusSource } from './source-status.ts'
 import {
   call, clock, draftIsEmpty, emptyDraft, failureText, formatInstant, newReplyId, reconcile, replies,
   sourcesOf, transportOf, type Draft, type Failure, type Requester, type SourceStatus
@@ -249,6 +251,33 @@ body:has(.d-app){overflow:hidden}
 @media (max-height:560px){.d-app .d-dock{max-height:72dvh;gap:5px;padding-block:6px 8px;min-height:0}.d-app .d-rec{padding:4px 8px}.d-app .d-rec .rich{-webkit-line-clamp:2}
  .d-app .d-dock textarea{min-height:2.4em;max-height:5em}.d-app .d-use-rec .d-hint,.d-app .d-dock-foot .d-hint{display:none}.d-app .d-dock-foot{justify-content:flex-end}
  .d-app .d-btn{height:30px}.d-app .d-opt{min-height:28px}}
+/* Inbox / Practice switch: always visible above the queue, also when the sheet covers it (narrow). */
+.d-app .d-mode{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:2px 0 8px}
+.d-app .d-mode-seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.d-app .d-mode-seg button{appearance:none;border:0;background:transparent;color:var(--fg);font:inherit;font-size:12.5px;padding:5px 12px;cursor:pointer;display:inline-flex;gap:6px;align-items:center}
+.d-app .d-mode-seg button+button{border-inline-start:1px solid var(--line)}
+.d-app .d-mode-seg button[aria-pressed="true"]{background:var(--sel);font-weight:600}
+.d-app .d-mode-seg button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.d-app .d-mode-seg .d-practice-tag{font-size:10.5px;font-weight:600;letter-spacing:.02em;border-radius:999px;padding:0 6px;border:1px solid var(--info,#6b8cff);color:var(--info,#8aa4ff)}
+.d-app .d-mode-say{font-size:12px;color:var(--muted);min-width:0}
+.d-app .d-practice-note{border:1px solid color-mix(in oklab,var(--info,#6b8cff) 55%,var(--line));background:color-mix(in oklab,var(--info,#6b8cff) 8%,var(--bg));border-radius:8px;padding:7px 10px;margin:4px 0 8px;font-size:12.5px;display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+.d-app .d-practice-note b{font-weight:600}
+.d-app .d-ws-static{font-size:12.5px;color:var(--muted);white-space:nowrap}
+/* One collapsible source status instead of a banner per source. */
+.d-app .d-srcstat{border:1px solid var(--line-soft);border-radius:8px;margin:4px 0 8px;font-size:12.5px}
+.d-app .d-srcstat.warn{border-color:color-mix(in oklab,var(--warn) 70%,var(--line))}
+.d-app .d-srcstat>summary{cursor:pointer;padding:5px 10px;color:var(--muted);list-style-position:inside}
+.d-app .d-srcstat.warn>summary{color:var(--fg)}
+.d-app .d-srcstat>summary::marker{color:var(--muted)}
+.d-app .d-srcstat ul{margin:0;padding:2px 12px 8px 28px;display:grid;gap:4px}
+.d-app .d-srcstat li b{font-weight:600}
+.d-app .d-srcstat li.warn b{color:var(--warn)}
+.d-app .d-srcstat .d-srcstat-act{margin:0 10px 8px}
+/* Where an answer goes, said at the reply; stays visible on short and narrow windows. */
+.d-app .d-reach{font-size:11.5px;color:var(--muted);margin:0}
+.d-app .d-reach.d-reach-local{color:var(--fg)}
+.d-app .d-reach.d-reach-local::before{content:'◆ ';color:var(--info,#8aa4ff)}
+.d-app .d-try-practice{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12px;color:var(--muted);margin:0}
 `
 document.head.append(Object.assign(document.createElement('style'), { textContent: css + variantDCss + dCss }))
 // Variant D's light palette: follow Orca's background luminance.
@@ -404,13 +433,14 @@ function rawRange(r: Range, field: Element): [number, number] | null {
 }
 
 // ---- reference file ---------------------------------------------------------------------------
-type Ref = { view: 'review'; questionId: string } | { view: 'settings' } | { view: 'dashboard' } | { view: 'invalid' }
+// `{"view":"dashboard","mode":"practice"}` (the + menu's practice file) opens the dashboard on Practice.
+type Ref = { view: 'review'; questionId: string; mode?: 'practice' } | { view: 'settings' } | { view: 'dashboard'; mode?: 'practice' } | { view: 'invalid' }
 const readRef = (text: string): Ref => {
   try {
     const v = JSON.parse(text)
     if (v?.view === 'settings') return { view: 'settings' }
-    if (v?.view === 'dashboard') return { view: 'dashboard' }
-    if (typeof v?.questionId === 'string' && v.questionId) return { view: 'review', questionId: v.questionId }
+    if (v?.view === 'dashboard') return v.mode === 'practice' ? { view: 'dashboard', mode: 'practice' } : { view: 'dashboard' }
+    if (typeof v?.questionId === 'string' && v.questionId) return v.mode === 'practice' ? { view: 'review', questionId: v.questionId, mode: 'practice' } : { view: 'review', questionId: v.questionId }
   } catch { /* fall through */ }
   return { view: 'invalid' }
 }
@@ -501,6 +531,8 @@ function recordedNotice(r: RecordedReply, x: Decision, own: boolean): Notice {
   const state = replyState(r, x)
   const receipt = state === 'agent-received' && r.delivery.state === 'agent-received' ? `, receipt ${r.delivery.receipt.receiptId}` : ''
   const what = r.kind === 'initial' ? 'answer' : 'follow-up'
+  if (own && r.delivery.state === 'local-only')
+    return { tone: 'info', text: `Your practice ${what} is saved in the Practice Inbox on this device (reply ID ${r.replyId}). Nothing was sent to any chat or agent.` }
   return own
     ? state === 'undelivered' && r.delivery.state === 'undelivered'
       ? { tone: 'warn', text: `Your ${what} is saved in Decision Inbox (reply ID ${r.replyId}) but was not delivered to the original chat. ${REASON[r.delivery.reason]}` }
@@ -513,14 +545,21 @@ function recordedNotice(r: RecordedReply, x: Decision, own: boolean): Notice {
  * what the worker recorded, by reply ID. `passive` loads come from invalidations: they change the
  * page only when the decision, its package or the draft actually changed.
  */
+/**
+ * Whether the open decision was opened from Practice: bound when it opens (dashboard selection, or
+ * a review file that names `"mode":"practice"`), never inferred from its ID, since a live question ID
+ * may begin with `practice:`. Its detail, draft, snapshot and reply requests carry `mode: "practice"`.
+ */
+let openPractice = ref.view === 'review' && ref.mode === 'practice'
+const md = <T extends object>(input: T, practice = openPractice): T => (practice ? { ...input, mode: 'practice' } : input) as T
 async function loadReview(questionId: string, keepNotice = false, passive = false) {
   const mine = ++seq
   if (!keepNotice) notice = null
-  const dr = await call(req, 'getDecision', { questionId })
+  const dr = await call(req, 'getDecision', md({ questionId }))
   if (mine !== seq) return
   // Native Bot Items are read-only here: no draft, no package siblings, no replies.
   const native = dr.ok && nativeOf(dr.value)
-  const wr = native || draftFor === questionId ? null : await call(req, 'draft.get', { questionId })
+  const wr = native || draftFor === questionId ? null : await call(req, 'draft.get', md({ questionId }))
   if (mine !== seq) return
   const before = d ? JSON.stringify(d) : null
   if (!dr.ok) {
@@ -553,14 +592,18 @@ async function loadReview(questionId: string, keepNotice = false, passive = fals
   if (!passive) render()
   else if (changed) requestRender(true)
   // Native siblings declared by ID need no package read.
-  if (native && d.package?.questionIds) { pkg = []; pkgMore = false; return }
+  // Native and Practice siblings declared by ID need no package read (Practice is never read live).
+  if ((native || isPractice(d)) && d.package?.questionIds) { pkg = []; pkgMore = false; return }
   // Same-package questions from the same origin workspace, each with its own state.
   // One bounded, server-searched page by package ID; only exact package members are kept.
   const unattributed = native && !native.workspaceAttributed
-  const pr = await call(req, 'listDecisionPage', {
-    scope: unattributed ? { kind: 'all' } : { kind: 'workspace', workspace: { hostId: d.origin.hostId, workspaceId: d.origin.workspaceId } },
-    query: d.packageId, includeHistory: true, timeZone: clock.zone()
-  })
+  // Practice packages are read from the Practice Inbox only; a live source is never asked.
+  const pr = openPractice
+    ? await call(req, 'practice.listDecisionPage', { query: d.packageId, includeHistory: true, timeZone: clock.zone() })
+    : await call(req, 'listDecisionPage', {
+      scope: unattributed ? { kind: 'all' } : { kind: 'workspace', workspace: { hostId: d.origin.hostId, workspaceId: d.origin.workspaceId } },
+      query: d.packageId, includeHistory: true, timeZone: clock.zone()
+    })
   if (mine !== seq || !d) return
   const pkgBefore = JSON.stringify([pkg, pkgFail])
   if (pr.ok) { pkgMore = !!pr.value.nextCursor; pkg = pr.value.rows.filter((x) => x.packageId === d!.packageId && x.questionId !== d!.questionId); pkgFail = null }
@@ -577,7 +620,7 @@ async function loadReview(questionId: string, keepNotice = false, passive = fals
 async function checkExternalDraft(questionId: string) {
   await saving
   if (draftFor !== questionId || saveTimer || draftRevision === null) return
-  const g = await call(req, 'draft.get', { questionId })
+  const g = await call(req, 'draft.get', md({ questionId }))
   if (!g.ok || draftFor !== questionId || saveTimer || busy() || g.value.revision === draftRevision) return
   draft = g.value.draft ?? emptyDraft(); draftRevision = g.value.revision
   notice = { tone: 'warn', text: 'This draft was changed in another tab or window. The saved draft is shown.' }
@@ -607,14 +650,15 @@ function saveDraftNow(): Promise<boolean> {
   const questionId = draftFor
   if (!questionId) return saving.then(() => false)
   const value: Draft | null = draftIsEmpty(draft) && !draft.replyId ? null : structuredClone(draft)
+  const practice = openPractice // bound now: a queued save keeps the mode of the decision it belongs to
   const p = saving.then(async (): Promise<boolean> => {
     if (draftRevision === null) {
-      const g = await call(req, 'draft.get', { questionId })
+      const g = await call(req, 'draft.get', md({ questionId }, practice))
       if (draftFor !== questionId) return false
       if (!g.ok) { draftFail = g; requestRender(); return false }
       draftRevision = g.value.revision
     }
-    const r = await call(req, 'draft.save', { questionId, draft: value, revision: draftRevision })
+    const r = await call(req, 'draft.save', md({ questionId, draft: value, revision: draftRevision }, practice))
     if (draftFor !== questionId) return r.ok
     if (r.ok) {
       draftRevision = r.value.revision
@@ -622,7 +666,7 @@ function saveDraftNow(): Promise<boolean> {
       return true
     }
     if (r.code === 'conflict') {
-      const g = await call(req, 'draft.get', { questionId })
+      const g = await call(req, 'draft.get', md({ questionId }, practice))
       if (draftFor !== questionId) return false
       if (g.ok) {
         draft = g.value.draft ?? emptyDraft(); draftRevision = g.value.revision; draftFail = null
@@ -773,6 +817,8 @@ document.addEventListener('keydown', (e) => {
 
 // ---- reply --------------------------------------------------------------------------------------
 const answered = (x: Decision) => x.answerState.state === 'answered'
+/** The open decision is a Practice one: note and reply copy say "saved here", never "sent". */
+const practiceOpen = () => !!d && isPractice(d)
 /** The decision as last drawn. Sends act on what the owner saw, never on a newer reload. */
 let shownD: Decision | null = null
 /** An initial answer the owner wrote that lost to another accepted answer: kept, never sent. */
@@ -831,7 +877,7 @@ async function send() {
     if (!cur || cur.tone !== 'warn') notice = { tone: 'bad', retry: !!draft.replyId, text: `Not sent. This reply attempt could not be saved first, so a later retry could not reuse its reply ID.${draftFail ? ` ${failureText(draftFail)}` : ''}` }
     say((notice as Notice | null)?.text ?? ''); render(); return
   }
-  const r = await call(req, 'submitReply', { questionId: x.questionId, replyId, kind, answer, annotations })
+  const r = await call(req, 'submitReply', md({ questionId: x.questionId, replyId, kind, answer, annotations }))
   sending = false
   if (d?.questionId !== x.questionId) return
   let conflictId: string | null = null
@@ -871,7 +917,7 @@ async function send() {
 
 async function retryDelivery(r: RecordedReply) {
   const x = d; if (!x) return
-  const out = await call(req, 'retryReply', { questionId: r.questionId, replyId: r.replyId })
+  const out = await call(req, 'retryReply', md({ questionId: r.questionId, replyId: r.replyId }))
   notice = out.ok
     ? { tone: 'info', text: `Retried reply ${out.value.replyId} to the original chat. ${STATE_LABEL[replyState(out.value, x)]}.` }
     : { tone: 'bad', text: `Retry failed. ${failureText(out)} The reply is kept.` }
@@ -891,7 +937,9 @@ async function openLink(url: string) {
 }
 
 async function openOther(questionId: string) {
-  const r = await call(req, 'review.open', { questionId })
+  // The dashboard opens a package sibling in its own sheet; Practice has no wide review tab.
+  if (ref.view === 'dashboard' && openPractice) return goTo(questionId)
+  const r = await call(req, 'review.open', md({ questionId }))
   if (!r.ok) { notice = { tone: 'bad', text: `Could not open that question. ${failureText(r)}` }; say(notice.text); render() }
 }
 
@@ -903,7 +951,7 @@ const MIME = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif'])
 function ensureSnapshot(e: Img) {
   const x = d; if (!x || snaps.has(e.attachmentId)) return
   snaps.set(e.attachmentId, { state: 'loading' })
-  void call(req, 'getSnapshot', { questionId: x.questionId, attachmentId: e.attachmentId }).then((r) => {
+  void call(req, 'getSnapshot', md({ questionId: x.questionId, attachmentId: e.attachmentId })).then((r) => {
     if (d?.questionId !== x.questionId) return
     const ok = r.ok && MIME.has(r.value.mimeType) && /^[A-Za-z0-9+/]+={0,2}$/.test(r.value.base64)
     snaps.set(e.attachmentId, ok ? { state: 'ok', url: `data:${r.value.mimeType};base64,${r.value.base64}` }
@@ -1131,7 +1179,7 @@ function openNoteComposer(t: NoteTarget) {
     quote = null; notesOpen = false; showNoteSaved(x.questionId)
     if (ncBack && n.kind === 'selection') ncBack.mark = draft.annotations.indexOf(n)
     closeNoteComposer(true)
-    say('Note saved with your draft. It is sent with your reply, not before.')
+    say(practiceOpen() ? 'Note saved with your practice draft.' : 'Note saved with your draft. It is sent with your reply, not before.')
   }
   const del = async () => {
     if (!editing || d !== x) return
@@ -1153,7 +1201,7 @@ function openNoteComposer(t: NoteTarget) {
     ...(t.kind === 'image' && thumb ? [el('img', { class: 'd-nc-thumb', src: thumb, alt: '' })] : []),
     el('blockquote', { class: 'd-nc-quote' }, t.kind === 'text' ? (t.q.text.length > 240 ? `${t.q.text.slice(0, 240)}…` : t.q.text) : t.caption),
     ta, err,
-    el('div', { class: 'd-nc-foot' }, el('span', { class: 'd-hint' }, 'Saved with your draft · not sent · Ctrl/Cmd+Enter adds this note only · Esc cancels'),
+    el('div', { class: 'd-nc-foot' }, el('span', { class: 'd-hint' }, `${practiceOpen() ? 'Saved with your practice draft' : 'Saved with your draft · not sent'} · Ctrl/Cmd+Enter adds this note only · Esc cancels`),
       ...(editing ? [el('button', { type: 'button', class: 'd-btn d-ghost', 'data-k': 'nc-delete', onclick: () => void del() }, 'Delete')] : []),
       el('button', { type: 'button', class: 'd-btn d-ghost', 'data-k': 'nc-cancel', onclick: () => { closeNoteComposer(true); say(editing ? 'Edit cancelled' : 'Note discarded') } }, 'Cancel'), addBtn))
   nc.addEventListener('keydown', (ev) => {
@@ -1232,7 +1280,7 @@ function markNotes(box: Element, field: NoteField) {
 function sidebar(x: Decision) {
   const list = draft.annotations
   return el('div', {}, el('h2', { style: 'margin-top:0' }, `Notes (${list.length})`),
-    ...(list.length ? [] : [el('p', { class: 'meta' }, 'Select text and press Alt+N, or use ✎ on an image. Notes are sent with your reply.')]),
+    ...(list.length ? [] : [el('p', { class: 'meta' }, `Select text and press Alt+N, or use ✎ on an image. ${isPractice(x) ? 'Notes are saved with your practice answer.' : 'Notes are sent with your reply.'}`)]),
     ...list.map((n, i) => noteEditor(n, i, x, 'side')))
 }
 
@@ -1290,6 +1338,8 @@ function mailLine(r: RecordedReply): string {
 }
 function deliveryView(r: RecordedReply, x: Decision) {
   const s = r.delivery
+  if (s.state === 'local-only')
+    return el('div', { class: 'meta' }, el('span', { class: 'chip' }, `● ${STATE_LABEL['local-only']}`), 'Saved on this device only. Practice answers are never sent to a chat or agent.')
   const state = replyState(r, x)
   if (state === 'agent-received' && s.state === 'agent-received')
     return el('div', { class: 'meta' }, el('span', { class: 'chip' }, `● ${STATE_LABEL['agent-received']}`), `Receipt ${s.receipt.receiptId} · ${when(s.receipt.receivedAt)}`)
@@ -1309,7 +1359,10 @@ const thread = (x: Decision): HTMLElement[] => {
   return [initial, ...followUps].map((r, i) => el('section', { class: `reply${i ? ' fu' : ''}`, 'aria-label': i === 0 ? 'Your answer' : `Follow-up ${i}` },
     el('h3', {}, `${i === 0 ? 'Answer' : `Follow-up ${i}`} · accepted ${when(r.acceptedAt)} · ${r.replyId}`),
     el('div', { style: 'white-space:pre-wrap' }, answerText(r.answer, x)),
-    ...(r.annotations.length ? [el('p', { class: 'meta' }, `${r.annotations.length} note${r.annotations.length > 1 ? 's' : ''} sent with this reply`)] : []),
+    // The owner's own notes stay readable after the reply is recorded (collapsed, read-only).
+    ...(r.annotations.length ? [el('details', { class: 'd-details d-reply-notes', 'data-k': `reply-notes-${r.replyId}` },
+      el('summary', { class: 'meta' }, `${r.annotations.length} note${r.annotations.length > 1 ? 's' : ''} ${notesFate(r.delivery)}`),
+      el('ul', { class: 'meta', style: 'margin:4px 0;padding-inline-start:18px' }, ...r.annotations.map((a) => el('li', {}, el('b', {}, `${noteLabel(a, x)} — `), a.text))))] : []),
     deliveryView(r, x)))
 }
 
@@ -1336,11 +1389,13 @@ function composeArea(x: Decision): HTMLElement[] {
   if (heldInitial(x)) return [...(notice ? [el('div', { class: `callout ${notice.tone === 'bad' ? '' : notice.tone}`, ...(notice.tone === 'bad' ? alertRole(`notice:${notice.text}`) : {}) }, notice.text)] : []), ...heldArea(x)]
   const isFollow = answered(x)
   const empty = !buildAnswer(x)
-  const label = isFollow ? 'Send follow-up' : 'Submit reply'
-  const sendBtn = el<HTMLButtonElement>('button', { type: 'button', class: 'pri', 'data-k': 'send', 'aria-disabled': empty || sending, onclick: () => send() }, sending ? 'Sending…' : label)
+  const practice = isPractice(x)
+  const label = practice ? (isFollow ? 'Save practice follow-up' : 'Save practice answer') : isFollow ? 'Send follow-up' : 'Submit reply'
+  const sendBtn = el<HTMLButtonElement>('button', { type: 'button', class: 'pri', 'data-k': 'send', 'aria-disabled': empty || sending, onclick: () => send() }, sending ? (practice ? 'Saving…' : 'Sending…') : label)
   const ta = field('textarea', {
     rows: 3, 'data-k': 'reply', 'aria-label': isFollow ? 'Follow-up' : 'Reply text', readonly: sending, 'aria-busy': sending,
-    placeholder: isFollow ? 'Follow-up to the agent (Ctrl+Enter to send)' : draft.optionId ? 'Optional detail with your option (Ctrl+Enter to submit)' : 'Free-text answer (Ctrl+Enter to submit)'
+    placeholder: practice ? (isFollow ? 'Practice follow-up (Ctrl+Enter saves it here)' : draft.optionId ? 'Optional detail with your option (Ctrl+Enter saves it here)' : 'Practice answer (Ctrl+Enter saves it here)')
+      : isFollow ? 'Follow-up to the agent (Ctrl+Enter to send)' : draft.optionId ? 'Optional detail with your option (Ctrl+Enter to submit)' : 'Free-text answer (Ctrl+Enter to submit)'
   }, draft.text)
   const onEdit = () => { draft.text = ta.value; scheduleSave(); sendBtn.setAttribute('aria-disabled', String(!buildAnswer(x) || sending)) }
   ta.addEventListener('input', onEdit); ta.addEventListener('change', onEdit)
@@ -1360,11 +1415,17 @@ function composeArea(x: Decision): HTMLElement[] {
         el('button', { type: 'button', onclick: () => copy(draft.text, 'Reply') }, 'Copy reply')] : []),
       ...(notice.notes ? [' ', el('button', { type: 'button', 'data-k': 'review-notes', onclick: () => reviewNotes() }, 'Review notes')] : []))] : []),
     ...(draftFail ? [el('div', { class: 'callout warn', role: 'status' }, `Draft not saved. ${failureText(draftFail)} It is kept in this tab only.`)] : []),
+    // Where this answer goes, at the point of reply (also on short and narrow windows): Practice
+    // saves here only; a Chat answer is saved in Decision Inbox and, without plugin mail, stays there.
+    el('p', { class: `d-reach${practice || dash.mail?.state !== 'available' ? ' d-reach-local' : ''}`, 'data-k': 'reply-reach', role: 'note' }, replyReach(practice ? 'practice' : 'chat', dash.mail)),
     el('div', { class: 'd-dock-foot' },
       // First use: say how a note is made; once there are notes, that they travel with the reply.
-      el('span', { class: 'd-hint', 'data-k': 'reply-hint' }, draft.annotations.length
-        ? 'Notes go with your reply, to the original chat only. Ctrl+Enter sends.'
-        : 'Select text, then Add note (Alt+N) to comment on it. Replies go only to the original chat.'),
+      el('span', { class: 'd-hint', 'data-k': 'reply-hint' }, practice
+        ? (draft.annotations.length ? 'Notes are saved with your practice answer. Ctrl+Enter saves.' : 'Select text, then Add note (Alt+N) to comment on it.')
+        : draft.annotations.length
+        ? 'Notes are saved with your reply. Ctrl+Enter submits.'
+        : 'Select text, then Add note (Alt+N) to comment on it.'),
+
       notesBtn, sendBtn)
   ]
 }
@@ -1387,7 +1448,7 @@ const pkgOrder = (a: Decision, b: Decision) => {
 /** Rebinds this editor to another question of the package; drafts stay with their own question. */
 function goTo(questionId: string) {
   if (ref.view === 'dashboard') return void selectInDashboard(questionId)
-  ref = { view: 'review', questionId }; void bind()
+  ref = { view: 'review', questionId, ...(openPractice ? { mode: 'practice' as const } : {}) }; void bind()
 }
 /** "Question i / N" with Previous / Next over the package (siblings from one bounded page). */
 function pager(x: Decision): HTMLElement {
@@ -1423,7 +1484,7 @@ function sheetHead(x: Decision | null): HTMLElement {
   const n = x && nativeOf(x)
   return el('div', { class: 'd-sheet-head' },
     ...(inDash ? [el('button', { type: 'button', class: 'd-icon-btn', 'data-k': 'sheet-back', 'aria-label': 'Back to the decision list', title: 'Back', onclick: () => closeDashSheet() }, '←')] : []),
-    el('span', { class: 'd-where' }, !x ? 'Decision' : n ? 'Bot Item · read-only' : 'Chat decision'),
+    el('span', { class: 'd-where' }, !x ? 'Decision' : n ? 'Bot Item · read-only' : isPractice(x) ? 'Practice · saved on this device' : 'Chat decision'),
     el('span', { class: 'd-spacer' }),
     ...(inDash ? [el('button', { type: 'button', class: 'd-icon-btn d-wide-only', 'data-k': 'sheet-reset', 'aria-label': 'Reset the decision panel width', title: 'Reset panel width', ...(sheetW === null ? { hidden: true } : {}), onclick: () => setSheetW(null) }, '↔')] : []),
     ...(x && x.decisionLink ? [el('button', { type: 'button', class: 'd-icon-btn', 'data-k': 'copy-link', 'aria-label': 'Copy decision link', title: 'Copy decision link', onclick: () => copy(x.decisionLink, 'Decision link') }, '⧉')] : []),
@@ -1517,9 +1578,9 @@ function metaNode(x: Decision, status: string, stateCard?: HTMLElement): HTMLEle
   const n = nativeOf(x)
   const dd = (k: string, v: Node | string) => [el('div', {}, el('dt', {}, k), el('dd', {}, v))]
   return [
-    el('div', { class: 'd-srcline' }, el('span', {}, n && !n.workspaceAttributed ? 'No workspace attribution' : `${x.projectName} · ${x.workspaceName}`),
-      el('span', {}, n ? `Bot Item${n.botName ? ` · ${n.botName}` : ''}${n.itemLabel ? ` · ${n.itemLabel}` : ''}` : 'Chat decision'),
-      ...(remote ? [el('span', { class: 'chip' }, `host: ${x.origin.hostId}`)] : []),
+    el('div', { class: 'd-srcline' }, el('span', {}, isPractice(x) ? 'Practice Inbox · synthetic' : n && !n.workspaceAttributed ? 'No workspace attribution' : `${x.projectName} · ${x.workspaceName}`),
+      el('span', {}, n ? `Bot Item${n.botName ? ` · ${n.botName}` : ''}${n.itemLabel ? ` · ${n.itemLabel}` : ''}` : sourceWord(x)),
+      ...(remote && !isPractice(x) ? [el('span', { class: 'chip' }, `host: ${n?.hostLabel ?? x.origin.hostId}`)] : []),
       ...sourceActions(x)),
     ...(stateCard ? [stateCard] : []),
     el('dl', { class: 'd-meta' },
@@ -1545,6 +1606,10 @@ function progressCard(x: Decision, state: ShownState): HTMLElement {
     sentence = `Orca reports this Item as ${nativeStatusLabel(n.itemStatus).toLowerCase()}.`
     if (n.observedAt) ms.push(['Snapshot', when(n.observedAt)])
     next = "Answer it in Orca's Bot Items view."
+  } else if (isPractice(x)) {
+    if (latest) ms.push([replies.length > 1 ? `Follow-up ${replies.length - 1} saved` : 'Answer saved', when(latest.acceptedAt)])
+    sentence = latest ? 'Saved in the Practice Inbox on this device. Nothing was sent.' : 'Practice decision: no answer saved yet.'
+    next = latest ? 'Add a follow-up, or try another practice decision.' : 'Answer in the reply card below; it is saved on this device only.'
   } else if (!latest) { sentence = 'No answer saved yet.'; next = 'Answer in the reply card below.' }
   else {
     const what = replies.length > 1 ? `Follow-up ${replies.length - 1} saved` : 'Answer saved'
@@ -1619,7 +1684,8 @@ function renderReview(questionId: string) {
     ...(links.length ? [el('h2', { class: 'd-sec-h' }, 'Linked evidence'), el('p', { style: 'margin:0' }, ...links.map((l) => l.kind === 'link'
       ? el('a', { href: l.url, onclick: (ev: Event) => { ev.preventDefault(); void openLink(l.url) } }, `${l.label} · v${l.version} ↗  `) : ''))] : []),
     ...(answered(x) ? [el('h2', { class: 'd-sec-h' }, 'Your answer and follow-ups'), ...thread(x)] : []),
-    ...disclosures(x, [['Project', x.projectName], ['Workspace', x.workspaceName], ...(x.origin.hostId !== 'local' ? [['Host', x.origin.hostId] as [string, string]] : []),
+    ...disclosures(x, [...(isPractice(x) ? [['Source', 'Practice Inbox · synthetic, saved on this device'] as [string, string]]
+      : [['Project', x.projectName], ['Workspace', x.workspaceName], ...(x.origin.hostId !== 'local' ? [['Host', x.origin.hostId] as [string, string]] : [])] as [string, string][]),
       ['Priority', x.priority], ...(x.deadline ? [['Deadline', when(x.deadline)] as [string, string]] : []), ['Created', when(x.createdAt)],
       ...(x.blockedWork.length ? [['Blocks', x.blockedWork.join(', ')] as [string, string]] : []), ['Question ID', x.questionId]], packageNodes())
   ]
@@ -1633,7 +1699,7 @@ function renderReview(questionId: string) {
             el('span', {}, o.label, ...(o.detail ? [el('span', { class: 'meta' }, ` — ${o.detail}`)] : [])))))] : []),
     ...(composing ? useRecNode(x) : []),
     ...(noteSaved === x.questionId && draft.annotations.length ? [el('div', { class: 'd-dock-row d-note-saved', role: 'status' },
-      el('span', {}, `Note saved with your draft (${draft.annotations.length}). Not sent yet: notes go with your reply.`),
+      el('span', {}, isPractice(x) ? `Note saved with your practice draft (${draft.annotations.length}).` : `Note saved with your draft (${draft.annotations.length}). Not sent yet: notes go with your reply.`),
       el('button', { type: 'button', class: 'd-btn d-ghost', 'data-k': 'notes-edit', onclick: () => {
         noteSaved = null
         if (notesInDialog()) return openComposer(null)
@@ -1749,7 +1815,11 @@ function renderNative(x: Decision, n: NativeSource) {
       ...(item ? [el('button', { type: 'button', class: 'd-btn', 'data-k': 'copy-location', onclick: () => copy(`${item}${n.observedAt ? ` (as of ${when(n.observedAt)})` : ''}`, 'Location') }, 'Copy location')] : [])),
     ...(x.options.length ? [el('ul', { class: 'd-opts', style: 'list-style:none;padding:0;margin:0' }, ...x.options.map((o) =>
       el('li', { class: 'd-opt' }, o.detail ? `${o.label} — ${o.detail}` : o.label)))] : []),
-    el('p', { class: 'meta', style: 'margin:0' }, 'Read-only copy: Decision Inbox cannot answer, resolve or open this Item for you.'))
+    el('p', { class: 'meta', style: 'margin:0' }, 'Read-only copy: Decision Inbox cannot answer, resolve or open this Item for you.'),
+    // The read-only path leads to a safe place to try answering, without touching this Item.
+    ...(ref.view === 'dashboard' ? [el('p', { class: 'd-try-practice' }, 'Want to try answering in Decision Inbox?',
+      el('button', { type: 'button', class: 'd-btn d-sm', 'data-k': 'try-practice', onclick: () => void setMode('practice') }, 'Open Practice Inbox'),
+      el('span', {}, 'Synthetic decisions, saved on this device; this Item stays unchanged.'))] : []))
   readerHost.replaceChildren(sheet(x, body, dock))
   shownD = x
 }
@@ -1917,58 +1987,106 @@ let dashTimer: ReturnType<typeof setTimeout> | null = null
 const sheetNarrow = matchMedia('(max-width: 899px)')
 type Tab = 'pending' | 'answered' | 'all'
 const dash = {
-  // Workspace: `chosen` is the owner's explicit choice (kept for the life of this view); until then
-  // the focused workspace applies. `inv` is the authorized inventory from workspace.options.
-  tab: 'pending' as Tab, chosen: undefined as Scope | undefined, inv: null as WorkspaceOptions | null, invFail: null as Failure | null, scopeLost: null as Failure | null, priority: '', status: '', group: 'priority', term: '',
-  focus: undefined as Workspace | null | undefined, focusFail: null as Failure | null,
+  // Workspace: the explicit choice (kept for the life of this view), the focused workspace and the
+  // authorized inventory, changed only through the shared tracker below (the panel uses it too).
+  ws: emptyScopeState() as ScopeState,
+  // Inbox: the live sources in the chosen workspace scope. Practice: the worker's synthetic Practice
+  // Inbox (no workspace scope, no live source, nothing delivered); same list, reader and reply card.
+  mode: (ref.view === 'dashboard' && ref.mode === 'practice' ? 'practice' : 'inbox') as 'inbox' | 'practice',
+  tab: 'pending' as Tab, priority: '', status: '', group: 'priority', term: '',
   rows: [] as Decision[], next: undefined as string | undefined, sources: [] as SourceStatus[], mail: undefined as { state: 'available' | 'unavailable'; message?: string } | undefined,
   loading: false as false | 'first' | 'more', fail: null as Failure | null, loaded: false, filtersOpen: false
 }
-let shell: { el: HTMLElement; list: HTMLElement; tabs: HTMLElement; wsSel: HTMLSelectElement; status: HTMLSelectElement; sheet: HTMLElement; side: HTMLElement } | null = null
+let shell: { el: HTMLElement; list: HTMLElement; tabs: HTMLElement; wsSel: HTMLSelectElement; status: HTMLSelectElement; sheet: HTMLElement; side: HTMLElement; mode: HTMLElement; modeSay: HTMLElement; wsPick: HTMLElement; wsStatic: HTMLElement } | null = null
 
-async function loadInventory() {
-  if (dash.inv) return
-  const r = await call(req, 'workspace.options')
-  if (r.ok) { dash.inv = r.value; dash.invFail = null } else dash.invFail = r
-}
+const tracker = new ScopeTracker({ get: () => dash.ws, set: (v) => { dash.ws = v } }, {
+  options: () => call(req, 'workspace.options') as Promise<{ ok: true; value: WorkspaceOptions } | Failure>,
+  resolve: (workspaceId) => call(req, 'workspace.resolve', { workspaceId }) as Promise<{ ok: true; value: Workspace } | Failure>
+})
 /** The scope the queue lists now, or null when the owner must choose (see workspace-scope.ts). */
-const dashScope = () => (dash.scopeLost ? null : effectiveScope(dash.chosen, dash.focus, dash.inv))
-async function resolveFocus() {
-  if (dash.focus !== undefined) return
-  const host = (orca as unknown as { host?: { call?: (m: string, p?: unknown) => Promise<{ workspaceId?: string } | null> } }).host
-  let ctx: { workspaceId?: string } | null = null
-  try { ctx = host?.call ? await host.call('workspace.readContext') : null } catch { ctx = null }
-  if (!ctx?.workspaceId) { dash.focus = null; return }
-  const r = await call(req, 'workspace.resolve', { workspaceId: ctx.workspaceId })
-  if (r.ok) dash.focus = r.value
-  else { dash.focus = null; dash.focusFail = r }
+const dashScope = () => scopeOf(dash.ws)
+type HostCall = { call?: (m: string, p?: unknown) => Promise<{ workspaceId?: string } | null> }
+let focusRead: Promise<unknown> | null = null
+/** The first focused workspace: read once from the frame's host API; later changes arrive as events. */
+function ensureFocus() {
+  if (dash.ws.focus !== undefined) return Promise.resolve()
+  focusRead ??= (async () => {
+    const host = (orca as unknown as { host?: HostCall }).host
+    let ctx: { workspaceId?: string } | null = null
+    try { ctx = host?.call ? await host.call('workspace.readContext') : null } catch { ctx = null }
+    if (dash.ws.focus === undefined) await tracker.focusChanged(ctx)
+  })()
+  return focusRead
+}
+/** A new first page for the scope in effect; the open decision and its draft are untouched. */
+function newScopeQuery() {
+  dash.rows = []; dash.next = undefined; dash.fail = null; dash.loaded = false
+  void loadQueue()
+}
+/** After focus or inventory news: re-query when the scope changed (or was never loaded), else repaint. */
+function scopeNews(changed: boolean) {
+  if (ref.view !== 'dashboard') return
+  if (dash.mode === 'practice') { paintQueue(); return } // Practice has no workspace scope
+  if (changed || dashScopeKey !== currentKey()) newScopeQuery(); else paintQueue()
+}
+// Orca's events for this frame (workspace:read): focus changes and created/removed workspaces. The
+// frame may miss events while hidden, so becoming visible again re-reads the inventory too.
+// While the dashboard shows Practice, nothing live is read: the latest focus report and any
+// inventory news are kept and applied when the owner switches back to the Inbox (`setMode`).
+let deferred: { focus?: { context: { workspaceId?: string } | null }; inventory?: boolean } = {}
+const inPractice = () => ref.view === 'dashboard' && dash.mode === 'practice'
+orca.on('workspace.changed', ({ context }) => {
+  if (inPractice()) { deferred.focus = { context }; return }
+  const p = tracker.focusChanged(context).then(scopeNews)
+  if (dash.ws.focus === undefined) focusRead = p // the first report stands in for the initial read
+})
+orca.on('workspace.created', () => { if (inPractice()) { deferred.inventory = true; return } void tracker.refreshInventory().then(scopeNews) })
+orca.on('workspace.removed', () => { if (inPractice()) { deferred.inventory = true; return } void tracker.refreshInventory().then(scopeNews) })
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible' || ref.view !== 'dashboard') return
+  if (inPractice()) { deferred.inventory = true; return }
+  void tracker.refreshInventory().then(scopeNews)
+})
+/** Back in the Inbox: apply what Practice deferred (a focus change re-reads the inventory too). */
+async function catchUpLive() {
+  const { focus, inventory } = deferred
+  deferred = {}
+  if (focus) await tracker.focusChanged(focus.context)
+  else if (inventory) await tracker.refreshInventory()
 }
 // Every tab reads history too: Pending / Answered / All split the same rows.
 const pageInput = (scope: Scope, cursor?: string) => queueInput(scope, { query: dash.term, includeHistory: true, timeZone: clock.zone(), cursor })
 async function loadQueue(more = false) {
+  if (dash.mode === 'practice') return loadPractice(more)
   if (!more) { dash.next = undefined; if (dashScopeKey !== currentKey()) dash.rows = [] } // a new query never reuses another query's cursor or rows
-  await Promise.all([resolveFocus(), loadInventory()])
+  await Promise.all([ensureFocus(), tracker.ensureInventory()])
+  if (inPractice()) return // the owner switched to Practice meanwhile: nothing live is read
   const scope = dashScope()
+
   if (!scope) { ++dashSeq; dash.loading = false; dash.loaded = true; dash.rows = []; dash.next = undefined; paintQueue(); return }
   const mine = ++dashSeq
   dash.loading = more ? 'more' : 'first'; paintQueue()
   const r = await call(req, 'listDecisionPage', pageInput(scope, more ? dash.next : undefined))
   if (mine !== dashSeq) return // a newer query or scope won
+  // A workspace the worker refused and a fresh inventory no longer lists: ask, never widen.
+  if (!r.ok && await tracker.refused(scope, r)) { if (mine === dashSeq) { dash.loading = false; newScopeQuery() } return }
+  if (mine !== dashSeq) return
+  // The scope changed while this page was in flight: not this view's list (its own query follows).
+  if (currentKey() !== scopeValue(scope)) { dash.loading = false; newScopeQuery(); return }
   dash.loading = false; dash.loaded = true
   dashScopeKey = scopeValue(scope)
-  // A chosen workspace the worker no longer lets us read: ask, never widen.
-  if (!r.ok && scope.kind === 'workspace' && dash.chosen?.kind === 'workspace' && (r.code === 'forbidden' || r.code === 'not-found')) { dash.scopeLost = r; dash.rows = []; dash.next = undefined; paintQueue(); return }
   if (r.ok) {
     const seen = new Set(more ? dash.rows.map((x) => x.questionId) : [])
     dash.rows = more ? [...dash.rows, ...r.value.rows.filter((x) => !seen.has(x.questionId))] : r.value.rows
     dash.next = r.value.nextCursor; dash.fail = null
-    if (!more) { dash.sources = sourcesOf(r.value); dash.mail = r.value.mail }
+    if (!more) { const m = JSON.stringify(dash.mail); dash.sources = sourcesOf(r.value); dash.mail = r.value.mail; if (dashSel && m !== JSON.stringify(dash.mail)) requestRender(true) }
   } else dash.fail = r
   paintQueue()
 }
 let dashScopeKey = ''
 const currentKey = () => { const sc = dashScope(); return sc ? scopeValue(sc) : '' }
 async function refreshQueue() {
+  if (dash.mode === 'practice') return refreshPractice()
   const scope = dashScope()
   if (!scope || dashScopeKey !== scopeValue(scope)) return
   const want = dash.rows.length
@@ -1978,14 +2096,80 @@ async function refreshQueue() {
   do {
     const r = await call(req, 'listDecisionPage', pageInput(scope, cursor))
     if (mine !== dashSeq) return
-    if (!r.ok) { dash.fail = r; paintQueue(); return }
+    if (!r.ok) { if (await tracker.refused(scope, r)) { if (mine === dashSeq) newScopeQuery() } else if (mine === dashSeq) { dash.fail = r; paintQueue() } return }
+    if (currentKey() !== scopeValue(scope)) return
     if (!first) first = r.value
     for (const x of r.value.rows) if (!seen.has(x.questionId)) { seen.add(x.questionId); rows.push(x) }
     cursor = r.value.nextCursor
   } while (cursor && rows.length < want && ++pages < 20)
   dash.rows = rows; dash.next = cursor; dash.fail = null
-  if (first) { dash.sources = sourcesOf(first); dash.mail = first.mail }
+  if (first) { const m = JSON.stringify(dash.mail); dash.sources = sourcesOf(first); dash.mail = first.mail; if (dashSel && m !== JSON.stringify(dash.mail)) requestRender(true) } // the reply card says where answers go
   paintQueue()
+}
+// ---- Practice Inbox: the same queue, without a workspace scope ----------------------------------
+const practiceInput = (cursor?: string) => ({ ...(dash.term.trim() ? { query: dash.term.trim() } : {}), includeHistory: true, timeZone: clock.zone(), ...(cursor ? { cursor } : {}) })
+async function loadPractice(more = false) {
+  if (!more) dash.next = undefined
+  const mine = ++dashSeq
+  dash.loading = more ? 'more' : 'first'; paintQueue()
+  const r = await call(req, 'practice.listDecisionPage', practiceInput(more ? dash.next : undefined))
+  if (mine !== dashSeq || dash.mode !== 'practice') return // a newer query or the Inbox won
+  dash.loading = false; dash.loaded = true; dashScopeKey = PRACTICE_KEY
+  if (r.ok) {
+    const seen = new Set(more ? dash.rows.map((x) => x.questionId) : [])
+    dash.rows = more ? [...dash.rows, ...r.value.rows.filter((x) => !seen.has(x.questionId))] : r.value.rows
+    dash.next = r.value.nextCursor; dash.fail = null
+    if (!more) { dash.sources = []; dash.mail = undefined } // Practice reads no live source and sends no mail
+  } else dash.fail = r
+  paintQueue()
+}
+async function refreshPractice() {
+  if (dashScopeKey !== PRACTICE_KEY) return
+  const want = dash.rows.length, mine = ++dashSeq
+  const rows: Decision[] = []; const seen = new Set<string>()
+  let cursor: string | undefined; let pages = 0
+  do {
+    const r = await call(req, 'practice.listDecisionPage', practiceInput(cursor))
+    if (mine !== dashSeq || dash.mode !== 'practice') return
+    if (!r.ok) { dash.fail = r; paintQueue(); return }
+    for (const x of r.value.rows) if (!seen.has(x.questionId)) { seen.add(x.questionId); rows.push(x) }
+    cursor = r.value.nextCursor
+  } while (cursor && rows.length < want && ++pages < 20)
+  dash.rows = rows; dash.next = cursor; dash.fail = null
+  paintQueue()
+}
+const PRACTICE_KEY = 'practice'
+/**
+ * Inbox ⇄ Practice. The open decision's draft is saved under its own question ID first; the sheet
+ * closes, because a practice question and a live one never share a reader. Filters stay.
+ */
+const modeFilters: Partial<Record<'inbox' | 'practice', { tab: Tab; priority: string; status: string; term: string }>> = {}
+async function setMode(mode: 'inbox' | 'practice') {
+  if (dash.mode === mode) return
+  ++dashSeq; ++seq // list and detail requests in flight belong to the other mode
+  if (dashTimer) { clearTimeout(dashTimer); dashTimer = null }
+  const kept = keepPendingNote()
+  if (dashSel) { await flushDraft(); dashSel = null; d = null; draftFor = null; draft = emptyDraft(); draftRevision = null; notice = null; notesOpen = false; noteSaved = null; sheetDrawnFor = undefined }
+  // Each mode keeps its own tab, search and filters: a filtered live queue never hides practice rows.
+  modeFilters[dash.mode] = { tab: dash.tab, priority: dash.priority, status: dash.status, term: dash.term }
+  const f = modeFilters[mode] ?? { tab: 'pending', priority: '', status: '', term: '' }
+  dash.mode = mode; dash.tab = f.tab; dash.priority = f.priority; dash.status = f.status; dash.term = f.term
+  dash.rows = []; dash.next = undefined; dash.fail = null; dash.loaded = false; dashScopeKey = ''
+  if (shell) {
+    const q = (k: string) => shell!.el.querySelector<HTMLInputElement | HTMLSelectElement>(`[data-k="${k}"]`)
+    const search = q('dash-search'), pri = q('f-priority'), stat = q('f-status')
+    const put = (e: HTMLInputElement | HTMLSelectElement | null, v: string) => {
+      if (!e) return
+      if (e.tagName === "SELECT") for (const o of Array.from(e.querySelectorAll("option"))) o.toggleAttribute("selected", o.getAttribute("value") === v)
+      else e.value = v
+    }
+    put(search, f.term); put(pri, f.priority); put(stat, f.status)
+  }
+  render()
+  if (mode === 'inbox') await catchUpLive()
+  shell?.el.querySelector<HTMLElement>(`[data-k="mode-${mode}"]`)?.focus()
+  say(`${mode === 'practice' ? 'Practice Inbox: synthetic decisions, saved on this device only' : 'Your Inbox'}${kept ? '. Your unsaved note was kept with its draft. Not sent.' : ''}`)
+  await loadQueue()
 }
 async function selectInDashboard(questionId: string) {
   if (dashSel === questionId) { render(); return }
@@ -1994,6 +2178,8 @@ async function selectInDashboard(questionId: string) {
   if (draftFor && draftFor !== questionId) await flushDraft()
   if (kept && leaving) say(`Your unsaved note was kept with the draft of “${leaving.title}”. Not sent.`)
   draftFor = null; draft = emptyDraft(); draftRevision = null; draftFail = null; d = null; pkg = []; notice = null; notesOpen = false; recOpen = false; recAsk = null; noteSaved = null
+  ++seq // a detail read in flight belongs to the previous decision
+  openPractice = dash.mode === 'practice'
   dashSel = questionId
   render()
   root.querySelector<HTMLElement>('#sheetTitle')?.focus({ preventScroll: true })
@@ -2012,7 +2198,7 @@ function closeDashSheet() {
 
 // ---- list model ----
 const statusOf = (x: Decision) => { const n = nativeOf(x); return n ? nativeStatusLabel(n.itemStatus) : STATE_LABEL[shownState(x)] }
-const wsLabel = (x: Decision) => { const n = nativeOf(x); return n && !n.workspaceAttributed ? 'No workspace attribution' : `${x.projectName} · ${x.workspaceName}` }
+const wsLabel = (x: Decision) => { const n = nativeOf(x); return isPractice(x) ? 'Practice Inbox' : n && !n.workspaceAttributed ? 'No workspace attribution' : `${x.projectName} · ${x.workspaceName}` }
 function inTab(x: Decision, tab: Tab) { return tab === 'all' || (tab === 'pending') === isActionable(x) }
 function visibleRows(tab: Tab = dash.tab) {
   return dash.rows.filter((x) => inTab(x, tab) && (!dash.priority || x.priority === dash.priority) && (!dash.status || statusOf(x) === dash.status))
@@ -2052,7 +2238,8 @@ function rowNode(x: Decision, now: number): HTMLElement {
     el('td', { class: 'd-col-bg' }, el('div', { class: 'd-bg-snip' }, x.background.replace(/```[^]*?(```|$)/g, ' ').replace(/\[([^\]\n]+)\]\([^)\s]+\)/g, '$1').replace(/https?:\/\/\S+/g, ' ').replace(/[#*`[\]()>_~-]+/g, ' ').replace(/\s+/g, ' ').trim())),
     el('td', { class: 'd-c-meta' }, el('span', { class: `d-pill d-p-${x.priority}` }, x.priority)),
     el('td', { class: 'd-c-meta' }, el('span', { class: 'd-pill' }, statusOf(x))),
-    el('td', { class: 'd-c-src d-nm' }, n ? 'Bot Item' : 'Chat'),
+    el('td', { class: 'd-c-src d-nm' }, n ? 'Bot Item' : isPractice(x) ? 'Practice' : 'Chat'),
+
     el('td', { class: 'd-c-ws d-nm' }, wsLabel(x)),
     el('td', { class: `d-c-meta d-nm d-c-due ${due?.overdue ? 'd-due-over' : ''}${due ? '' : ' d-no-due'}` }, due ? due.text : '—'))
   // The whole row opens the decision for pointers; the title button carries keyboard focus.
@@ -2071,44 +2258,46 @@ function paintQueue() {
   // Workspace selector options: this workspace, all workspaces, and each workspace seen in the rows.
   // One Workspace choice: All workspaces or one authorized workspace, from the worker's inventory.
   const scope = dashScope()
-  const intended = dash.chosen ?? (dash.focus ? { kind: 'workspace' as const, workspace: dash.focus } : null)
+  const st = dash.ws
   const shownValue = scope ? scopeValue(scope) : ''
-  shell.wsSel.replaceChildren(...workspaceChoices(dash.inv, scope, scope ? null : dash.focus).map((o) =>
+  shell.wsSel.replaceChildren(...workspaceChoices(st.inv, scope, scope ? null : st.focus).map((o) =>
     el('option', { value: o.value, selected: o.value === shownValue, ...(o.disabled ? { disabled: true } : {}) }, o.label)))
   const statuses = [...new Set(dash.rows.map(statusOf))].sort()
   shell.status.replaceChildren(el('option', { value: '', selected: !dash.status }, 'All'), ...statuses.map((st) => el('option', { value: st, selected: st === dash.status }, st)))
 
   const rows = visibleRows()
+  const practice = dash.mode === 'practice'
+  paintMode()
   const kids: (HTMLElement | string)[] = []
-  for (const x of dash.sources.filter((y) => y.state !== 'available')) {
-    kids.push(el('div', { class: 'callout warn' }, `${x.state === 'partial' ? `Some ${SRC_NAME[x.source]} could not be read.` : `${SRC_NAME[x.source]} are unavailable.`} ${x.message ?? ''} ${x.source === 'plugin' ? 'Bot Items' : 'Chat decisions'} below are not affected.`))
-  }
-  if (dash.mail?.state === 'unavailable') kids.push(el('div', { class: 'callout info' }, dash.mail.message && /saved in Decision Inbox/i.test(dash.mail.message) ? dash.mail.message : 'Answers to Chat decisions are saved in Decision Inbox. Orca mail from this plugin is unavailable on this host, so saved answers are not delivered to the chat yet.'))
+  // Practice says once what it is; the Inbox shows one collapsible source status (mail is said at the reply).
+  if (practice) kids.push(el('div', { class: 'd-practice-note', role: 'note', 'data-k': 'practice-note' },
+    el('b', {}, 'Practice Inbox.'), ' ', el('span', {}, 'Synthetic decisions to try the full flow. Drafts, notes and answers are saved in this Inbox on this device only; nothing is sent to any chat, agent or Orca mail. Your real Inbox and Bot Items are unchanged.')))
+  else { const ss = sourceStatusNode(dash.sources as StatusSource[]); if (ss) kids.push(ss) }
   if (dash.fail) kids.push(el('div', { class: 'callout', ...alertRole(`dash:${dash.fail.message}`) }, `${dash.rows.length ? 'Showing the last loaded list. ' : 'Could not load decisions. '}${failureText(dash.fail)} `,
-    el('button', { type: 'button', onclick: () => void loadQueue() }, 'Retry loading')))
+    el('button', { type: 'button', onclick: () => { void tracker.refreshInventory().then(scopeNews); void loadQueue() } }, 'Retry loading')))
   const chips: [string, string, () => void][] = []
   if (dash.priority) chips.push(['priority', `Priority: ${dash.priority}`, () => { dash.priority = '' }])
   if (dash.status) chips.push(['status', `Status: ${dash.status}`, () => { dash.status = '' }])
   if (dash.term.trim()) chips.push(['search', `Search: “${dash.term.trim()}”`, () => { dash.term = ''; const f = shell!.el.querySelector<HTMLInputElement>('[data-k="dash-search"]'); if (f) f.value = ''; void loadQueue() }])
   if (chips.length) kids.push(el('div', { class: 'd-chips', 'aria-label': 'Active filters' }, ...chips.map(([k, t, clear]) =>
     el('span', { class: 'd-chip' }, t, el('button', { type: 'button', 'aria-label': `Remove filter ${t}`, 'data-k': `chip-${k}`, onclick: () => { clear(); paintQueue(); say('Filter removed') } }, '✕')))))
-  const label = !scope ? 'no workspace' : scope.kind === 'all' ? 'all workspaces' : workspaceLabel(scope.workspace, dash.inv?.workspaces ?? [])
+  const label = practice ? 'Practice Inbox' : !scope ? 'no workspace' : scope.kind === 'all' ? 'all workspaces' : workspaceLabel(scope.workspace, st.inv?.workspaces ?? [])
   kids.push(el('div', { class: 'd-meta-line' },
     el('span', { role: 'status' }, dash.loading === 'first' ? 'Loading decisions…' : `${rows.length}${more} ${dash.term.trim() ? 'matching ' : ''}decision${rows.length === 1 ? '' : 's'} · ${label}`)))
   const degraded = dash.sources.some((x) => x.state !== 'available')
-  if (dash.invFail) kids.push(el('div', { class: 'callout warn' }, `Could not list your workspaces. ${failureText(dash.invFail)} The Workspace list shows only the current choice.`))
-  else if (dash.inv?.truncated) kids.push(el('div', { class: 'callout info' }, 'Some workspaces could not be listed. The Workspace list shows the ones Orca reported.'))
-  if (!scope && dash.focus !== undefined) {
+  if (practice) { /* no workspace inventory in Practice */ } else if (st.invFail) kids.push(el('div', { class: 'callout warn' }, `Could not list your workspaces. ${failureText(st.invFail)} The Workspace list shows only the current choice.`))
+  else if (st.inv?.truncated) kids.push(el('div', { class: 'callout info' }, 'Some workspaces could not be listed. The Workspace list shows the ones Orca reported.'))
+  if (!practice && !scope && st.focus !== undefined) {
     // Ask; never widen to All workspaces by ourselves.
-    const lost = intended?.kind === 'workspace' && (dash.scopeLost || missing(intended.workspace, dash.inv))
+    const lost = lostWorkspace(st)
     kids.push(el('div', { class: 'd-empty', role: 'status' },
-      el('b', {}, lost ? `${workspaceLabel((intended as { workspace: Workspace }).workspace, dash.inv?.workspaces ?? [])} is no longer available.`
-        : dash.focusFail ? `Could not identify the focused workspace. ${failureText(dash.focusFail)}` : 'No workspace is focused.'),
-      'Choose a workspace or All workspaces in the Workspace list.',
+      el('b', {}, lost ? `${workspaceLabel(lost, st.inv?.workspaces ?? [])} is no longer available.`
+        : st.focusFail ? `Could not identify the focused workspace. ${failureText(st.focusFail)}` : 'No workspace is focused.'),
+      lost && st.chosen ? 'Your choice is kept until you pick another. Choose a workspace or All workspaces in the Workspace list.' : 'Choose a workspace or All workspaces in the Workspace list.',
       el('button', { type: 'button', class: 'd-btn', 'data-k': 'choose-ws', onclick: () => shell?.wsSel.focus() }, 'Choose workspace')))
   } else if (dash.loaded && !rows.length && !dash.loading) {
-    kids.push(el('div', { class: 'd-empty' }, el('b', {}, chips.length || dash.term.trim() ? 'No decisions match these filters.' : degraded ? `Nothing found in ${label} from the sources that could be read.` : dash.tab === 'pending' ? `Nothing needs you in ${label}.` : 'Nothing here yet.'),
-      chips.length ? 'Remove a filter chip or reset to see more.' : scope?.kind === 'workspace' ? 'Choose All workspaces in the Workspace list to see other workspaces. Bot Items without a workspace appear only there.' : 'New questions from agents appear here.'))
+    kids.push(el('div', { class: 'd-empty' }, el('b', {}, chips.length || dash.term.trim() ? 'No decisions match these filters.' : practice ? (dash.tab === 'pending' ? 'No practice decisions are waiting.' : 'No practice decisions here.') : degraded ? `Nothing found in ${label} from the sources that could be read.` : dash.tab === 'pending' ? `Nothing needs you in ${label}.` : 'Nothing here yet.'),
+      chips.length ? 'Remove a filter chip or reset to see more.' : practice ? (dash.tab === 'pending' ? 'Every practice decision has a saved answer. See Answered or All.' : 'Practice decisions appear here.') : scope?.kind === 'workspace' ? 'Choose All workspaces in the Workspace list to see other workspaces. Bot Items without a workspace appear only there.' : 'New questions from agents appear here.'))
   } else if (rows.length) {
     kids.push(el('div', { class: 'd-table-wrap', id: 'panel', role: 'tabpanel', 'aria-labelledby': `tab-${dash.tab}`, 'data-k': 'table-wrap', tabindex: -1 },
       el('table', {}, el('caption', { class: 'sr' }, `Decisions, grouped by ${dash.group}`),
@@ -2122,13 +2311,33 @@ function paintQueue() {
   shell.list.replaceChildren(...kids)
   if (focusedKey) shell.list.querySelector<HTMLElement>(`[data-k="${CSS.escape(focusedKey)}"]`)?.focus({ preventScroll: true })
 }
+/** One collapsible status for the live sources; null when every source was read in full. */
+function sourceStatusNode(sources: readonly StatusSource[]): HTMLElement | null {
+  const v = sourceStatus(sources)
+  if (!v) return null
+  const unavailable = sources.some((x) => x.state === 'unavailable')
+  return el('details', { class: `d-srcstat ${v.tone}`, 'data-k': 'source-status', ...(v.open || srcOpen ? { open: true } : {}),
+      ontoggle: (ev: Event) => { srcOpen = (ev.target as HTMLDetailsElement).open } },
+    el('summary', { ...(unavailable ? alertRole(`src:${v.summary}`) : {}) }, v.summary),
+    el('ul', {}, ...v.lines.map((l) => el('li', { class: l.tone }, el('b', {}, `${l.label}. `), l.text))),
+    ...(unavailable ? [el('button', { type: 'button', class: 'd-btn d-sm d-srcstat-act', 'data-k': 'source-retry', onclick: () => { void tracker.refreshInventory().then(scopeNews); void loadQueue() } }, 'Check sources again')] : []))
+}
+let srcOpen = false
+/** The Inbox / Practice switch and, in Practice, a fixed scope label instead of the Workspace list. */
+function paintMode() {
+  if (!shell) return
+  const practice = dash.mode === 'practice'
+  shell.mode.querySelectorAll<HTMLButtonElement>('[data-mode]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.mode === dash.mode)))
+  shell.modeSay.textContent = practice ? 'Synthetic decisions · saved on this device · nothing is sent' : 'Your decisions from Chats and Bot Items'
+  shell.wsPick.hidden = practice
+  shell.wsStatic.hidden = !practice
+}
 /** An explicit Workspace choice: fixed for this view; the queue starts a new first-page query. */
 function chooseWorkspace(v: string) {
-  const sc = scopeFromValue(v, dash.inv?.workspaces ?? [], [dash.chosen?.kind === 'workspace' ? dash.chosen.workspace : null, dash.focus ?? null].filter((w): w is Workspace => !!w))
-  if (!sc || (sameScope(sc, dashScope()) && !dash.scopeLost)) return
-  dash.chosen = sc; dash.scopeLost = null; dash.rows = []; dash.next = undefined; dash.fail = null; dash.loaded = false
-  void loadQueue()
-  say(`Showing ${sc.kind === 'all' ? 'all workspaces' : workspaceLabel(sc.workspace, dash.inv?.workspaces ?? [])}`)
+  if (!tracker.choose(v)) { paintQueue(); return } // pinned; the same scope stays listed
+  const sc = dashScope()!
+  newScopeQuery()
+  say(`Showing ${sc.kind === 'all' ? 'all workspaces' : workspaceLabel(sc.workspace, dash.ws.inv?.workspaces ?? [])}`)
 }
 function buildShell() {
   const tabs = el('div', { class: 'd-tabs', role: 'tablist', 'aria-label': 'View' })
@@ -2158,11 +2367,19 @@ function buildShell() {
       toolbar.querySelectorAll('select:not([data-k="group-by"])').forEach((s) => { (s as HTMLSelectElement).value = '' }); void loadQueue(); say('Filters reset')
     } }, 'Reset'), filtersBtn, groupBy)
   const list = el('div', { class: 'd-results' })
+  // Always discoverable: the Inbox / Practice switch heads the queue in every width.
+  const modeBtn = (m: 'inbox' | 'practice', ...label: (Node | string)[]) => el('button', { type: 'button', 'data-mode': m, 'data-k': `mode-${m}`, 'aria-pressed': String(dash.mode === m), onclick: () => void setMode(m) }, ...label)
+  const mode = el('div', { class: 'd-mode-seg', role: 'group', 'aria-label': 'Which inbox' },
+    modeBtn('inbox', 'Inbox'), modeBtn('practice', 'Practice', el('span', { class: 'd-practice-tag', 'aria-hidden': 'true' }, 'safe')))
+  const modeSay = el('span', { class: 'd-mode-say' })
+  const wsPick = el('label', { class: 'd-ws-pick' }, el('span', { class: 'd-ws-label' }, 'Workspace'), wsSel)
+  const wsStatic = el('span', { class: 'd-ws-pick d-ws-static', hidden: true }, 'Practice · this device')
   const side = el('section', { class: 'd-list-side', 'aria-label': 'Decisions' },
-    el('div', { class: 'd-tabs-row' }, tabs, el('label', { class: 'd-ws-pick' }, el('span', { class: 'd-ws-label' }, 'Workspace'), wsSel)),
+    el('div', { class: 'd-mode' }, mode, modeSay),
+    el('div', { class: 'd-tabs-row' }, tabs, wsStatic, wsPick),
     toolbar, list)
   const sheetSlot = el('div', { class: 'd-sheet-slot' })
-  shell = { el: el('div', { class: 'd-workspace' }, side, divider(), sheetSlot), list, tabs, wsSel, status: statusLabel.querySelector('select')!, sheet: sheetSlot, side }
+  shell = { el: el('div', { class: 'd-workspace' }, side, divider(), sheetSlot), list, tabs, wsSel, status: statusLabel.querySelector('select')!, sheet: sheetSlot, side, mode, modeSay, wsPick, wsStatic }
 }
 // ---- resizable sheet (wide only) ------------------------------------------------------------------
 // A separator between the table and the sheet: drag (pointer or touch), or focus it and use the arrow
@@ -2267,6 +2484,9 @@ function render() {
 /** Opens what the reference file names. A new question flushes the old draft under its own ID. */
 async function bind() {
   if (ref.view === 'dashboard') {
+    // The file names the mode (the + menu's practice file opens Practice); an edit to it switches.
+    const want = ref.mode === 'practice' ? 'practice' : 'inbox'
+    if (shell && want !== dash.mode) return setMode(want)
     render()
     await loadQueue()
     return
@@ -2278,6 +2498,7 @@ async function bind() {
       if (kept && leaving) say(`Your unsaved note was kept with the draft of “${leaving.title}”. Not sent.`)
       draftFor = null; draft = emptyDraft(); draftRevision = null; draftFail = null; d = null; pkg = []; notice = null; noteSaved = null
     }
+    openPractice = ref.mode === 'practice' // after the previous question's draft was saved under its own mode
     render()
     await loadReview(ref.questionId)
   } else if (ref.view === 'settings') {
@@ -2290,15 +2511,22 @@ session?.onReplace((v) => { ref = readRef(v); void bind() })
 // Empty invalidation from the worker: refetch through the authenticated requests.
 // Bursts (each draft save, delivery, receipt) coalesce; the page changes only on real differences.
 let invalidTimer: ReturnType<typeof setTimeout> | null = null
-orca.plugin.on('inbox.changed', () => {
+// Live invalidations refresh the Inbox; Practice writes send their own `practice.changed`, so a
+// practice save never makes the live sources be read again (and a live change never reloads Practice).
+const invalidated = (practice: boolean) => {
   if (invalidTimer) clearTimeout(invalidTimer)
   invalidTimer = setTimeout(() => {
     invalidTimer = null
     if (ref.view === 'review') void loadReview(ref.questionId, true, true)
-    else if (ref.view === 'dashboard') { void refreshQueue(); if (dashSel) void loadReview(dashSel, true, true) }
-    else if (ref.view === 'settings') void settingsInvalidated()
+    else if (ref.view === 'dashboard') {
+      if ((dash.mode === 'practice') !== practice) return
+      void refreshQueue(); if (dashSel) void loadReview(dashSel, true, true)
+    } else if (ref.view === 'settings' && !practice) void settingsInvalidated()
   }, 150)
-})
+}
+orca.plugin.on('inbox.changed', () => invalidated(false))
+;(orca.plugin.on as (name: string, f: () => void) => unknown)('practice.changed', () => invalidated(true))
+
 // Live clock: deadlines and relative text stay current, without interrupting typing.
 setInterval(() => { if ((ref.view === 'review' || ref.view === 'dashboard') && d) requestRender() }, 60_000)
 await bind()

@@ -4,6 +4,7 @@
 // Orca, network or private data. Drafts follow the worker's compare-and-set rule and live in
 // sessionStorage, so a reload after a source edit keeps them, as worker storage would.
 import { decisions, historyExample, clock, origins } from './build/fixtures/decisions.js'
+import { createPractice, practiceOwner } from './build/src/backend-practice.js'
 import { order } from './build/src/model.js'
 
 const clone = (v) => (v === undefined ? v : structuredClone(v))
@@ -67,6 +68,31 @@ export function createMockOrca({ ref, history = false }) {
   const draft = (q) => JSON.parse(sessionStorage.getItem(key(q)) ?? 'null') ?? { draft: null, revision: 0 }
   let settings = { defaultTemplate: 'Ask one question with clear options and a recommendation.', exceptions: [], revision: 1 }
   const listeners = {}
+  // Run the same sample packages, draft revision checks and local answer store as the plugin.
+  const practice = createPractice({
+    storage: {
+      get: async key => JSON.parse(sessionStorage.getItem(key) ?? 'null'),
+      set: async (key, value) => sessionStorage.setItem(key, JSON.stringify(value)),
+      delete: async key => sessionStorage.removeItem(key),
+      keys: async () => Object.keys(sessionStorage)
+    },
+    panels: { post: event => setTimeout(() => (listeners[event] ?? []).forEach(fn => fn({})), 0) }
+  })
+  const practiceRow = row => ({ ...row, source: { kind: 'practice' },
+    actions: row.answerState.state === 'awaiting-answer' ? ['reply'] : ['follow-up'] })
+  async function practiceRequest(name, input) {
+    await practice.ready()
+    if (name === 'practice.listDecisionPage') {
+      const r = await practice.backend.listDecisionPage(practiceOwner, { ...input, scope: { kind: 'all' } })
+      return r.ok ? ok({ ...r.value, rows: r.value.rows.map(practiceRow) }) : r
+    }
+    if (name === 'getDecision') {
+      const r = await practice.backend.getDecision(practiceOwner, input)
+      return r.ok ? ok(practiceRow(r.value)) : r
+    }
+    const method = { 'draft.get': 'getDraft', 'draft.save': 'saveDraft', getSnapshot: 'getSnapshot', submitReply: 'submitReply' }[name]
+    return method ? practice.backend[method](practiceOwner, input) : err('unavailable', 'This action is unavailable in Practice.')
+  }
   const page = ({ scope, query, includeHistory, cursor }) => {
     const t = (query ?? '').toLocaleLowerCase()
     const rows = order([...db.values()]).filter((d) => (scope.kind === 'all' ||
@@ -130,6 +156,7 @@ export function createMockOrca({ ref, history = false }) {
     host: { call: async (method) => (method === 'workspace.readContext' ? { workspaceId: 'studio-local', branch: 'main', displayName: 'studio', terminals: [] } : null) },
     plugin: {
       request: async (name, input) => {
+        if (name === 'practice.listDecisionPage' || input?.mode === 'practice') return practiceRequest(name, input)
         const h = handlers[name]
         if (!h) throw Object.assign(new Error(`No handler ${name}`), { code: 'unknown_method' })
         await new Promise((r) => setTimeout(r, 40)) // a little latency, like the worker bridge

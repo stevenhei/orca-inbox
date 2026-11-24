@@ -1,17 +1,18 @@
 import {
   atom, read, set, on, plugin,
   Badge, Box, Button, Callout, Card, Checkbox, Collapsible, EmptyState, Heading, IconButton, Input, KeyValue, Link, List,
-  ListItem, Markdown, RadioGroup, Row, Select, Skeleton, Stack, Text, Textarea
+  ListItem, Markdown, RadioGroup, Row, Select, Skeleton, Stack, Tab, Tabs, Text, Textarea
 } from 'orca'
 import type { PanelContext } from 'orca'
 import type { Answer, Decision, Delivery, RecordedReply, SubmitReply, Workspace } from './contract.ts'
 import type { InboxSettings } from './backend-protocol.ts'
 import { autolinkForMarkdown } from './markdown-inline.ts'
-import { NOTE_FIELD_LABEL, makeNote, noteTargets, occurrences } from './note-anchors.ts'
-import { STATE_LABEL, actionsOf, deadlineLabel, replyState, isActionable, nativeNeedsYou, nativeOf, nativeStatusLabel, order, sameWorkspace, shownState, siblings, undeliveredReplies } from './model.ts'
+import { NOTE_FIELD_LABEL, makeNote, noteLabel, notesFate, noteTargets, occurrences } from './note-anchors.ts'
+import { STATE_LABEL, actionsOf, deadlineLabel, replyState, isActionable, isPractice, nativeNeedsYou, nativeOf, nativeStatusLabel, order, sameWorkspace, shownState, siblings, undeliveredReplies } from './model.ts'
+import { replyReach, sourceStatus } from './source-status.ts'
 import { call, clock, draftIsEmpty, emptyDraft, failureText, formatInstant, newReplyId, reconcile, replies, sourcesOf, transportOf, type Draft, type Failure, type Requester, type SourceStatus } from './client.ts'
 import type { DecisionPage, WorkspaceOptions } from './backend-protocol.ts'
-import { ALL_VALUE, effectiveScope, missing, queueInput, sameScope, scopeFromValue, scopeValue, workspaceChoices, workspaceLabel, type Scope } from './workspace-scope.ts'
+import { ALL_VALUE, ScopeTracker, emptyScopeState, intendedScope, lostWorkspace, queueInput, scopeOf, scopeValue, workspaceChoices, workspaceLabel, type Scope, type ScopeState } from './workspace-scope.ts'
 type MailStatus = NonNullable<DecisionPage['mail']>
 
 // Narrow right-sidebar panel, declarative Orca components only. Data comes from the plugin
@@ -29,20 +30,19 @@ type MailStatus = NonNullable<DecisionPage['mail']>
 
 const req: Requester = (name, input, options) => (plugin.request as Requester)(name, input, options)
 
-/** The owner's explicit Workspace choice; undefined until they choose (then focus applies). */
-const chosen = atom<Scope | undefined>(undefined)
-/** Authorized workspaces (names, hosts), and why they could not be read. */
-const inv = atom<WorkspaceOptions | null>(null)
-const invError = atom<string | null>(null)
-/** The worker refused the chosen workspace (forbidden / not found): ask again. */
-const scopeLost = atom(false)
+/**
+ * The Workspace choice, focused workspace, authorized inventory and any refusal: one state, changed
+ * only by the shared tracker (workspace-scope.ts), which the dashboard uses too.
+ */
+const ws = atom<ScopeState>(emptyScopeState())
+const tracker = new ScopeTracker({ get: () => read(ws), set: (v) => set(ws, v) }, {
+  options: () => call(req, 'workspace.options') as Promise<{ ok: true; value: WorkspaceOptions } | Failure>,
+  resolve: (workspaceId) => call(req, 'workspace.resolve', { workspaceId }) as Promise<{ ok: true; value: Workspace } | Failure>
+})
 const term = atom('')
 const history = atom(false)
 /** The decision whose review tab the worker last opened, by question ID. Set only on success. */
 const openId = atom<string | null>(null)
-/** Focused workspace: undefined while unknown, null when none is focused or it cannot be resolved. */
-const current = atom<Workspace | null | undefined>(undefined)
-const focusError = atom<string | null>(null)
 /** Loaded pages for one query key, so a failed refresh still shows (and labels) the last list. */
 const rows = atom<{ key: string; list: Decision[]; nextCursor?: string; sources: SourceStatus[]; mail?: MailStatus } | null>(null)
 const loading = atom<false | 'first' | 'more'>(false)
@@ -52,10 +52,9 @@ const loadError = atom<{ key: string; f: Failure } | null>(null)
 const now = atom(clock.now())
 
 let seq = 0
-let focusSeq = 0
 let searchTimer: ReturnType<typeof setTimeout> | null = null
 /** The scope listed now, or null when the owner must choose. */
-const scopeNow = () => (read(scopeLost) ? null : effectiveScope(read(chosen), read(current), read(inv)))
+const scopeNow = () => scopeOf(read(ws))
 const queryKey = (sc: Scope | null, t: string, h: boolean) => `${sc ? scopeValue(sc) : 'none'}|${h ? 'h' : '-'}|${t.trim()}`
 const pageInput = (sc: Scope, t: string, h: boolean, cursor?: string) => queueInput(sc, { query: t, includeHistory: h, timeZone: clock.zone(), cursor })
 
@@ -75,8 +74,11 @@ async function load(more = false) {
   const r = await call(req, 'listDecisionPage', pageInput(sc, t, h, cursor))
   if (mine !== seq) return // a newer query, scope or refresh won; it owns the loading state
   set(loading, false)
-  // The worker refuses a chosen workspace that is no longer authorized: ask, never widen.
-  if (!r.ok && sc.kind === 'workspace' && read(chosen)?.kind === 'workspace' && (r.code === 'forbidden' || r.code === 'not-found')) { set(scopeLost, true); return }
+  // The worker refused this workspace and the inventory confirms it is gone: ask, never widen.
+  if (!r.ok && await tracker.refused(sc, r)) { if (mine === seq) void load(); return }
+  if (mine !== seq) return
+  // The scope changed while this page was in flight (focus, inventory): it is not this view's list.
+  if (queryKey(scopeNow(), read(term).trim(), read(history)) !== key) return
   if (supersededRefresh && r.ok) invalidated()
   if (r.ok) {
     const seen = new Set(cursor ? prev!.list.map((d) => d.questionId) : [])
@@ -114,7 +116,12 @@ async function refresh() {
   do {
     const r = await call(req, 'listDecisionPage', pageInput(sc, t, h, cursor))
     if (mine !== seq) return
-    if (!r.ok) { refreshing = false; set(loading, false); set(loadError, { key, f: r }); return }
+    if (!r.ok) {
+      refreshing = false; set(loading, false)
+      if (await tracker.refused(sc, r)) { if (mine === seq) void load() } else if (mine === seq) set(loadError, { key, f: r })
+      return
+    }
+    if (queryKey(scopeNow(), read(term).trim(), read(history)) !== key) { refreshing = false; set(loading, false); return }
     const before = list.length
     for (const d of r.value.rows) if (!seen.has(d.questionId)) { seen.add(d.questionId); list.push(d) }
     if (pages === 0) { sources = sourcesOf(r.value); mail = r.value.mail } // the first page reports availability
@@ -134,41 +141,20 @@ function invalidated() {
   refreshTimer = setTimeout(() => { refreshTimer = null; void refresh() }, 150)
 }
 
-/** A later focus change always wins, even when an earlier resolve answers last. */
-async function focus(context: { workspaceId?: string } | null) {
-  const mine = ++focusSeq
-  set(focusError, null)
-  if (!context?.workspaceId) { set(current, null); return }
-  const r = await call(req, 'workspace.resolve', { workspaceId: context.workspaceId })
-  if (mine !== focusSeq) return
-  if (r.ok) {
-    const prev = read(current)
-    set(current, r.value)
-    // Reload when the workspace changed, or when the loaded rows belong to another query (for
-    // example after the panel was reopened with state from an earlier run).
-    const loadedKey = read(rows)?.key
-    const stale = loadedKey !== queryKey(scopeNow(), read(term), read(history))
-    if (!read(chosen) && (!prev || !sameWorkspace(prev, r.value) || stale)) await load()
-  } else {
-    set(current, null)
-    set(focusError, failureText(r))
-  }
+/**
+ * Focus, lifecycle and refusals go through the shared tracker; a new first page is read whenever the
+ * scope in effect changes, or when the loaded rows belong to another query. A later focus change
+ * always wins, even when an earlier resolve answers last.
+ */
+const reloadIfStale = (changed: boolean) => {
+  if (changed || read(rows)?.key !== queryKey(scopeNow(), read(term), read(history))) void load()
 }
-
-/** Authorized workspaces for the Workspace choice; the list reloads if they change what it shows. */
-async function loadInventory() {
-  const before = queryKey(scopeNow(), read(term), read(history))
-  const r = await call(req, 'workspace.options')
-  if (r.ok) { set(inv, r.value); set(invError, null) } else set(invError, failureText(r))
-  if (queryKey(scopeNow(), read(term), read(history)) !== before || !read(rows)) void load()
-}
+async function focus(context: { workspaceId?: string } | null) { reloadIfStale(await tracker.focusChanged(context)) }
+/** Orca created or removed a workspace, the panel came back, or the owner retried: re-read the list. */
+async function refreshWorkspaces() { reloadIfStale(await tracker.refreshInventory()) }
 /** An explicit Workspace choice: kept across focus changes; a new first-page query. */
 function chooseScope(v: string) {
-  const w = read(current), c = read(chosen)
-  const sc = scopeFromValue(v, read(inv)?.workspaces ?? [], [c?.kind === 'workspace' ? c.workspace : null, w ?? null].filter((x): x is Workspace => !!x))
-  if (!sc || (sameScope(sc, scopeNow()) && !read(scopeLost))) return
-  set(chosen, sc); set(scopeLost, false)
-  void load()
+  if (tracker.choose(v)) void load()
 }
 
 function search(v: string) {
@@ -180,6 +166,49 @@ function search(v: string) {
 function toggleHistory(v: boolean) {
   set(history, v)
   void load()
+}
+
+// ---- Practice Inbox in the panel ------------------------------------------------------------------
+// The worker's synthetic Practice Inbox: the same rows, reader and reply card, read through
+// `practice.listDecisionPage` with no workspace scope. While it is shown nothing live is read: focus,
+// workspace and inbox events are kept and applied when the owner goes back to the Inbox.
+const mode = atom<'inbox' | 'practice'>('inbox')
+const pList = atom<{ list: Decision[]; nextCursor?: string } | null>(null)
+const pLoading = atom<false | 'first' | 'more'>(false)
+const pFail = atom<Failure | null>(null)
+let pSeq = 0
+let deferred: { focus?: { context: { workspaceId?: string } | null }; inventory?: boolean; inbox?: boolean } = {}
+const inPractice = () => read(mode) === 'practice'
+async function loadPractice(more = false) {
+  const prev = read(pList)
+  const cursor = more ? prev?.nextCursor : undefined
+  if (more && !cursor) return
+  const mine = ++pSeq
+  set(pLoading, more ? 'more' : 'first')
+  const r = await call(req, 'practice.listDecisionPage', { includeHistory: true, timeZone: clock.zone(), ...(cursor ? { cursor } : {}) })
+  if (mine !== pSeq) return
+  set(pLoading, false)
+  if (!r.ok) { set(pFail, r); return }
+  const seen = new Set(cursor ? prev!.list.map((d) => d.questionId) : [])
+  const list = cursor ? [...prev!.list, ...r.value.rows.filter((d) => !seen.has(d.questionId))] : r.value.rows
+  const next = { list, ...(r.value.nextCursor ? { nextCursor: r.value.nextCursor } : {}) }
+  if (JSON.stringify(next) !== JSON.stringify(prev)) set(pList, next)
+  set(pFail, null)
+}
+/** Inbox ⇄ Practice: the open decision's draft is saved first and the panel returns to the list. */
+function setMode(m: string) {
+  const next = m === 'practice' ? 'practice' : 'inbox'
+  if (read(mode) === next) return
+  void flushDraft()
+  nav++
+  set(view, { kind: 'list' }); set(wide, null); set(mode, next)
+  if (next === 'practice') { void loadPractice(); return }
+  // Back in the Inbox: apply what Practice deferred.
+  const { focus: f, inventory, inbox } = deferred
+  deferred = {}
+  if (f) void focus(f.context)
+  else if (inventory) void refreshWorkspaces()
+  else if (inbox) invalidated()
 }
 
 // ---- in-panel navigation ------------------------------------------------------------------------
@@ -202,8 +231,18 @@ const wide = atom<{ nav: number; state: 'opening' | 'opened' | 'failed'; text?: 
  */
 const pkgRows = atom<{ packageId: string; rows: Decision[]; more: boolean } | null>(null)
 
+/**
+ * Whether the open decision was opened from Practice. It is bound when the decision opens (never
+ * inferred from its ID, since a live question ID may begin with `practice:`) and every detail, draft,
+ * snapshot and reply request for it carries `mode: "practice"`; live requests carry no mode.
+ */
+let detailPractice = false
+const md = <T extends object>(input: T, practice = detailPractice): T => (practice ? { ...input, mode: 'practice' } : input) as T
+/** Draft revisions are per mode and question, so equal IDs in Practice and the Inbox never mix. */
+const rk = (questionId: string, practice = detailPractice) => `${practice ? 'practice' : 'live'}|${questionId}`
 function openDecision(d: Decision) {
   void flushDraft()
+  detailPractice = inPractice()
   const mine = ++nav
   set(view, { kind: 'decision', questionId: d.questionId, title: d.title })
   set(openId, d.questionId)
@@ -214,10 +253,14 @@ function openDecision(d: Decision) {
 }
 async function loadPackage(mine: number, d: Decision) {
   const native = nativeOf(d)
-  const r = await call(req, 'listDecisionPage', {
-    scope: native && !native.workspaceAttributed ? { kind: 'all' } : { kind: 'workspace', workspace: { hostId: d.origin.hostId, workspaceId: d.origin.workspaceId } },
-    query: d.packageId, includeHistory: true, timeZone: clock.zone()
-  })
+  // Practice siblings come from the Practice Inbox only (none to read when their IDs are declared).
+  if (isPractice(d) && d.package?.questionIds?.length) return
+  const r = isPractice(d)
+    ? await call(req, 'practice.listDecisionPage', { query: d.packageId, includeHistory: true, timeZone: clock.zone() })
+    : await call(req, 'listDecisionPage', {
+      scope: native && !native.workspaceAttributed ? { kind: 'all' } : { kind: 'workspace', workspace: { hostId: d.origin.hostId, workspaceId: d.origin.workspaceId } },
+      query: d.packageId, includeHistory: true, timeZone: clock.zone()
+    })
   if (mine !== nav || !r.ok) return
   const rows = r.value.rows.filter((x) => x.packageId === d.packageId)
   set(pkgRows, { packageId: d.packageId, rows: rows.some((x) => x.questionId === d.questionId) ? rows : [...rows, d], more: !!r.value.nextCursor })
@@ -254,7 +297,7 @@ type RichDecision = Decision & {
   nativeLinks?: { kind: string; ref: string; label: string; url?: string }[]
 }
 async function loadDetail(mine: number, questionId: string, passive = false) {
-  const r = await call(req, 'getDecision', { questionId })
+  const r = await call(req, 'getDecision', md({ questionId }))
   if (mine !== nav) return // the owner moved on: never overwrite another view
   if (!r.ok && passive && read(detail).state === 'ok') return // a failed refresh keeps the shown detail
   set(detail, r.ok ? { state: 'ok', value: r.value } : { state: 'fail', f: r })
@@ -269,7 +312,7 @@ async function openWide() {
   const v = read(view); const mine = nav
   if (v.kind === 'list') return
   set(wide, { nav: mine, state: 'opening' })
-  const r = v.kind === 'settings' ? await call(req, 'settings.open') : await call(req, 'review.open', { questionId: v.questionId })
+  const r = v.kind === 'settings' ? await call(req, 'settings.open') : await call(req, 'review.open', md({ questionId: v.questionId }))
   if (mine !== nav) return
   set(wide, r.ok ? { nav: mine, state: 'opened' } : { nav: mine, state: 'failed', text: failureText(r) })
 }
@@ -319,10 +362,10 @@ async function addPanelNote(d: Decision) {
 }
 async function loadDraft(mine: number, d: Decision) {
   if (read(cMeta).loaded && read(cMeta).questionId === d.questionId) return reconcileDraft(d)
-  const r = await call(req, 'draft.get', { questionId: d.questionId })
+  const r = await call(req, 'draft.get', md({ questionId: d.questionId }))
   if (mine !== nav) return
   if (r.ok) {
-    knownRevision.set(d.questionId, r.value.revision)
+    knownRevision.set(rk(d.questionId), r.value.revision)
     set(cDraft, r.value.draft ?? emptyDraft()); set(cMeta, { questionId: d.questionId, revision: r.value.revision, loaded: true }); set(cFail, null)
   }
   else { set(cMeta, { questionId: d.questionId, revision: null, loaded: true }); set(cFail, r) }
@@ -376,19 +419,21 @@ function saveDraftNow(): Promise<boolean> {
   if (!questionId || !meta.loaded) return saving.then(() => false)
   const draft = read(cDraft)
   const value: Draft | null = draftIsEmpty(draft) && !draft.replyId ? null : draft
+  const practice = detailPractice // bound now: a queued save keeps the mode of the decision it belongs to
+  const key = rk(questionId, practice)
   const p = saving.then(async (): Promise<boolean> => {
     // Our own earlier save of this question may have advanced the revision; that is still the
     // lineage the owner saw. No known revision means the draft could not be read: do not write.
-    const revision = knownRevision.get(questionId)
+    const revision = knownRevision.get(key)
     if (revision === undefined) {
       keepRecoverable(questionId, value)
       if (read(cMeta).questionId === questionId) set(cFail, { ok: false, code: 'unavailable', message: 'The stored draft could not be read, so this edit was not saved.' })
       return false
     }
-    const r = await call(req, 'draft.save', { questionId, draft: value, revision })
+    const r = await call(req, 'draft.save', md({ questionId, draft: value, revision }, practice))
     const here = read(cMeta).questionId === questionId
     if (r.ok) {
-      knownRevision.set(questionId, r.value.revision)
+      knownRevision.set(key, r.value.revision)
       if (here) { set(cMeta, { ...read(cMeta), revision: r.value.revision }); set(cFail, null) }
       return true
     }
@@ -396,12 +441,12 @@ function saveDraftNow(): Promise<boolean> {
       // The newer draft stays as it is; this edit is kept so the owner can choose to use it.
       keepRecoverable(questionId, value)
       if (here) {
-        const g = await call(req, 'draft.get', { questionId })
+        const g = await call(req, 'draft.get', md({ questionId }, practice))
         if (g.ok && read(cMeta).questionId === questionId) {
-          knownRevision.set(questionId, g.value.revision)
+          knownRevision.set(key, g.value.revision)
           set(cDraft, g.value.draft ?? emptyDraft()); set(cMeta, { ...read(cMeta), revision: g.value.revision })
         }
-      } else knownRevision.delete(questionId) // re-read when the question is opened again
+      } else knownRevision.delete(key) // re-read when the question is opened again
       return false
     }
     keepRecoverable(questionId, value)
@@ -445,7 +490,7 @@ async function send() {
     if (mine === nav && !read(cNotice)) set(cNotice, { tone: 'danger', retry: true, text: 'Not sent. This reply attempt could not be saved first, so a later retry could not reuse its reply ID.' })
     return
   }
-  const r = await call(req, 'submitReply', { questionId: d.questionId, replyId, kind, answer, annotations })
+  const r = await call(req, 'submitReply', md({ questionId: d.questionId, replyId, kind, answer, annotations }))
   set(cSending, false)
   if (mine !== nav) return
   if (r.ok && r.value.replyId === replyId) {
@@ -480,6 +525,7 @@ const mailUnavailable = () => read(rows)?.mail?.state === 'unavailable'
 const awaitingDelivery = (r: RecordedReply, d: Decision) =>
   r.delivery.state === 'undelivered' && r.delivery.reason === 'delivery-failed' && mailUnavailable() && !actionsOf(d).includes('retry')
 function deliveryText(r: RecordedReply, d: Decision): string {
+  if (r.delivery.state === 'local-only') return 'Saved in the Practice Inbox on this device. Nothing was sent to any chat or agent.'
   const state = replyState(r, d)
   if (state === 'agent-received' && r.delivery.state === 'agent-received') return `Agent received · receipt ${r.delivery.receipt.receiptId} · ${when(r.delivery.receipt.receivedAt)}.`
   if (awaitingDelivery(r, d)) return 'Saved in Decision Inbox and awaiting delivery. Orca mail from this plugin is unavailable on this host, so it has not been sent to the original chat yet.'
@@ -527,32 +573,50 @@ async function saveSettingsView() {
   else set(sNotice, { tone: 'danger', text: `Not saved. ${failureText(r)}` })
 }
 
+let practiceTimer: ReturnType<typeof setTimeout> | null = null
 export function setup(ctx: PanelContext) {
   ctx.subscriptions.push(
     // Each new subscriber first receives the current context.
-    on('workspace.changed', ({ context }) => { void focus(context) }),
+    // In Practice nothing live is read: the latest focus and any workspace or inbox news wait for
+    // the switch back to the Inbox (setMode).
+    on('workspace.changed', ({ context }) => { if (inPractice()) { deferred.focus = { context }; return } void focus(context) }),
+    // Orca reports worktree and folder workspaces it creates or removes: the Workspace list follows.
+    on('workspace.created', () => { if (inPractice()) { deferred.inventory = true; return } void refreshWorkspaces() }),
+    on('workspace.removed', () => { if (inPractice()) { deferred.inventory = true; return } void refreshWorkspaces() }),
     // Empty invalidation: refetch through the authenticated request.
     plugin.on('inbox.changed', () => {
+      if (inPractice()) { deferred.inbox = true; return }
       invalidated()
       // The open card follows its decision (receipts, another surface's answer); a failure keeps it.
       const v = read(view)
       if (v.kind === 'decision') void loadDetail(nav, v.questionId, true)
+    }),
+    // Practice writes have their own event, so a practice save never makes live sources be read.
+    plugin.on('practice.changed', () => {
+      if (!inPractice()) return
+      if (practiceTimer) clearTimeout(practiceTimer)
+      practiceTimer = setTimeout(() => {
+        practiceTimer = null
+        void loadPractice()
+        const v = read(view)
+        if (v.kind === 'decision') void loadDetail(nav, v.questionId, true)
+      }, 150)
     })
   )
   set(now, clock.now())
   const tick = setInterval(() => set(now, clock.now()), 60_000)
   ctx.signal.addEventListener('abort', () => {
-    clearInterval(tick); if (searchTimer) clearTimeout(searchTimer); if (refreshTimer) clearTimeout(refreshTimer)
+    clearInterval(tick); if (searchTimer) clearTimeout(searchTimer); if (refreshTimer) clearTimeout(refreshTimer); if (practiceTimer) clearTimeout(practiceTimer)
     void flushDraft() // never lose a draft when the panel closes
   })
   // The Workspace list; `all` needs no focused workspace, so load it now if the panel starts there.
-  void loadInventory()
-  if (read(chosen)?.kind === 'all') void load()
+  void refreshWorkspaces()
 }
 
 function DecisionRow(props: { d: Decision; all: readonly Decision[]; at: number; complete: boolean }) {
   const { d, all, at, complete } = props
   const native = nativeOf(d)
+  const practice = isPractice(d)
   const due = deadlineLabel(d, at)
   const state = shownState(d)
   const pkg = native ? 0 : siblings(all, d).length
@@ -563,7 +627,7 @@ function DecisionRow(props: { d: Decision; all: readonly Decision[]; at: number;
   const initial = d.answerState.state === 'answered' ? d.answerState.initial : null
   const initialAwaiting = !native && !!initial && awaitingDelivery(initial, d)
   const followAwaiting = !native && undeliveredReplies(d).some((r) => r.kind === 'follow-up' && awaitingDelivery(r, d))
-  const where = native && !native.workspaceAttributed
+  const where = practice ? 'Practice Inbox · synthetic' : native && !native.workspaceAttributed
     ? 'No workspace attribution'
     : `${d.projectName} · ${d.workspaceName}${d.origin.hostId !== 'local' ? ` · ${d.origin.hostId}` : ''}`
   const item = native ? [native.botName, native.itemLabel && `item ${native.itemLabel}`].filter(Boolean).join(' · ') : ''
@@ -576,7 +640,7 @@ function DecisionRow(props: { d: Decision; all: readonly Decision[]; at: number;
     >
       <Row gap="xs" wrap>
         {/* The source is text, not color, so it reads the same to everyone. */}
-        <Badge tone="neutral">{native ? 'Bot Item · answer in Orca' : 'Chat decision'}</Badge>
+        <Badge tone="neutral">{native ? 'Bot Item · answer in Orca' : practice ? 'Practice' : 'Chat decision'}</Badge>
         <Badge tone={d.priority === 'P0' ? 'danger' : d.priority === 'P1' ? 'warning' : 'neutral'}>{d.priority}</Badge>
         {due && <Badge tone={due.overdue ? 'danger' : 'warning'}>{due.text}</Badge>}
         {native
@@ -593,42 +657,49 @@ function DecisionRow(props: { d: Decision; all: readonly Decision[]; at: number;
   )
 }
 
-const SOURCE_NAME: Record<SourceStatus['source'], string> = { plugin: 'Chat decisions', 'native-item': 'Bot Items' }
 /**
- * Read coverage, one callout per source that was not fully read, saying what still works. A
- * failing source never hides the other source's rows. Mail delivery is reported separately.
+ * One collapsible source status (source-status.ts) instead of a banner per source: a read that
+ * failed is named in the title, so it shows while collapsed; the rest is on demand. Mail is said at
+ * the reply itself, not here.
  */
-function SourceNotices(props: { sources: readonly SourceStatus[] }) {
+function SourceStatusBlock(props: { sources: readonly SourceStatus[] }) {
+  const v = sourceStatus(props.sources)
+  if (!v) return null
+  const unavailable = props.sources.some((x) => x.state === 'unavailable')
   return (
-    <Stack gap="xs">
-      {props.sources.filter((x) => x.state !== 'available').map((x) => {
-        const other = x.source === 'plugin' ? 'Bot Items' : 'Chat decisions'
-        const title = x.state === 'partial' ? `Some ${SOURCE_NAME[x.source]} could not be read` : `${SOURCE_NAME[x.source]} are unavailable`
-        const what = x.source === 'native-item'
-          ? 'Check Bot Items in Orca directly.'
-          : x.state === 'partial'
-            ? 'The Chat decisions shown can still be answered.'
-            : 'Chat decisions cannot be listed or answered here right now; saved drafts are kept.'
-        return (
-          <Callout key={x.source} tone="warning" title={title}>
-            {`${x.message ? `${x.message} ` : ''}${what} ${other} below are not affected.`}
-          </Callout>
-        )
-      })}
-    </Stack>
+    <Collapsible title={v.summary} defaultOpen={v.open}>
+      <Stack gap="xs">
+        {v.lines.map((l, i) => <Text key={`${i}`} size="xs" tone={l.tone === 'warn' ? 'warning' : undefined}>{`${l.label}. ${l.text}`}</Text>)}
+        {unavailable && <Button size="sm" variant="outline" onPress={() => { void refreshWorkspaces(); void load() }}>Check sources again</Button>}
+      </Stack>
+    </Collapsible>
   )
 }
 
-/** Delivery, not reading: answers still save when no mail sender exists. */
-function MailNotice(props: { mail?: MailStatus }) {
-  if (props.mail?.state !== 'unavailable') return null
+/** The Practice Inbox list: what it is, said once, then the same rows as the Inbox. */
+function PracticeList() {
+  const p = read(pList); const f = read(pFail); const at = read(now)
+  const shown = p ? order(p.list, at, clock.zone()) : []
+  const waiting = p ? p.list.filter(isActionable).length : 0
   return (
-    <Callout tone="neutral" title="Answers are saved, not delivered yet">
-      {/* One statement: the worker's message alone when it already says answers are saved, else
-          ours followed by the worker's detail. Never the same sentence twice. */}
-      {props.mail.message && /saved in Decision Inbox/i.test(props.mail.message) ? props.mail.message
-        : `Answers to Chat decisions are saved in Decision Inbox. Orca mail from this plugin is unavailable on this host, so saved answers are not delivered to the chat yet.${props.mail.message ? ` ${props.mail.message}` : ''}`}
-    </Callout>
+    <Stack gap="sm">
+      <Callout tone="neutral" title="Practice Inbox">
+        Synthetic decisions to try answering. Drafts, notes and answers are saved in this Inbox on this device only; nothing is sent to any chat, agent or Orca mail. Your real Inbox and Bot Items are unchanged.
+      </Callout>
+      {f && <Callout tone="danger" title={p ? 'Showing the last loaded practice list' : 'Could not load the Practice Inbox'}>{failureText(f)}</Callout>}
+      {f && !read(pLoading) && <Button size="sm" variant="outline" onPress={() => { void loadPractice() }}>Retry loading</Button>}
+      {!p && !f && <Skeleton shape="block" lines={4} label="Loading practice decisions" />}
+      {p && shown.length === 0 && <EmptyState icon="check" title="No practice decisions" description="Practice decisions appear here." />}
+      {p && shown.length > 0 && (
+        <Stack gap="xs">
+          <Text muted size="xs">{`${shown.length} practice decision${shown.length === 1 ? '' : 's'} · ${waiting} waiting for an answer`}</Text>
+          <List label="Practice decisions, most urgent first">
+            {shown.map((d) => <DecisionRow key={d.questionId} d={d} all={p.list} at={at} complete={!p.nextCursor} />)}
+          </List>
+        </Stack>
+      )}
+      {p?.nextCursor && <Button size="sm" variant="outline" disabled={read(pLoading) === 'more'} onPress={() => loadPractice(true)}>{read(pLoading) === 'more' ? 'Loading more…' : 'Load more'}</Button>}
+    </Stack>
   )
 }
 
@@ -691,6 +762,7 @@ function Pager(props: { d: Decision }) {
 function QuestionBody(props: { d: Decision }) {
   const d = props.d as RichDecision
   const n = nativeOf(d)
+  const practice = isPractice(d)
   const due = deadlineLabel(d, read(now))
   const thread = replies(d)
   const state = shownState(d)
@@ -700,7 +772,7 @@ function QuestionBody(props: { d: Decision }) {
       {d.context && d.context !== d.title && <Text muted size="sm">{d.context}</Text>}
       <Heading level={2}>{d.title}</Heading>
       <Row gap="xs" wrap>
-        <Badge tone="neutral">{n ? 'Bot Item · read-only' : 'Chat decision'}</Badge>
+        <Badge tone="neutral">{n ? 'Bot Item · read-only' : practice ? 'Practice · saved on this device' : 'Chat decision'}</Badge>
         {n ? <Badge tone={nativeNeedsYou(n) ? 'accent' : 'neutral'}>{nativeStatusLabel(n.itemStatus)}</Badge>
           : <Badge tone={state === 'undelivered' ? 'danger' : 'accent'}>{state === 'undelivered' && awaiting ? 'Saved · awaiting delivery' : STATE_LABEL[state]}</Badge>}
         {(d.priority === 'P0' || d.priority === 'P1') && <Badge tone={d.priority === 'P0' ? 'danger' : 'warning'}>{d.priority}</Badge>}
@@ -708,12 +780,18 @@ function QuestionBody(props: { d: Decision }) {
       </Row>
       <Section title="Background" text={d.background} />
       {d.blockedWork.length > 0 && <Section title="Blocks" text={d.blockedWork.map((x) => `- ${x}`).join('\n')} />}
-      {!n && d.evidence.length > 0 && <Text muted size="xs">{`${d.evidence.length} evidence item${d.evidence.length > 1 ? 's' : ''} (${d.evidence.map((e) => e.label).join(', ')}): open the wide review to view them.`}</Text>}
+      {!n && d.evidence.length > 0 && <Text muted size="xs">{`${d.evidence.length} evidence item${d.evidence.length > 1 ? 's' : ''} (${d.evidence.map((e) => e.label).join(', ')}): ${practice ? 'open the dashboard’s Practice view to see them.' : 'open the wide review to view them.'}`}</Text>}
       {thread.length > 0 && (
         <List label="Recorded answer and follow-ups">
           {thread.map((r, i) => (
             <ListItem key={r.replyId} title={`${i === 0 ? 'Answer' : `Follow-up ${i}`} · accepted ${when(r.acceptedAt)}`} description={answerText(r.answer, d)}>
               <Text muted size="xs">{deliveryText(r, d)}</Text>
+              {/* The owner's own notes stay readable after the reply is recorded. */}
+              {r.annotations.length > 0 && (
+                <Collapsible title={`${r.annotations.length} note${r.annotations.length > 1 ? 's' : ''} ${notesFate(r.delivery)}`}>
+                  {r.annotations.map((a, j) => <Text key={`${j}`} size="xs">{`${noteLabel(a, d)} — ${a.text}`}</Text>)}
+                </Collapsible>
+              )}
             </ListItem>
           ))}
         </List>
@@ -722,8 +800,9 @@ function QuestionBody(props: { d: Decision }) {
         <KeyValue label="Details" items={[
           ...(n ? [{ label: 'Status in Orca', value: nativeStatusLabel(n.itemStatus) }, ...(n.observedAt ? [{ label: 'As of', value: when(n.observedAt) }] : []),
             ...(n.botName ? [{ label: 'Bot', value: n.botName }] : []), ...(n.itemLabel ? [{ label: 'Item', value: n.itemLabel }] : [])] : []),
-          { label: 'Workspace', value: n && !n.workspaceAttributed ? 'No workspace attribution' : `${d.projectName} · ${d.workspaceName}` },
-          ...(d.origin.hostId && d.origin.hostId !== 'local' ? [{ label: 'Host', value: d.origin.hostId }] : []),
+          practice ? { label: 'Source', value: 'Practice Inbox · synthetic, saved on this device' }
+            : { label: 'Workspace', value: n && !n.workspaceAttributed ? 'No workspace attribution' : `${d.projectName} · ${d.workspaceName}` },
+          ...(!practice && d.origin.hostId && d.origin.hostId !== 'local' ? [{ label: 'Host', value: n?.hostLabel ?? d.origin.hostId }] : []),
           { label: 'Priority', value: d.priority },
           ...(d.deadline ? [{ label: 'Deadline', value: when(d.deadline) }] : []),
           { label: 'Created', value: when(d.createdAt) },
@@ -759,6 +838,11 @@ function NativeFooter(props: { d: Decision }) {
         </Row>
       )}
       <Text muted size="xs">Read-only copy: Decision Inbox cannot answer, resolve or open this Item for you.</Text>
+      {/* The read-only path leads to a safe place to try answering, without touching this Item. */}
+      <Row gap="xs" align="center" wrap>
+        <Button size="sm" variant="outline" onPress={() => setMode('practice')}>Try answering in Practice</Button>
+        <Text muted size="xs">Synthetic decisions, saved on this device; this Item stays unchanged.</Text>
+      </Row>
     </Stack>
   )
 }
@@ -787,9 +871,9 @@ function PanelNotes(props: { d: Decision }) {
           <Button size="sm" variant="ghost" disabled={sending} onPress={() => { set(pNoteSaved, false); editDraft({ annotations: read(cDraft).annotations.filter((x) => x !== n) }) }}>{`Remove note ${i + 1}`}</Button>
         </Row>
       ))}
-      {read(pNoteSaved) && draft.annotations.length > 0 && !open && <Text muted size="xs">{`Note saved with your draft (${draft.annotations.length}). Not sent yet: notes go with your reply.`}</Text>}
+      {read(pNoteSaved) && draft.annotations.length > 0 && !open && <Text muted size="xs">{isPractice(d) ? `Note saved with your practice draft (${draft.annotations.length}).` : `Note saved with your draft (${draft.annotations.length}). Not sent yet: notes go with your reply.`}</Text>}
       {open ? (
-        <Card title="Add a note" description="Notes are saved with your draft and sent with your reply, not before.">
+        <Card title="Add a note" description={isPractice(d) ? 'Notes are saved with your practice draft and answer, on this device only.' : 'Notes are saved with your draft and sent with your reply, not before.'}>
           <Select label="Note on" value={open.target || undefined} placeholder="Choose a paragraph or image…" options={targets.map((t) => ({ value: t.value, label: t.label }))}
             onChange={(v) => editNote({ target: v, phrase: '', occurrence: 0 })} />
           {target?.kind === 'text' && (
@@ -825,6 +909,7 @@ function ChatFooter(props: { d: Decision }) {
   const { d } = props
   const draft = read(cDraft); const meta = read(cMeta); const sending = read(cSending); const notice = read(cNotice); const fail = read(cFail)
   const answered = d.answerState.state === 'answered'
+  const practice = isPractice(d)
   const canSend = actionsOf(d).includes(answered ? 'follow-up' : 'reply')
   const held = heldInitial(d, draft)
   const answer = buildAnswer(d, draft)
@@ -860,12 +945,14 @@ function ChatFooter(props: { d: Decision }) {
                 onChange={(v) => editDraft({ optionId: v, kind: 'initial' })} />
             )}
             <Textarea label={answered ? 'Follow-up' : 'Reply text'} rows={3} value={draft.text} disabled={sending}
-              placeholder={answered ? 'Follow-up to the agent (Ctrl+Enter to send)' : draft.optionId ? 'Optional detail with your option (Ctrl+Enter to submit)' : 'Free-text answer (Ctrl+Enter to submit)'}
+              placeholder={practice ? (answered ? 'Practice follow-up (Ctrl+Enter saves it here)' : 'Practice answer (Ctrl+Enter saves it here)')
+                : answered ? 'Follow-up to the agent (Ctrl+Enter to send)' : draft.optionId ? 'Optional detail with your option (Ctrl+Enter to submit)' : 'Free-text answer (Ctrl+Enter to submit)'}
               onChange={(v) => editDraft({ text: v })} onSubmit={() => { void send() }} />
             <PanelNotes d={d} />
             <Row gap="xs" align="center" justify="between">
-              <Text muted size="xs">Replies go only to the original chat.</Text>
-              <Button disabled={sending || !answer} onPress={send}>{sending ? 'Sending…' : answered ? 'Send follow-up' : 'Submit reply'}</Button>
+              {/* Where this answer goes, at the point of reply: nothing is promised that Orca did not report. */}
+              <Text muted size="xs">{replyReach(practice ? 'practice' : 'chat', read(rows)?.mail)}</Text>
+              <Button disabled={sending || !answer} onPress={send}>{sending ? (practice ? 'Saving…' : 'Sending…') : practice ? (answered ? 'Save practice follow-up' : 'Save practice answer') : answered ? 'Send follow-up' : 'Submit reply'}</Button>
             </Row>
           </Stack>
         ) : <Text muted>Replying here is not available for this decision right now.</Text>}
@@ -886,9 +973,12 @@ function DecisionView(props: { title: string }) {
     <Box direction="column" height="100%" gap="sm">
       <Box shrink={false} gap="xs">
         <Row justify="between" align="center">
-          <Button size="sm" variant="ghost" onPress={back}>← Back to list</Button>
-          <Button size="sm" variant="outline" icon="open-external" disabled={read(wide)?.state === 'opening'} onPress={openWide}>Open wide review</Button>
+          <Button size="sm" variant="ghost" onPress={back}>{read(mode) === 'practice' ? '← Back to Practice' : '← Back to list'}</Button>
+          {/* Practice has no wide review tab; it opens wide in the dashboard's Practice view. */}
+          {d && isPractice(d) ? <Text muted size="xs">Wide: dashboard → Practice</Text>
+            : <Button size="sm" variant="outline" icon="open-external" disabled={read(wide)?.state === 'opening'} onPress={openWide}>Open wide review</Button>}
         </Row>
+
         <WideNotice what="the decision" />
       </Box>
       <Box grow scroll="y" minHeight={0} gap="sm">
@@ -966,8 +1056,9 @@ export default function Panel() {
   if (v.kind === 'decision') return <DecisionView title={v.title} />
   if (v.kind === 'settings') return <SettingsView />
   const sc = scopeNow()
-  const w = read(current)
-  const options = read(inv)?.workspaces ?? []
+  const st = read(ws)
+  const w = st.focus
+  const options = st.inv?.workspaces ?? []
   const at = read(now)
   const t = read(term)
   const h = read(history)
@@ -991,15 +1082,15 @@ export default function Panel() {
   const degraded = sources.some((x) => x.state !== 'available')
 
   let body
-  const intended = read(chosen) ?? (w ? { kind: 'workspace' as const, workspace: w } : null)
-  if (!sc && !read(chosen) && w === undefined) {
+  if (!sc && !st.chosen && w === undefined) {
     body = <Skeleton shape="block" lines={4} label="Finding the focused workspace" />
   } else if (!sc) {
     // Ask; the scope is never widened without the owner's choice.
-    const lost = intended?.kind === 'workspace' && (read(scopeLost) || missing(intended.workspace, read(inv)))
+    const lost = lostWorkspace(st)
+    const focusFail = st.focusFail ? failureText(st.focusFail) : null
     body = (
-      <EmptyState icon="flag" title={lost ? `${workspaceLabel((intended as { workspace: Workspace }).workspace, options)} is no longer available` : read(focusError) ? 'Could not identify the focused workspace' : 'No workspace is focused'}
-        description={`${lost ? '' : read(focusError) ? `${read(focusError)} ` : ''}Choose a workspace or All workspaces in the Workspace list.`}>
+      <EmptyState icon="flag" title={lost ? `${workspaceLabel(lost, options)} is no longer available` : focusFail ? 'Could not identify the focused workspace' : 'No workspace is focused'}
+        description={`${lost ? (st.chosen ? 'Your choice is kept until you pick another. ' : '') : focusFail ? `${focusFail} ` : ''}Choose a workspace or All workspaces in the Workspace list.`}>
         <Button size="sm" onPress={() => chooseScope(ALL_VALUE)}>Show all workspaces</Button>
       </EmptyState>
     )
@@ -1033,17 +1124,22 @@ export default function Panel() {
         <Heading level={2}>Decision Inbox</Heading>
         <Row gap="xs" align="center">
           {/* While searching, the count covers the matches only; say so. */}
-          {all && !updating && <Badge tone={need ? 'accent' : 'neutral'}>{`${need}${more ? '+' : ''} ${t.trim() ? 'matching ' : ''}need you`}</Badge>}
+          {!inPractice() && all && !updating && <Badge tone={need ? 'accent' : 'neutral'}>{`${need}${more ? '+' : ''} ${t.trim() ? 'matching ' : ''}need you`}</Badge>}
           <IconButton icon="settings" label="Inbox settings" size="sm" variant="ghost" onPress={openSettingsView} />
         </Row>
       </Row>
 
+      {/* Always discoverable: Inbox (live sources) or Practice (synthetic, saved here only). Orca
+          draws only the selected tab's children, so the hidden one reads nothing. */}
+      <Tabs label="Which inbox" value={read(mode)} onChange={setMode}>
+        <Tab value="inbox" label="Inbox">{!inPractice() && (
+      <Stack gap="sm">
       {/* One Workspace choice: All workspaces or one authorized workspace (host shown for equal names). */}
       {/* Orca's Select shows its placeholder for no value; option values must be non-empty. */}
       <Select label="Workspace" {...(sc ? { value: scopeValue(sc) } : {})} placeholder="Choose a workspace…"
-        options={workspaceChoices(read(inv), sc, sc ? null : w).filter((o) => o.value)} onChange={chooseScope} />
-      {read(invError) && <Text muted size="xs">{`Could not list your workspaces. ${read(invError)}`}</Text>}
-      {read(inv)?.truncated && <Text muted size="xs">Some workspaces could not be listed.</Text>}
+        options={workspaceChoices(st.inv, sc, sc ? null : (w ?? (intendedScope(st)?.kind === 'workspace' ? lostWorkspace(st) : null))).filter((o) => o.value)} onChange={chooseScope} />
+      {st.invFail && <Text muted size="xs">{`Could not list your workspaces. ${failureText(st.invFail)}`}</Text>}
+      {st.inv?.truncated && <Text muted size="xs">Some workspaces could not be listed.</Text>}
 
       <Input label="Search" type="search" placeholder="Title, background, option, ID, 中文…" value={t} onChange={search} />
       <Checkbox label="Include history" description="Submitted, received and answered" checked={h} onChange={toggleHistory} />
@@ -1054,16 +1150,19 @@ export default function Panel() {
           {`${failureText(err)} Nothing is sent from this list.`}
         </Callout>
       )}
-      {err && !read(loading) && <Button size="sm" variant="outline" onPress={() => load()}>Retry loading</Button>}
+      {err && !read(loading) && <Button size="sm" variant="outline" onPress={() => { void refreshWorkspaces(); void load() }}>Retry loading</Button>}
 
-      <SourceNotices sources={sources} />
-      {all && loaded && <MailNotice mail={loaded.mail} />}
+      <SourceStatusBlock sources={sources} />
       {body}
       {more && (
         <Button size="sm" variant="outline" disabled={read(loading) === 'more'} onPress={() => load(true)}>
           {read(loading) === 'more' ? 'Loading more…' : 'Load more'}
         </Button>
       )}
+      </Stack>
+        )}</Tab>
+        <Tab value="practice" label="Practice · safe">{inPractice() && <PracticeList />}</Tab>
+      </Tabs>
     </Stack>
   )
 }

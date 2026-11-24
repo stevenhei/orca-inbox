@@ -95,6 +95,7 @@ export interface AgentReceipt extends AcknowledgeReply {
 }
 
 export type Delivery =
+  | { state: 'local-only' }
   | { state: 'submitted'; transport?: { messageId: string; acceptedAt: string } }
   | { state: 'agent-received'; receipt: AgentReceipt }
   | { state: 'undelivered'; reason: 'closed-origin' | 'disconnected' | 'origin-mismatch' | 'delivery-failed' }
@@ -108,7 +109,9 @@ export type AnswerState =
   | { state: 'awaiting-answer' }
   | { state: 'answered'; initial: RecordedReply; followUps: RecordedReply[] }
 
-export type DecisionSource = { kind: 'plugin' } | {
+export const practicePrefix = 'practice:'
+
+export type DecisionSource = { kind: 'plugin' } | { kind: 'practice' } | {
   kind: 'native-item'
   workspaceAttributed: boolean
   botName?: string

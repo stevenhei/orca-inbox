@@ -9,6 +9,7 @@
 //  * Every authorized workspace is offered, even one with no decisions; equal names show the host.
 import type { ListDecisions, Workspace } from './contract.ts'
 import type { DecisionPageInput, WorkspaceOptions } from './backend-protocol.ts'
+import type { Failure } from './client.ts'
 
 export type WorkspaceOption = WorkspaceOptions['workspaces'][number]
 /** Exactly the `ListDecisions.scope` union the worker reads. */
@@ -77,5 +78,112 @@ export function queueInput(scope: Scope, q: { query?: string; includeHistory: bo
   return {
     scope: scope.kind === 'all' ? { kind: 'all' } : { kind: 'workspace', workspace: { hostId: scope.workspace.hostId, workspaceId: scope.workspace.workspaceId } },
     ...(t ? { query: t } : {}), includeHistory: q.includeHistory, timeZone: q.timeZone, ...(q.cursor ? { cursor: q.cursor } : {})
+  }
+}
+
+// ---- lifecycle: one owner for the choice, the focused workspace and the authorized inventory ------
+//
+// Both views keep their Workspace state in a ScopeState and change it only through a ScopeTracker.
+// The tracker re-reads `workspace.options` on focus changes, on Orca's workspace.created/removed,
+// when the view comes back into view, on an explicit retry, and after the worker refuses the scope
+// in effect. Late answers never overwrite newer ones (sequence numbers per read). It never widens:
+// a workspace that a complete inventory no longer lists leaves the view asking for a choice (the
+// explicit choice stays pinned, so it comes back by itself if the workspace returns); a refusal the
+// inventory does not confirm (for example "owner only") is an ordinary error, shown as such.
+
+export type ScopeState = {
+  /** The owner's explicit choice; pinned for the life of the view. */
+  chosen?: Scope
+  /** Focused workspace: undefined while unknown, null when none or it could not be resolved. */
+  focus: Workspace | null | undefined
+  focusFail: Failure | null
+  inv: WorkspaceOptions | null
+  invFail: Failure | null
+}
+export const emptyScopeState = (): ScopeState => ({ focus: undefined, focusFail: null, inv: null, invFail: null })
+type R<T> = { ok: true; value: T } | Failure
+export type ScopeIO = {
+  options(): Promise<R<WorkspaceOptions>>
+  resolve(workspaceId: string): Promise<R<Workspace>>
+}
+
+/** The scope to list now, or null when the owner must choose. */
+export const scopeOf = (s: ScopeState): Scope | null => effectiveScope(s.chosen, s.focus, s.inv)
+export const scopeKey = (s: ScopeState) => { const sc = scopeOf(s); return sc ? scopeValue(sc) : 'none' }
+/** What the owner meant: the choice, else the focused workspace. */
+export const intendedScope = (s: ScopeState): Scope | null => s.chosen ?? (s.focus ? { kind: 'workspace', workspace: s.focus } : null)
+/** The intended workspace when a complete inventory no longer lists it. */
+export function lostWorkspace(s: ScopeState): Workspace | null {
+  const i = intendedScope(s)
+  return i?.kind === 'workspace' && missing(i.workspace, s.inv) ? i.workspace : null
+}
+/** The worker refused this workspace scope: the owner is asked again; nothing is widened. */
+export const refusesScope = (r: { ok: boolean; code?: string }, scope: Scope) =>
+  !r.ok && scope.kind === 'workspace' && (r.code === 'forbidden' || r.code === 'not-found')
+
+export class ScopeTracker {
+  private invSeq = 0
+  private focusSeq = 0
+  private invRead: Promise<boolean> | null = null
+  constructor(private store: { get(): ScopeState; set(s: ScopeState): void }, private io: ScopeIO) {}
+  get state() { return this.store.get() }
+  /** Applies a change; true when the scope in effect changed (the caller starts a new first page). */
+  private apply(patch: Partial<ScopeState>): boolean {
+    const before = scopeKey(this.state)
+    this.store.set({ ...this.state, ...patch })
+    return scopeKey(this.state) !== before
+  }
+  /** Re-reads the authorized inventory. A failed read keeps the last list and says why. */
+  refreshInventory(): Promise<boolean> {
+    const mine = ++this.invSeq
+    const p = this.io.options().then((r) => {
+      if (mine !== this.invSeq) return false
+      return r.ok ? this.apply({ inv: r.value, invFail: null }) : this.apply({ invFail: r })
+    }).finally(() => { if (this.invRead === p) this.invRead = null })
+    this.invRead = p
+    return p
+  }
+  /** The first inventory read, or the one in flight. */
+  ensureInventory(): Promise<boolean> {
+    if (this.invRead) return this.invRead
+    return this.state.inv || this.state.invFail ? Promise.resolve(false) : this.refreshInventory()
+  }
+  /**
+   * Orca's focused workspace changed (or is first reported). The inventory is read again with it,
+   * so a workspace created and focused since the last read is offered instead of reported missing.
+   */
+  async focusChanged(context: { workspaceId?: string } | null | undefined): Promise<boolean> {
+    const mine = ++this.focusSeq
+    const inv = this.refreshInventory()
+    if (!context?.workspaceId) {
+      await inv
+      if (mine !== this.focusSeq) return false
+      return this.apply({ focus: null, focusFail: null })
+    }
+    const [r] = await Promise.all([this.io.resolve(context.workspaceId), inv])
+    if (mine !== this.focusSeq) return false
+    return this.apply({ focus: r.ok ? r.value : null, focusFail: r.ok ? null : r })
+  }
+  /**
+   * An explicit Workspace choice (a select value). Always pinned, also when it names the workspace
+   * already shown through focus, so a later focus change does not move it. True when the scope in
+   * effect changed (the caller reads a new first page).
+   */
+  choose(value: string): boolean {
+    const s = this.state
+    const extra = [s.chosen?.kind === 'workspace' ? s.chosen.workspace : null, s.focus ?? null].filter((x): x is Workspace => !!x)
+    const sc = scopeFromValue(value, s.inv?.workspaces ?? [], extra)
+    if (!sc) return false
+    return this.apply({ chosen: sc })
+  }
+  /**
+   * A list answer for `scope`. When the worker refused a workspace scope, the inventory is read
+   * again; true when that inventory confirms the workspace is gone (the view then asks for a choice
+   * and shows nothing from this answer). False means show the answer's error as usual.
+   */
+  async refused(scope: Scope, r: { ok: boolean; code?: string }): Promise<boolean> {
+    if (!refusesScope(r, scope)) return false
+    await this.refreshInventory()
+    return scope.kind === 'workspace' && missing(scope.workspace, this.state.inv)
   }
 }

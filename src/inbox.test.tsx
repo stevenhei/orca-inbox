@@ -5,8 +5,8 @@ import { decisions, historyExample, clock as fixtureClock, origins } from '../fi
 import { actionsOf, dayKey, deadlineLabel, group, isActionable, nativeStatusLabel, order, receiptMatches, searchText, shownState, visible, workspaceKey } from './model'
 import { clock, reconcile } from './client'
 import { workspaceValue } from './workspace-scope'
-import type { Decision, ListDecisions, Result, SubmitReply } from './contract'
-import type { DecisionPage, DraftRecord, InboxSettings, SourceAvailability } from './backend-protocol'
+import type { Decision, ListDecisions, Result, SubmitReply, Workspace } from './contract'
+import type { DecisionPage, DraftRecord, InboxSettings, SourceAvailability, WorkspaceOptions } from './backend-protocol'
 
 // Fixtures, the fixed clock and UTC are injected here only; production reads the live clock and
 // the desktop zone (see the last test).
@@ -139,6 +139,11 @@ function worker(list: Decision[] = decisions, extra: MockRequests = {}, size = 5
     ...extra
   }
 }
+/** The stand-in inventory, without local library once it is gone. */
+function withoutLibrary(w: MockRequests, gone: boolean) {
+  const r = (w['workspace.options'] as () => Result<WorkspaceOptions>)()
+  return gone && r.ok ? ok({ ...r.value, workspaces: r.value.workspaces.filter((x) => x.workspaceId !== 'library') }) : r
+}
 const requestsOf = (view: TestPanel, name: string) =>
   view.host.callsOf('plugin.request').filter((c) => (c as { name: string }).name === name).map((c) => (c as { input: unknown }).input)
 const titles = (view: TestPanel) => view.findAll({ type: 'ListItem' }).map((e) => e.label)
@@ -233,7 +238,9 @@ test('panel: ambiguous focus or a chosen workspace that disappears asks; it neve
   })
   let gone = false
   const w = worker()
-  await withPanel({ ...w, listDecisionPage: (i: PageInput): Result<DecisionPage> => (gone && i.scope.kind === 'workspace' ? { ok: false, code: 'forbidden', message: 'Not authorized for that workspace.' } : (w.listDecisionPage as (x: PageInput) => Result<DecisionPage>)(i)) }, async (view) => {
+  // Like the real worker, refusal and inventory come from the same authorized set: library leaves both.
+  await withPanel({ ...w, 'workspace.options': () => withoutLibrary(w, gone),
+    listDecisionPage: (i: PageInput): Result<DecisionPage> => (gone && i.scope.kind === 'workspace' ? { ok: false, code: 'forbidden', message: 'Not authorized for that workspace.' } : (w.listDecisionPage as (x: PageInput) => Result<DecisionPage>)(i)) }, async (view) => {
     await view.emit('workspace.changed', ctx('studio-local'))
     await view.select({ label: 'Workspace' }, workspaceValue(workspaces['library-local']))
     gone = true
@@ -248,6 +255,76 @@ test('panel: ambiguous focus or a chosen workspace that disappears asks; it neve
     assert.ok(titles(view).includes('Approve the reading room route'), 'a deliberate choice recovers')
   })
 })
+
+test('panel: workspace lifecycle: addition on focus, removal after page one, stale inventory, ambiguous focus, pinned choice', async () => {
+  const w = worker(decisions, {}, 1)
+  const baseInv = (w['workspace.options'] as () => Result<WorkspaceOptions>)()
+  const listed = (drop: string[] = [], extra: WorkspaceOptions['workspaces'] = []) =>
+    baseInv.ok ? ok({ workspaces: [...baseInv.value.workspaces.filter((x) => !drop.includes(x.workspaceId)), ...extra] }) : baseInv
+  let inventory: () => Result<WorkspaceOptions> | Promise<Result<WorkspaceOptions>> = () => listed()
+  let gone = false
+  let ambiguous = false
+  const requests: MockRequests = { ...w,
+    'workspace.options': () => inventory(),
+    'workspace.resolve': ({ workspaceId }: { workspaceId: string }) => ambiguous
+      ? { ok: false, code: 'unavailable', message: 'Multiple hosts report the focused workspace ID. Switch to All workspaces.' }
+      : workspaceId === 'kiln-local' ? ok({ hostId: 'local', workspaceId: 'kiln' }) : (w['workspace.resolve'] as (i: { workspaceId: string }) => Result<Workspace>)({ workspaceId }),
+    listDecisionPage: (i: PageInput): Result<DecisionPage> => gone && i.scope.kind === 'workspace' && i.scope.workspace.workspaceId === 'studio' && i.scope.workspace.hostId === 'local'
+      ? { ok: false, code: 'forbidden', message: 'Inbox workspace is missing or inaccessible.' }
+      : (w.listDecisionPage as (x: PageInput) => Result<DecisionPage>)(i)
+  }
+  await withPanel(requests, async (view) => {
+    await view.emit('workspace.changed', ctx('studio-local')); await view.settled()
+    // Addition on focus: Orca creates and focuses a workspace the panel's last inventory lacked.
+    inventory = () => listed([], [{ hostId: 'local', workspaceId: 'kiln', name: 'kiln', hostLabel: 'Local Orca' }])
+    const before = requestsOf(view, 'workspace.options').length
+    await view.emit('workspace.created', { workspaceId: 'kiln-local', kind: 'worktree', path: '/w/kiln', branch: 'kiln' }); await view.settled()
+    assert.ok(requestsOf(view, 'workspace.options').length > before, 'workspace.created re-reads the inventory')
+    await view.emit('workspace.changed', ctx('kiln-local')); await view.settled()
+    assert.equal(view.valueOf({ label: 'Workspace' }), workspaceValue({ hostId: 'local', workspaceId: 'kiln' }), 'the new focused workspace is selected')
+    assert.ok(view.find({ label: 'Nothing needs you in kiln' }), 'listed, not reported missing')
+    // Removal after page one.
+    await view.emit('workspace.changed', ctx('studio-local')); await view.settled()
+    assert.equal(titles(view).length, 1, 'page one (one row per page)')
+    gone = true; inventory = () => listed(['studio'])
+    const lp = requestsOf(view, 'listDecisionPage').length
+    await view.press({ text: 'Load more' }); await wait(20); await view.settled()
+    assert.ok(view.find({ label: 'studio is no longer available' }), 'asks after the refused second page')
+    assert.equal(titles(view).length, 0, 'no rows from the removed workspace')
+    assert.ok(requestsOf(view, 'listDecisionPage').slice(lp).every((i) => (i as PageInput).scope.kind === 'workspace'), 'never widened')
+    // Stale inventory: an older read answering last does not bring studio back.
+    let releaseOld: () => void = () => {}
+    inventory = () => new Promise((r) => { releaseOld = () => r(listed()) })
+    const slow = view.emit('workspace.removed', { workspaceId: 'x', kind: 'worktree', path: '/w/x' })
+    await wait(5)
+    inventory = () => listed(['studio'])
+    const fresh = view.emit('workspace.removed', { workspaceId: 'y', kind: 'worktree', path: '/w/y' })
+    await wait(20) // the newer read answers first
+    releaseOld(); await Promise.all([slow, fresh]); await wait(20); await view.settled()
+    assert.ok(view.find({ label: 'studio is no longer available' }), 'a late inventory answer is dropped')
+    // Ambiguous focus: ask, list nothing.
+    ambiguous = true
+    const lq = requestsOf(view, 'listDecisionPage').length
+    await view.emit('workspace.changed', ctx('twin')); await view.settled()
+    assert.ok(view.find({ label: 'Could not identify the focused workspace' }))
+    assert.equal(requestsOf(view, 'listDecisionPage').length, lq, 'nothing listed for ambiguous focus')
+    // An explicit choice is pinned across focus changes.
+    ambiguous = false
+    await view.select({ label: 'Workspace' }, workspaceValue(workspaces['library-local'])); await view.settled()
+    await view.emit('workspace.changed', ctx('kiln-local')); await view.settled()
+    assert.equal(view.valueOf({ label: 'Workspace' }), workspaceValue(workspaces['library-local']))
+    assert.deepEqual((requestsOf(view, 'listDecisionPage').at(-1) as PageInput).scope, { kind: 'workspace', workspace: { hostId: 'local', workspaceId: 'library' } })
+  })
+})
+
+test('panel: choosing the workspace that focus already shows pins it', () => withPanel(worker(), async (view) => {
+  await view.emit('workspace.changed', ctx('studio-local')); await view.settled()
+  const before = requestsOf(view, 'listDecisionPage').length
+  await view.select({ label: 'Workspace' }, workspaceValue(workspaces['studio-local'])); await view.settled()
+  assert.equal(requestsOf(view, 'listDecisionPage').length, before, 'the same scope is not read again')
+  await view.emit('workspace.changed', ctx('library-local')); await view.settled()
+  assert.equal(view.valueOf({ label: 'Workspace' }), workspaceValue(workspaces['studio-local']), 'focus does not move a deliberate choice')
+}))
 
 test('panel: invalidations keep pages loaded with Load more and leave unchanged rows alone', () => withPanel(worker(decisions, {}, 4), async (view) => {
   await view.select({ label: 'Workspace' }, 'all')
@@ -721,12 +798,13 @@ test('panel: a failed read is truthful and Try again recovers; not-found and for
   }
 })
 
-test('panel: the mail notice is one statement', () => withPanel(worker(decisions, {}, 50, allAvailable,
+test('panel: unavailable mail is said once, at the reply, not as a list banner', () => withPanel(worker(decisions, {}, 50, allAvailable,
   { state: 'unavailable', message: 'Answers are saved in Decision Inbox. Orca mail from this plugin is unavailable on this host.' }), async (view) => {
   await view.emit('workspace.changed', ctx('studio-local'))
-  const n = view.findAll({ label: 'Answers are saved, not delivered yet' })
-  assert.equal(n.length, 1)
-  assert.equal((n[0].text.match(/saved in Decision Inbox/g) ?? []).length, 1, 'no repeated sentence')
+  assert.ok(!view.find({ text: /Orca mail from this plugin is unavailable/ }), 'no mail banner over the list')
+  await view.press({ label: 'Pick a rehearsal slot' }); await view.settled()
+  const n = view.findAll({ text: /Orca mail from this plugin is unavailable here, so the original chat is not notified/ })
+  assert.equal(n.length, 1, 'one statement at the point of reply')
 }))
 
 
@@ -778,22 +856,24 @@ test('panel: Bot Items unavailable keeps Chat decisions and says what still work
   [{ source: 'plugin', state: 'available' }, { source: 'native-item', state: 'unavailable', message: 'No authorized Bot Items reader on this host.' }]), async (view) => {
   await view.emit('workspace.changed', ctx('studio-local'))
   assert.deepEqual(titles(view), ['Compare seven paper model views', 'Pick a rehearsal slot'], 'Chat decisions are not blanked')
-  assert.ok(view.find({ label: 'Bot Items are unavailable' }))
-  assert.ok(view.find({ text: /No authorized Bot Items reader on this host\. Check Bot Items in Orca directly\. Chat decisions below are not affected\./ }))
+  assert.ok(view.find({ label: 'Needs attention: Bot Items could not be read' }), 'a failed read is named in the collapsed title')
+  assert.ok(view.find({ text: /No authorized Bot Items reader on this host\. Bot Items may be missing here; check them in Orca\./ }))
+  assert.ok(!view.find({ text: /Chat decisions (could not|cannot)/ }), 'the readable source is not blamed')
 }))
 
 test('panel: Chat decisions unavailable still shows read-only Bot Items', () => withPanel(worker([nativeHere], {}, 50,
   [{ source: 'plugin', state: 'unavailable', message: 'Authenticated owner access is unavailable on this Orca host.' }, { source: 'native-item', state: 'available' }]), async (view) => {
   await view.emit('workspace.changed', ctx('studio-local'))
   assert.deepEqual(titles(view), ['Ship the lantern build?'])
-  assert.ok(view.find({ label: 'Chat decisions are unavailable' }))
-  assert.ok(view.find({ text: /cannot be listed or answered here right now; saved drafts are kept\. Bot Items below are not affected\./ }))
+  assert.ok(view.find({ label: 'Needs attention: Chat decisions could not be read' }))
+  assert.ok(view.find({ text: /New Chat decisions may be missing\. Decisions already shown, your drafts and saved answers still work\./ }), 'local saving stays independent of reads')
+  assert.ok(!view.find({ text: /cannot be listed or answered/ }))
 }))
 
 test('panel: partial Bot Items and an empty list say only what could be checked', () => withPanel(worker([], {}, 50,
   [{ source: 'plugin', state: 'available' }, { source: 'native-item', state: 'partial', message: 'One bot could not be read.' }]), async (view) => {
   await view.select({ label: 'Workspace' }, 'all')
-  assert.ok(view.find({ label: 'Some Bot Items could not be read' }))
+  assert.ok(view.find({ label: 'Needs attention: Some Bot Items not read' }))
   assert.ok(view.find({ label: 'Nothing found in all workspaces from the sources that could be read' }), 'no "all caught up" claim')
   assert.ok(!view.find({ label: /^Nothing needs you/ }), 'no "nothing needs you" title while a source is degraded')
 }))
@@ -805,10 +885,9 @@ test('panel: all Chat decisions read but mail unavailable: a neutral saved-not-d
   withPanel(worker(decisions, {}, 50, allAvailable, mailOff), async (view) => {
     await view.emit('workspace.changed', ctx('studio-local'))
     assert.deepEqual(titles(view), ['Compare seven paper model views', 'Pick a rehearsal slot'])
-    const n = view.find({ label: 'Answers are saved, not delivered yet' })
-    assert.ok(n && n.props.tone === 'neutral')
-    assert.ok(view.find({ text: /Answers to Chat decisions are saved in Decision Inbox\. Orca mail from this plugin is unavailable on this host, so saved answers are not delivered to the chat yet\. No supported plugin mail sender on Orca 1\.4\.271\./ }))
-    assert.ok(!view.find({ label: /could not be read|are unavailable/ }), 'mail is not a read failure')
+    assert.ok(!view.find({ label: /^Sources:|^Needs attention:/ }), 'no source status when every source was read; mail is not a read failure')
+    await view.press({ label: 'Pick a rehearsal slot' }); await view.settled()
+    assert.ok(view.find({ text: 'Saved in Decision Inbox only: Orca mail from this plugin is unavailable here, so the original chat is not notified.' }))
     assert.ok(!view.find({ text: /cannot be (listed or )?answered/ }), 'never claims loaded Chat decisions cannot be answered')
   }))
 
@@ -821,8 +900,8 @@ test('panel: mail unavailable does not make an empty list look degraded', () => 
 test('panel: genuinely partial Chat intake says some were not read and the shown ones can be answered', () =>
   withPanel(worker(decisions, {}, 50, [{ source: 'plugin', state: 'partial', message: 'Two Chat decisions are waiting for intake checks.' }, { source: 'native-item', state: 'available' }]), async (view) => {
     await view.emit('workspace.changed', ctx('studio-local'))
-    assert.ok(view.find({ label: 'Some Chat decisions could not be read' }))
-    assert.ok(view.find({ text: /Two Chat decisions are waiting for intake checks\. The Chat decisions shown can still be answered\. Bot Items below are not affected\./ }))
+    assert.ok(view.find({ label: 'Needs attention: Some Chat decisions not read' }), 'an untyped partial report from an older worker is still flagged')
+    assert.ok(view.find({ text: /Two Chat decisions are waiting for intake checks\./ }))
     assert.equal(titles(view).length, 2)
   }))
 
@@ -1070,3 +1149,106 @@ test('production clock is the live clock and the desktop zone', () => {
   assert.notEqual(t, NOW)
   assert.equal(live.zone(), Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC')
 })
+
+// ---- Practice Inbox and the one source status (FE task_60bd1a0c57b3) ------------------------------
+// A stand-in for the worker's Practice Inbox: eight synthetic `practice:` decisions in their own
+// store, answered locally (`local-only`), read only through `practice.listDecisionPage` and the
+// detail/draft/reply requests that carry `mode: "practice"`.
+const practiceRows: Decision[] = [...decisions, decisions[0], decisions[1]].slice(0, 8).map((d, i) => ({
+  ...d, questionId: `practice:q${i + 1}`, packageId: `practice:pkg${i + 1}`, requestId: `practice:r${i + 1}`, title: `Practice ${i + 1}: ${d.title}`,
+  origin: { hostId: 'practice:local', workspaceId: 'practice:inbox', sessionId: 'practice' }, projectName: 'Practice', workspaceName: 'Practice Inbox',
+  source: { kind: 'practice' }, actions: ['reply'], answerState: { state: 'awaiting-answer' }
+}))
+function practiceWorker(live: MockRequests = worker(mixed, {}, 50, allAvailable)): MockRequests {
+  const store = new Map(practiceRows.map((d) => [d.questionId, structuredClone(d)]))
+  const drafts = new Map<string, DraftRecord>()
+  const isP = (i: { mode?: string }) => i?.mode === 'practice'
+  // Typed loosely: each handler answers in the shape of the request it stands in for.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const liveOr = (name: string, i: { mode?: string; questionId: string }, f: () => unknown): any => isP(i) ? f() : (live[name] as (x: unknown) => unknown)?.(i)
+  return {
+    ...live,
+    'practice.listDecisionPage': ({ includeHistory, query }: { includeHistory: boolean; query?: string }) =>
+      ok({ rows: [...store.values()].filter((d) => (includeHistory || isActionable(d)) && (!query || searchText(d).includes(query.toLowerCase()))) }),
+    getDecision: (i: { mode?: string; questionId: string }) => liveOr('getDecision', i, () => {
+      const d = store.get(i.questionId); return d ? ok(d) : { ok: false, code: 'not-found', message: 'Practice decision is missing.' }
+    }),
+    'draft.get': (i: { mode?: string; questionId: string }) => liveOr('draft.get', i, () => ok(drafts.get(i.questionId) ?? { draft: null, revision: 0 })),
+    'draft.save': (i: { mode?: string; questionId: string; draft: DraftRecord['draft']; revision: number }) => liveOr('draft.save', i, () => {
+      const cur = drafts.get(i.questionId) ?? { draft: null, revision: 0 }
+      if (cur.revision !== i.revision) return { ok: false, code: 'conflict', message: 'Changed elsewhere.' }
+      const next = { draft: i.draft, revision: cur.revision + 1 }; drafts.set(i.questionId, next); return ok(next)
+    }),
+    submitReply: (i: SubmitReply & { mode?: string }) => liveOr('submitReply', i, () => {
+      const d = store.get(i.questionId)!
+      const { mode: _m, ...reply } = i
+      const recorded = { ...reply, acceptedAt: '2030-06-14T12:00:00Z', delivery: { state: 'local-only' as const } }
+      if (d.answerState.state === 'awaiting-answer') d.answerState = { state: 'answered', initial: recorded, followUps: [] }
+      d.actions = ['follow-up']
+      return ok(recorded)
+    })
+  }
+}
+const LIVE = ['listDecisionPage', 'workspace.options', 'workspace.resolve', 'retryReply', 'review.open']
+const liveCalls = (view: TestPanel) => LIVE.reduce((n, name) => n + requestsOf(view, name).length, 0)
+
+test('source status: typed coverage is one line per kind, failed reads are named in the summary, nothing is promised', async () => {
+  const { sourceStatus, replyReach } = await import('./source-status')
+  assert.equal(sourceStatus(allAvailable), null, 'nothing to say when every source was read')
+  const v = sourceStatus([
+    { source: 'plugin', state: 'partial', coverage: [
+      { kind: 'pending-verification', message: 'Two lookups are not verified.' }, { kind: 'pending-verification', message: 'Two lookups are not verified.' },
+      { kind: 'hint-scan-limited', message: 'The lookup reached its scan limit.' }, { kind: 'paired-unreadable', message: 'Paired Chats cannot be read.' }] },
+    { source: 'native-item', state: 'available', coverage: [{ kind: 'native-attribution', message: 'One Item has no workspace.' }] }
+  ] as SourceAvailability[])!
+  assert.equal(v.tone, 'info', 'verification, scan limits and attribution are information')
+  assert.match(v.summary, /^Sources: Some Chat submissions not verified yet/)
+  assert.equal(v.lines.filter((l) => l.label === 'Not verified yet').length, 1, 'repeats merged')
+  assert.equal((v.lines[0].text.match(/Two lookups are not verified/g) ?? []).length, 1)
+  assert.ok(!v.lines.some((l) => /nothing is lost|will appear|guarantee/i.test(l.text)), 'no promises')
+  const bad = sourceStatus([{ source: 'plugin', state: 'partial', coverage: [{ kind: 'hint-read-failed', message: 'Inbox could not read the local Chat lookup directory.' }] },
+    { source: 'native-item', state: 'unavailable', message: 'The Bot roster is offline.' }] as SourceAvailability[])!
+  assert.equal(bad.tone, 'warn')
+  assert.match(bad.summary, /^Needs attention: Chat lookup could not be read · Bot Items could not be read/, 'failed reads show while collapsed')
+  assert.ok(bad.open, 'an unavailable source opens the details')
+  assert.match(replyReach('practice'), /this device only\. Nothing is sent/)
+  assert.ok(!/will notify|is notified|gets notified/i.test(replyReach('chat')), 'no notification is promised without a reported delivery')
+})
+
+test('panel: Practice is always one tab away; eight decisions; zero live requests while it is shown', () => withPanel(practiceWorker(), async (view) => {
+  await view.emit('workspace.changed', ctx('studio-local')); await view.settled()
+  assert.ok(view.find({ label: 'Which inbox' }), 'the Inbox / Practice switch is on the list')
+  const before = liveCalls(view)
+  await view.select({ label: 'Which inbox' }, 'practice'); await view.settled()
+  assert.equal(titles(view).length, 8, 'all eight practice decisions')
+  assert.ok(view.find({ label: 'Practice Inbox' }), 'says once what Practice is')
+  assert.ok(view.find({ text: /saved in this Inbox on this device only; nothing is sent/ }))
+  // Focus, workspace and live inbox news while Practice is shown are deferred, not read.
+  await view.emit('workspace.changed', ctx('library-local'))
+  await view.emit('workspace.created', { workspaceId: 'kiln-local', kind: 'worktree', path: '/w/kiln', branch: 'kiln' })
+  await view.post('inbox.changed', {}); await wait(200); await view.settled()
+  // Open, note-free answer, save: every request names Practice explicitly.
+  await view.press({ label: practiceRows[1].title }); await view.settled()
+  assert.ok(view.find({ text: 'Practice · saved on this device' }))
+  assert.ok(view.find({ text: /^Practice: saved in this Inbox on this device only/ }), 'said at the point of reply')
+  await view.type({ label: 'Reply text' }, 'Tuesday works.'); await wait(700); await view.settled()
+  await view.press({ text: 'Save practice answer' }); await view.settled()
+  assert.ok(view.find({ text: /Saved in the Practice Inbox on this device\. Nothing was sent/ }))
+  assert.equal(liveCalls(view), before, 'no live list, inventory, focus, retry or wide request in Practice')
+  for (const name of ['getDecision', 'draft.get', 'draft.save', 'submitReply'])
+    assert.ok(requestsOf(view, name).length && requestsOf(view, name).every((i) => (i as { mode?: string }).mode === 'practice'), `${name} carries mode: practice`)
+  // Back to the Inbox: the deferred focus applies; live requests carry no mode.
+  await view.press({ text: '← Back to Practice' }); await view.select({ label: 'Which inbox' }, 'inbox'); await view.settled()
+  assert.ok(liveCalls(view) > before, 'live reads resume in the Inbox')
+  assert.ok(requestsOf(view, 'workspace.resolve').some((i) => (i as { workspaceId: string }).workspaceId === 'library-local'), 'the focus change made in Practice is applied')
+}))
+
+test('panel: a read-only Bot Item leads to Practice, and the Item itself stays unanswerable', () => withPanel(practiceWorker(), async (view) => {
+  await view.emit('workspace.changed', ctx('studio-local')); await view.settled()
+  await view.press({ label: 'Ship the lantern build?' }); await view.settled()
+  assert.ok(view.find({ text: /^Answer in Orca's Bot Items/ }), 'where the actual Item is answered')
+  assert.ok(!view.find({ text: 'Submit reply' }))
+  await view.press({ text: 'Try answering in Practice' }); await view.settled()
+  assert.equal(titles(view).length, 8)
+  assert.ok(!requestsOf(view, 'submitReply').length, 'nothing was written for the Item')
+}))

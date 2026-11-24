@@ -3,13 +3,14 @@
 import type { Decision, DecisionAction, DecisionSource, Priority, RecordedReply, Workspace } from './contract.ts'
 
 /** What the owner sees for a question. Four distinct states; never merged. */
-export type ShownState = 'awaiting-answer' | 'submitted' | 'agent-received' | 'undelivered'
+export type ShownState = 'awaiting-answer' | 'submitted' | 'agent-received' | 'undelivered' | 'local-only'
 
 export const STATE_LABEL: Record<ShownState, string> = {
   'awaiting-answer': 'Awaiting answer',
   submitted: 'Submitted / awaiting confirmation',
   'agent-received': 'Agent received',
-  undelivered: 'Undelivered'
+  undelivered: 'Undelivered',
+  'local-only': 'Saved in Practice Inbox'
 }
 
 /**
@@ -51,6 +52,14 @@ export type NativeSource = Extract<DecisionSource, { kind: 'native-item' }>
 /** Absent on legacy rows, which are plugin-owned. */
 export const sourceOf = (d: Decision): DecisionSource => d.source ?? { kind: 'plugin' }
 export const nativeOf = (d: Decision): NativeSource | null => { const s = sourceOf(d); return s.kind === 'native-item' ? s : null }
+/**
+ * A synthetic Practice Inbox decision (worker-seeded, reserved `practice:` IDs). Answered like a Chat
+ * decision, but drafts, notes and answers stay in the plugin's local storage: nothing is delivered.
+ */
+export const isPractice = (d: Decision) => sourceOf(d).kind === 'practice'
+/** Where a row comes from, in words the owner reads on rows, sheets and badges. */
+export const SOURCE_WORD = { plugin: 'Chat decision', 'native-item': 'Bot Item', practice: 'Practice' } as const
+export const sourceWord = (d: Decision) => SOURCE_WORD[sourceOf(d).kind]
 
 const NATIVE_STATUS: Record<string, string> = { 'needs-you': 'Needs you', 'in-progress': 'In progress', planned: 'Planned', done: 'Done', canceled: 'Canceled', cancelled: 'Canceled' }
 /** Orca's CLI may spell statuses `needs_you`, `Needs You` or `needs-you`: compare one canonical form. */

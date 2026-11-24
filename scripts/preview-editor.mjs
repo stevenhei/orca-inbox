@@ -31,7 +31,7 @@ for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => process.exit(0))
 writeFileSync(path.join(tmp, 'tsconfig.json'), JSON.stringify({
   extends: path.join(root, 'tsconfig.json'),
   compilerOptions: { noEmit: false, outDir: path.join(tmp, 'build'), rootDir: root, rewriteRelativeImportExtensions: true, allowImportingTsExtensions: false, noEmitOnError: false },
-  files: [path.join(root, 'src/review.ts'), path.join(root, 'fixtures/decisions.ts')], include: []
+  files: [path.join(root, 'src/review.ts'), path.join(root, 'src/backend-practice.ts'), path.join(root, 'fixtures/decisions.ts')], include: []
 }))
 function build() {
   const t = Date.now()
@@ -50,7 +50,7 @@ import { createMockOrca } from './bridge.mjs'
 import { clock } from './build/src/client.js'
 const p = new URLSearchParams(location.search)
 const name = p.get('ref') ?? 'dashboard'
-const ref = name === 'dashboard' ? { view: 'dashboard' } : name === 'settings' ? { view: 'settings' } : { questionId: name }
+const ref = name === 'dashboard' ? { view: 'dashboard' } : name === 'practice' ? { view: 'dashboard', mode: 'practice' } : name === 'settings' ? { view: 'settings' } : { questionId: name }
 clock.now = () => Date.parse('2030-06-14T12:00:00Z') // the fixtures' clock
 clock.zone = () => p.get('zone') ?? 'UTC'
 window.orca = createMockOrca({ ref, history: p.has('history') })

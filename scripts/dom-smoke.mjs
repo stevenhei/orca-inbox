@@ -22,7 +22,7 @@ const LINKEDOM = '0.18.5'
 const TYPESCRIPT = '5.9.3'
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.join(here, '..')
-const SCENARIOS = ['review', 'quiet', 'ime', 'restart', 'ambiguous', 'inflight', 'durable', 'draftcas', 'winner', 'noreceipt', 'bind', 'followup', 'receipt', 'package', 'narrow', 'errors', 'offline', 'settings', 'settings2', 'native', 'mail', 'noactions', 'race', 'racebtn', 'localonly', 'reader', 'dashboard', 'dashnarrow', 'dashfocus', 'dashscope', 'rich', 'sections']
+const SCENARIOS = ['review', 'quiet', 'ime', 'restart', 'ambiguous', 'inflight', 'durable', 'draftcas', 'winner', 'noreceipt', 'bind', 'followup', 'receipt', 'package', 'narrow', 'errors', 'offline', 'settings', 'settings2', 'native', 'mail', 'noactions', 'race', 'racebtn', 'localonly', 'reader', 'dashboard', 'dashnarrow', 'dashfocus', 'dashscope', 'rich', 'sections', 'dashlife', 'dashpractice', 'practicefile']
 const scenario = process.argv[2]
 
 if (!scenario) {
@@ -190,16 +190,19 @@ const files = {
   settings: '{"view":"settings"}', settings2: '{"view":"settings"}', quiet: '{"questionId":"image-review"}', ime: '{"questionId":"schedule"}',
   native: '{"questionId":"native-x"}', mail: '{"questionId":"layout"}', noactions: '{"questionId":"schedule"}',
   reader: '{"questionId":"pkg-a-1"}', dashboard: '{"view":"dashboard"}', dashnarrow: '{"view":"dashboard"}', dashfocus: '{"view":"dashboard"}', race: '{"questionId":"schedule"}', racebtn: '{"questionId":"schedule"}', localonly: '{"questionId":"schedule"}',
-  dashscope: '{"view":"dashboard"}', rich: '{"questionId":"rich-context-question"}', sections: '{"questionId":"sections"}', ambiguous: '{"questionId":"schedule"}', inflight: '{"questionId":"schedule"}', noreceipt: '{"questionId":"schedule"}', narrow: '{"questionId":"image-review"}'
+  dashscope: '{"view":"dashboard"}', dashlife: '{"view":"dashboard"}', rich: '{"questionId":"rich-context-question"}', sections: '{"questionId":"sections"}', ambiguous: '{"questionId":"schedule"}', inflight: '{"questionId":"schedule"}', noreceipt: '{"questionId":"schedule"}', narrow: '{"questionId":"image-review"}'
 }
 const opened = []
+const frameListeners = {}
+const emitFrame = async (event, payload) => { for (const fn of frameListeners[event] ?? []) fn(payload); await settle(30) }
 globalThis.orca = {
   document: { session: async () => ({ value: files[scenario], onReplace(fn) { replace = fn }, change() {} }) },
   shell: { openExternal: async (url) => { opened.push(url); return { opened: true } } },
   plugin: worker,
   // The focused workspace, as the editor frame's host API reports it.
   host: { call: async (method) => { calls.push({ name: `host:${method}` }); return method === 'workspace.readContext' ? { workspaceId: 'studio-local', branch: 'main', displayName: 'studio', terminals: [] } : null } },
-  on: () => ({ dispose() {} })
+  // Orca's frame events (workspace.changed / created / removed), recorded so scenarios can emit them.
+  on: (event, fn) => { (frameListeners[event] ??= []).push(fn); return { dispose() {} } }
 }
 
 // ---- helpers ------------------------------------------------------------------------------------
@@ -414,6 +417,40 @@ if (scenario === 'settings' || scenario === 'settings2') {
     return okR({ ...clone(saved), revision })
   }
 }
+
+// ---- Practice Inbox (FE task_60bd1a0c57b3): its own store, reached only with mode: "practice" -----
+if (scenario === 'dashpractice' || scenario === 'practicefile') {
+  files[scenario] = scenario === 'practicefile' ? '{"view":"dashboard","mode":"practice"}' : '{"view":"dashboard"}'
+  // A read-only native Item, as in the owner's screenshot (Bot Item #2), in the live store.
+  db.set('bot-item:local:b2:0', { ...clone(fx.decisions.find((d) => d.questionId === 'schedule')), questionId: 'bot-item:local:b2:0', packageId: 'bot-item:local:b2', title: 'Bot Item #2: which build ships?',
+    source: { kind: 'native-item', workspaceAttributed: true, botName: 'Release bot', itemLabel: '#2', itemStatus: 'needs-you', observedAt: '2030-06-14T11:00:00Z' }, actions: [], answerState: { state: 'awaiting-answer' } })
+  const pstore = new Map([...fx.decisions, fx.decisions[0], fx.decisions[1]].slice(0, 8).map((d, i) => [`practice:q${i + 1}`, {
+    ...clone(d), questionId: `practice:q${i + 1}`, packageId: `practice:pkg${i + 1}`, title: `Practice ${i + 1}: ${d.title}`,
+    origin: { hostId: 'practice:local', workspaceId: 'practice:inbox', sessionId: 'practice' }, projectName: 'Practice', workspaceName: 'Practice Inbox',
+    source: { kind: 'practice' }, actions: ['reply'], answerState: { state: 'awaiting-answer' }, package: { index: 0, size: 1, questionIds: [`practice:q${i + 1}`] } }]))
+  const pdrafts = new Map()
+  globalThis.__practice = { pstore, pdrafts }
+  const P = (i) => i?.mode === 'practice'
+  handlers['practice.listDecisionPage'] = ({ query, includeHistory }) => okR({ rows: [...pstore.values()].filter((d) => includeHistory && (!query || d.questionId.includes(query) || d.title.includes(query))).map(clone) })
+  handlers.getDecision = (i) => P(i) ? (pstore.has(i.questionId) ? okR(clone(pstore.get(i.questionId))) : errR('not-found')) : base.getDecision(i)
+  handlers['draft.get'] = (i) => P(i) ? okR(clone(pdrafts.get(i.questionId) ?? { draft: null, revision: 0 })) : base['draft.get'](i)
+  handlers['draft.save'] = (i) => {
+    if (!P(i)) return base['draft.save'](i)
+    const cur = pdrafts.get(i.questionId) ?? { draft: null, revision: 0 }
+    if (i.revision !== cur.revision) return errR('conflict', 'Stale draft revision.')
+    const next = { draft: clone(i.draft), revision: cur.revision + 1 }; pdrafts.set(i.questionId, next); return okR(clone(next))
+  }
+  handlers.submitReply = (i) => {
+    if (!P(i)) return base.submitReply(i)
+    const d = pstore.get(i.questionId); const { mode: _m, ...reply } = clone(i)
+    const rec = { ...reply, acceptedAt: '2030-06-14T12:04:00Z', delivery: { state: 'local-only' } }
+    d.answerState = d.answerState.state === 'answered' ? { ...d.answerState, followUps: [...d.answerState.followUps, rec] } : { state: 'answered', initial: rec, followUps: [] }
+    d.actions = ['follow-up']
+    return okR(clone(rec))
+  }
+}
+const LIVE_CALLS = ['listDecisionPage', 'workspace.options', 'workspace.resolve', 'host:workspace.readContext', 'retryReply', 'review.open']
+const liveCount = () => calls.filter((c) => LIVE_CALLS.includes(c.name)).length
 
 await import(build('src/review.js'))
 await settle()
@@ -751,8 +788,11 @@ if (scenario === 'review') {
     sources: [{ source: 'plugin', state: 'available' }, { source: 'native-item', state: 'unavailable', message: 'No authorized Bot Items reader.' }],
     mail: { state: 'unavailable', message: 'Answers are saved in Decision Inbox. Orca mail from this plugin is unavailable on this host.' } } })
   await changed()
-  assert.match(text(), /Bot Items are unavailable\. No authorized Bot Items reader\. Chat decisions below are not affected\./); ok('source availability shown')
-  assert.equal(text().split('Answers are saved in Decision Inbox').length - 1, 1); ok('mail notice once')
+  // One collapsible source status names the failed read; mail is said once, at the reply.
+  assert.match(document.querySelector('[data-k="source-status"] summary').textContent, /^Needs attention: Bot Items could not be read/); ok('source availability shown')
+  assert.match(text(), /No authorized Bot Items reader\. Bot Items may be missing here; check them in Orca\./); ok('the read failure is actionable')
+  assert.ok(!/Answers are saved in Decision Inbox/.test(text()), 'no mail banner over the list')
+  assert.equal(text().split('Orca mail from this plugin is unavailable here').length - 1, 1); ok('mail notice once, at the reply')
   assert.match(document.head.textContent, /@media \(max-width: 899px\) \{\.d-app \.d-workspace\.d-has-sheet \{ grid-template-columns: minmax\(0, 1fr\); \} \.d-app \.d-sheet \{ position: fixed; inset: 0;/); ok('narrow sheet rule present')
   // Esc closes the sheet and focus returns to the row.
   await click(find('.qrow .qt', 'Pick a rehearsal slot').parentElement)
@@ -812,6 +852,14 @@ if (scenario === 'review') {
   assert.ok(!opts().some((t) => /This workspace/.test(t)) && !document.querySelector('[data-k="chip-workspace"]')); ok('no "This workspace" duplicate and no workspace chip')
   assert.equal(chosen(), wsVal('local', 'studio')); assert.deepEqual(last('listDecisionPage').scope, { kind: 'workspace', workspace: { hostId: 'local', workspaceId: 'studio' } }); ok('starts on the focused workspace, named; request is host-qualified')
   assert.ok(document.querySelector('[data-k="group-by"]').closest('.d-toolbar')); ok('Group by stays a separate control')
+  // Choosing the workspace focus already shows pins it: a later focus change does not move it.
+  const pinBefore = callsOf('listDecisionPage').length
+  await chooseWs(wsVal('local', 'studio'))
+  assert.equal(callsOf('listDecisionPage').length, pinBefore)
+  handlers['workspace.resolve'] = ({ workspaceId }) => workspaceId === 'library-local' ? okR({ hostId: 'local', workspaceId: 'library' }) : base['workspace.resolve']({ workspaceId })
+  await emitFrame('workspace.changed', { context: { workspaceId: 'library-local', branch: 'main', displayName: 'library', terminals: [] } })
+  assert.equal(chosen(), wsVal('local', 'studio')); assert.deepEqual(last('listDecisionPage').scope, { kind: 'workspace', workspace: { hostId: 'local', workspaceId: 'studio' } }); ok('choosing the focused workspace pins it; focus no longer moves it')
+  delete handlers['workspace.resolve']
   // Empty authorized workspace.
   await chooseWs(wsVal('local', 'archive'))
   assert.deepEqual(last('listDecisionPage').scope, { kind: 'workspace', workspace: { hostId: 'local', workspaceId: 'archive' } }); assert.match(text(), /Nothing needs you in archive\./); assert.equal(all('tr.d-row').length, 0); ok('an empty workspace is an ordinary empty state')
@@ -843,10 +891,74 @@ if (scenario === 'review') {
   // A chosen workspace the worker refuses: ask; never widen.
   await chooseWs(wsVal('local', 'library'))
   handlers.listDecisionPage = (i) => i.scope.kind === 'workspace' ? errR('forbidden', 'Not authorized for that workspace.') : base.listDecisionPage(i)
+  // Like the worker, the refusal and the inventory come from the same authorized set.
+  handlers['workspace.options'] = () => { const r = base['workspace.options'](); return okR({ workspaces: r.value.workspaces.filter((w) => w.workspaceId !== 'library') }) }
   const before = callsOf('listDecisionPage').length
   await setValue(byLabel('Search decisions'), 'room', 'input'); await sleep(300); await settle()
   assert.match(text(), /library is no longer available\./); assert.equal(all('tr.d-row').length, 0)
   assert.ok(callsOf('listDecisionPage').slice(before).every((c) => c.scope.kind === 'workspace')); ok('a refused workspace asks for a choice and is never widened')
+  assert.ok(!opts().includes('library')); ok('the re-read inventory no longer offers it')
+  assert.equal(document.querySelector('.d-sheet h1')?.textContent, 'Approve the reading room route'); assert.equal(byLabel('Reply text').value, 'East entrance'); ok('the open decision and its draft are kept')
+  // A refusal the inventory does not confirm (the owner check) is an error, not a lost workspace.
+  delete handlers['workspace.options']
+  handlers.listDecisionPage = () => errR('forbidden', 'Owner only.')
+  await chooseWs(wsVal('local', 'studio'))
+  assert.match(text(), /Owner only\./); assert.ok(!/studio is no longer available/.test(text())); assert.equal(chosen(), wsVal('local', 'studio')); ok('an unconfirmed refusal is shown as an error; the choice stays')
+} else if (scenario === 'dashlife') {
+  const sel = () => document.querySelector('[data-k="ws-select"]')
+  const opts = () => [...sel().querySelectorAll('option')].filter((o) => !o.hasAttribute('disabled')).map((o) => o.textContent)
+  const chosen = () => sel().querySelector('option[selected]')?.getAttribute('value')
+  const inv = (extra = [], drop = []) => () => { const r = base['workspace.options'](); return okR({ workspaces: [...r.value.workspaces.filter((w) => !drop.includes(w.workspaceId)), ...extra] }) }
+  const optCalls = () => callsOf('workspace.options').length
+  const ctxOf = (workspaceId) => ({ context: { workspaceId, branch: 'main', displayName: workspaceId, terminals: [] } })
+  assert.equal(chosen(), wsVal('local', 'studio')); ok('starts on the focused workspace')
+  // Addition on focus: Orca creates and focuses a workspace the last inventory did not list.
+  handlers['workspace.resolve'] = ({ workspaceId }) => workspaceId === 'kiln-local' ? okR({ hostId: 'local', workspaceId: 'kiln' }) : base['workspace.resolve']({ workspaceId })
+  handlers['workspace.options'] = inv([{ hostId: 'local', workspaceId: 'kiln', name: 'kiln', hostLabel: 'Local Orca' }])
+  const n0 = optCalls()
+  await emitFrame('workspace.created', { workspaceId: 'kiln-local', kind: 'worktree', path: '/w/kiln', branch: 'kiln' })
+  assert.ok(optCalls() > n0 && opts().includes('kiln')); ok('workspace.created re-reads the inventory; the new workspace is offered')
+  await emitFrame('workspace.changed', ctxOf('kiln-local'))
+  assert.equal(chosen(), wsVal('local', 'kiln')); assert.deepEqual(last('listDecisionPage').scope, { kind: 'workspace', workspace: { hostId: 'local', workspaceId: 'kiln' } })
+  assert.match(text(), /Nothing needs you in kiln\./); assert.ok(!/no longer available/.test(text())); ok('focus moves to the new workspace: it is listed, not reported missing')
+  // Removal after page one: the focused workspace is removed before its second page is read.
+  const paged = (i) => { const r = base.listDecisionPage(i); const start = i.cursor ? Number(i.cursor) : 0; const rows = r.value.rows.slice(start, start + 1); return okR({ rows, ...(start + 1 < r.value.rows.length ? { nextCursor: String(start + 1) } : {}) }) }
+  handlers.listDecisionPage = paged
+  await emitFrame('workspace.changed', ctxOf('studio-local'))
+  assert.equal(chosen(), wsVal('local', 'studio')); assert.equal(all('tr.d-row').length, 1); assert.ok(find('button', 'Load more')); ok('focus back on studio: page one loaded')
+  await click(all('.qrow')[0])
+  await setValue(byLabel('Reply text'), 'keep me', 'input')
+  const openTitle = document.querySelector('.d-sheet h1').textContent
+  handlers['workspace.options'] = inv([], ['studio'])
+  handlers.listDecisionPage = (i) => i.scope.kind === 'workspace' && i.scope.workspace.workspaceId === 'studio' && i.scope.workspace.hostId === 'local' ? errR('forbidden', 'Inbox workspace is missing or inaccessible.') : paged(i)
+  const lp = callsOf('listDecisionPage').length
+  await click(find('button', 'Load more')); await settle(30)
+  assert.match(text(), /studio is no longer available\./); assert.equal(all('tr.d-row').length, 0); assert.ok(!find('button', 'Load more'))
+  assert.ok(callsOf('listDecisionPage').slice(lp).every((c) => c.scope.kind === 'workspace')); ok('removal after page one: Load more is refused, the view asks, nothing is widened')
+  assert.equal(document.querySelector('.d-sheet h1').textContent, openTitle); assert.equal(byLabel('Reply text').value, 'keep me'); ok('the open decision and its draft are kept')
+  await sleep(450); assert.ok([...drafts.values()].some((x) => x.draft?.text === 'keep me')); ok('and saved under its own question')
+  // Stale inventory: an older, slower read must not overwrite a newer one.
+  let releaseOld = () => {}
+  handlers['workspace.options'] = () => new Promise((r) => { releaseOld = () => r(inv()()) })
+  const slow = emitFrame('workspace.removed', { workspaceId: 'x', kind: 'worktree', path: '/w/x' })
+  handlers['workspace.options'] = inv([], ['studio'])
+  await emitFrame('workspace.removed', { workspaceId: 'y', kind: 'worktree', path: '/w/y' })
+  releaseOld(); await slow; await settle(30)
+  assert.ok(!opts().includes('studio · Local Orca')); assert.match(text(), /studio is no longer available\./); ok('a late inventory answer does not bring back a removed workspace')
+  // Ambiguous focus: the worker cannot map the focused ID to one host: ask, list nothing new.
+  handlers['workspace.resolve'] = () => errR('unavailable', 'Multiple hosts report the focused workspace ID. Switch to All workspaces.')
+  const lq = callsOf('listDecisionPage').length
+  await emitFrame('workspace.changed', ctxOf('twin'))
+  assert.match(text(), /Could not identify the focused workspace\..*Multiple hosts report the focused workspace ID/); assert.equal(callsOf('listDecisionPage').length, lq); ok('ambiguous focus asks and lists nothing')
+  // An explicit choice is pinned: later focus changes do not move it.
+  handlers['workspace.resolve'] = base['workspace.resolve']
+  await chooseWs(wsVal('local', 'library'))
+  await emitFrame('workspace.changed', ctxOf('studio-local'))
+  assert.equal(chosen(), wsVal('local', 'library')); assert.deepEqual(last('listDecisionPage').scope, { kind: 'workspace', workspace: { hostId: 'local', workspaceId: 'library' } }); ok('an explicit choice stays pinned across focus changes')
+  // Becoming visible again re-reads the inventory.
+  const nv = optCalls()
+  Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true }); document.dispatchEvent(new window.Event('visibilitychange')); await settle(30)
+  assert.ok(optCalls() > nv); ok('returning to the tab re-reads the inventory')
 } else if (scenario === 'reader') {
   assert.equal(document.querySelector('h1').textContent, '第一題：是否發佈？'); ok('active question first')
   assert.equal(document.querySelector('.pager span').textContent, '1 / 2'); assert.equal(document.querySelector('.pager span').getAttribute('aria-label'), 'Question 1 of 2'); assert.ok(document.querySelector('.d-dock .pager')); ok('pager 1 / 2 in the reply card')
@@ -1069,5 +1181,49 @@ if (scenario === 'review') {
   await setValue(byLabel('Default question template'), 'Changed again.')
   await click(find('button', 'Save'))
   assert.match(text(), /changed elsewhere since you opened them, so nothing was saved/); assert.ok(find('button', 'Load latest settings')); ok('save conflict reported with a reload')
+}
+if (scenario === 'dashpractice') {
+  await sleep(50); await settle()
+  // Owner's starting point: the live queue with a read-only native Bot Item.
+  assert.ok(find('[data-k="mode-practice"]', 'Practicesafe') || document.querySelector('[data-k="mode-practice"]'), 'Practice switch'); ok('Practice is on the dashboard, above the queue')
+  await click(find('.qrow .qt', 'Bot Item #2: which build ships?').parentElement); await sleep(20); await settle()
+  assert.match(text(), /Answer in Orca's Bot Items: bot “Release bot”, item #2/); assert.ok(!document.querySelector('[data-k="send"]')); ok('native Item: actual location, read-only, no reply')
+  assert.ok(!/Orca mail from this plugin/.test(document.querySelector('.d-sheet').textContent), 'native view is not told about plugin mail'); ok('native-only view not blamed for mail')
+  // A live search that matches nothing must not hide the practice rows.
+  const search = document.querySelector('[data-k="dash-search"]'); await setValue(search, 'nomatch', 'input'); await sleep(320); await settle()
+  await click(document.querySelector('[data-k="try-practice"]')); await sleep(30); await settle()
+  assert.equal(all('.qrow').length, 8); assert.equal(search.value, ''); ok('from the native sheet: Practice opens with all eight, live search not carried over')
+  assert.match(text(), /Practice Inbox\. Synthetic decisions/); assert.equal(document.querySelector('[data-k="source-status"]'), null); ok('one practice note, no live source status')
+  const live0 = liveCount()
+  await click(find('.qrow .qt', 'Practice 1: Pick a rehearsal slot').parentElement); await sleep(20); await settle()
+  assert.ok(callsOf('getDecision').at(-1).mode === 'practice' && callsOf('draft.get').at(-1).mode === 'practice'); ok('detail and draft reads carry mode: practice')
+  assert.match(document.querySelector('.d-where').textContent, /Practice · saved on this device/); assert.match(document.querySelector('[data-k="reply-reach"]').textContent, /^Practice: saved in this Inbox on this device only/); ok('source and where the answer goes, at the reply')
+  const bg = document.querySelector('[data-field="background"] p').firstChild
+  select(range(bg, 0, 4)); await key({ altKey: true, key: 'n', code: 'KeyN' }); await addNote('practice note'); await sleep(450)
+  assert.equal(last('draft.save').mode, 'practice'); assert.equal(last('draft.save').draft.annotations[0].text, 'practice note'); ok('a text note saves to the practice draft')
+  assert.match(document.querySelector('.d-note-saved').textContent, /Note saved with your practice draft \(1\)\./); assert.doesNotMatch(document.querySelector('.d-dock').textContent, /Not sent yet: notes go with your reply/); ok('note copy says saved here, not "sent with your reply"')
+  await setValue(document.querySelector('[data-k="reply"]'), 'Tuesday works for practice.'); await sleep(450)
+  assert.match(document.querySelector('[data-k="send"]').textContent, /Save practice answer/)
+  await click(document.querySelector('[data-k="send"]')); await sleep(30); await settle()
+  assert.equal(last('submitReply').mode, 'practice'); assert.match(text(), /practice answer is saved in the Practice Inbox on this device/); ok('answer saved locally, said plainly')
+  // Live news while Practice is shown: nothing live is read.
+  await emitFrame('workspace.changed', { context: { workspaceId: 'studio-local' } }); await emitFrame('workspace.created', {})
+  document.dispatchEvent(new window.Event('visibilitychange')); await changed()
+  for (const fn of listeners['practice.changed'] ?? []) fn({}); await sleep(200); await settle()
+  assert.equal(liveCount(), live0); ok('zero live list, inventory, focus, retry or wide requests in Practice (events included)')
+  // Close and reopen: the answer and its note persist.
+  await click(document.querySelector('[data-k="sheet-close"]'))
+  assert.equal(all('.qrow').length, 7); await click(document.querySelector('[data-k="tab-answered"]')); ok('the answered practice decision moves to Answered')
+  await click(find('.qrow .qt', 'Practice 1: Pick a rehearsal slot').parentElement); await sleep(20); await settle()
+  assert.match(text(), /Tuesday works for practice\./); assert.match(text(), /Saved in Practice Inbox/); assert.match(text(), /1 note saved with this practice answer, on this device only/); ok('close and reopen: answer persists, local-only state shown')
+  const rn = document.querySelector('.d-reply-notes'); assert.ok(rn && !rn.hasAttribute('open')); assert.match(rn.textContent, /Background: “Both” — practice note/); assert.ok(!document.querySelector('.d-nc')); ok('the saved note stays readable (collapsed, read-only; composer closed)')
+  // Back to the Inbox: live reads resume, the live search returns, the native Item is unchanged.
+  await click(document.querySelector('[data-k="mode-inbox"]')); await sleep(350); await settle()
+  assert.ok(liveCount() > live0); assert.equal(search.value, 'nomatch'); ok('Inbox: live reads resume and its own search is restored')
+  assert.ok(callsOf('submitReply').every((i) => i.mode === 'practice')); assert.equal(db.get('bot-item:local:b2:0').answerState.state, 'awaiting-answer'); ok('no live reply; the native Item is unchanged')
+} else if (scenario === 'practicefile') {
+  await sleep(50); await settle()
+  assert.equal(all('.qrow').length, 8); assert.equal(document.querySelector('[data-k="mode-practice"]').getAttribute('aria-pressed'), 'true'); ok('the + menu practice file opens the dashboard on Practice')
+  assert.equal(liveCount(), 0); assert.ok(document.querySelector('.d-ws-pick:not(.d-ws-static)').hidden); ok('no live request and no Workspace list in Practice')
 }
 process.exit(0)

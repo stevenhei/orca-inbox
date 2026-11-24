@@ -384,9 +384,38 @@ test('registered paging distinguishes removed workspaces from authorized empty s
     const annex = value(await list({ ...queue, scope: { kind: 'workspace', workspace: empty } }))
     assert.deepEqual(annex.rows, [])
     assert.equal(annex.nextCursor, undefined)
-    assert.deepEqual(annex.sources?.map(source => source.state), ['available', 'partial'])
-    assert.match(annex.sources?.find(source => source.source === 'native-item')?.message ?? '', /attribution/)
+    assert.deepEqual(annex.sources?.map(source => source.state), ['available', 'available'])
   } finally {
     await worker.deactivate()
   }
+})
+
+test('native coverage distinguishes readable unattributed items from failed inventory and bot reads', async () => {
+  let mode = 'missing'
+  const cli = async (args: string[]) => {
+    if (args[0] === 'environment') return { environments: [] }
+    if (args.join(' ') === 'bot list') return { bots: [{ id: 'sample-bot' }] }
+    if (args[0] === 'agent') {
+      if (mode === 'failed-inventory') throw new Error('Source failed')
+      return { agents: [] }
+    }
+    if (args[0] === 'worktree') return { worktrees: [] }
+    if (mode === 'failed-bot') throw new Error('Item read failed')
+    return { items: [{ uid: 'sample-item', title: 'Readable Item', status: 'needs_you', chat: { kind: 'chat', id: 'sample-chat' } }] }
+  }
+  const all = await nativePage(cli, [localWorkspace])
+  assert.equal(all.source.state, 'available')
+  assert.equal(all.rows.length, 1)
+  assert.ok(all.rows[0].source?.kind === 'native-item' && !all.rows[0].source.workspaceAttributed)
+  assert.equal(all.source.coverage?.[0].kind, 'native-attribution')
+  assert.match(all.source.coverage?.[0].message ?? '', /readable Bot Items have no verified workspace/)
+  assert.equal((await nativePage(cli, [localWorkspace], 'local')).source.state, 'partial')
+  mode = 'failed-inventory'
+  const scoped = await nativePage(cli, [localWorkspace], 'local')
+  assert.equal(scoped.source.state, 'partial')
+  assert.match(scoped.source.coverage?.[0].message ?? '', /inventory could not be fully read/)
+  mode = 'failed-bot'
+  const denied = await nativePage(cli, [localWorkspace])
+  assert.equal(denied.source.state, 'unavailable')
+  assert.equal(denied.source.coverage?.[0].kind, 'native-partial')
 })

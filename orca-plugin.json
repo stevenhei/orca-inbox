@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "decision-inbox",
   "name": "Decision Inbox",
-  "version": "0.3.2-rc.1",
+  "version": "0.3.2-rc.2",
   "description": "Read authorized Bot Items and save answers to workspace Chat decisions.",
   "engines": { "orca": ">=1.4.248" },
   "execution": "trusted-worker",
@@ -16,7 +16,8 @@
       { "id": "review", "title": "Decision Review", "extensions": [".orca-decision"], "entry": "src/review.ts", "frame": "isolated" }
     ],
     "newFiles": [
-      { "id": "dashboard", "title": "Decision Inbox dashboard", "extension": ".orca-decision", "template": "templates/dashboard.orca-decision" }
+      { "id": "dashboard", "title": "Decision Inbox dashboard", "extension": ".orca-decision", "template": "templates/dashboard.orca-decision" },
+      { "id": "practice", "title": "Decision Inbox practice (safe, local only)", "extension": ".orca-decision", "template": "templates/practice.orca-decision" }
     ]
   },
   "capabilities": [

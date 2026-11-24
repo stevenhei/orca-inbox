@@ -45,7 +45,7 @@ function transitionHeadroom(state: State) {
   for (const d of state.decisions) {
     if (d.answerState.state === 'answered') {
       for (const r of [d.answerState.initial, ...d.answerState.followUps]) {
-        if (r.delivery.state !== 'agent-received') {
+        if (r.delivery.state !== 'agent-received' && r.delivery.state !== 'local-only') {
           bytes += deliveryHeadroom(d.origin, d.questionId, r.replyId, r.delivery, queued.has(r.replyId))
         }
       }
@@ -85,7 +85,7 @@ const chunkOverhead = 128
 const account = (state: State, physicalBytes: number) => physicalBytes + transitionHeadroom(state) +
   Number(state.drafts.length > 0) + Number(state.outbox.length > 0) + Number(state.replies.length > 0)
 
-async function readIndex(host: Storage): Promise<Index | null> {
+async function readIndex(host: Pick<Storage, 'get'>): Promise<Index | null> {
   const value = await host.get(indexKey)
   if (value === null) return null
   if (typeof value !== 'object' || Array.isArray(value) || (value.slot !== 'a' && value.slot !== 'b') ||
@@ -98,7 +98,15 @@ async function readIndex(host: Storage): Promise<Index | null> {
 /** Orca caps each value at 256 KiB and the plugin at 5 MiB. Stage one bounded
  * metadata generation in the inactive slot, then atomically switch the index.
  * Immutable snapshot chunks are shared by generations. A later write removes abandoned blobs. */
-export function orcaStorage(host: Storage): InboxStorage {
+export function orcaStorage(storage: Storage, practice = false): InboxStorage {
+  const namespace = 'practice.'
+  const host = practice ? {
+    get: (key: string) => storage.get(namespace + key),
+    set: (key: string, value: Parameters<Storage['set']>[1]) => storage.set(namespace + key, value),
+    delete: (key: string) => storage.delete(namespace + key),
+    keys: async () => (await storage.keys()).filter(key => key.startsWith(namespace)).map(key => key.slice(namespace.length))
+  } : storage
+
   const readState = async (index: Index) => {
     const chunks = await Promise.all(Array.from({ length: index.count }, (_, i) => host.get(chunkKey(index.slot, i))))
     if (!chunks.every(chunk => typeof chunk === 'string')) throw new InboxError('unavailable', 'Inbox storage is incomplete.')
@@ -160,11 +168,11 @@ export function orcaStorage(host: Storage): InboxStorage {
           snapshotBytes += header.length
         }
       }
-      if (snapshotBytes > snapshotBudget) throw new InboxError('unavailable', 'The Inbox has reached its private snapshot storage limit.')
+      if (snapshotBytes > (practice ? 12_000 : snapshotBudget)) throw new InboxError('unavailable', 'The Inbox has reached its private snapshot storage limit.')
       const serialized = JSON.stringify(compactState(state))
       const physicalBytes = storedStringBytes(serialized) + chunkOverhead
       const accounted = account(state, physicalBytes)
-      if (physicalBytes > physicalMetadataBudget ||
+      if (physicalBytes > (practice ? 48 * 1024 : physicalMetadataBudget) ||
         (accounted > metadataBudget && (!previous || accounted > account(previous, storedBytes(compactState(previous)) + chunkOverhead)))) {
         throw new InboxError('unavailable', 'The Inbox has reached its Orca storage limit.')
       }

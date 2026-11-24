@@ -2,9 +2,21 @@
 
 Decision Inbox organizes authorized Orca Bot Items and plugin-owned decisions from ordinary workspace Chats. Read native Items in the merged queue and answer them in Orca. Save plugin-owned answers in the Inbox. Mail delivery requires a legitimate Orca plugin sender.
 
+## Try a decision
+
+Open **Decision Inbox dashboard** from the editor’s **+** menu and choose **Practice**. Eight fictional questions are available on each installation. Open **活動海報要用哪一款版面？** to compare two designs, attach a note to the image or a passage, then choose an option or type a reply. Open **請寫一句海報標題** to try a free-text answer. After saving, find the answer under **Answered**. Practice drafts, notes and answers are stored by this installation and survive reopening. Practice works without access to Chat, Bot Items or mail.
+
+| Decision source | What you can do | Where the result goes |
+| --- | --- | --- |
+| Practice | Write an answer, select options, annotate text and images, and revisit answers | Practice storage on this installation |
+| Workspace Chat | Review a verified submission, annotate it and save an answer | Decision Inbox storage. On hosts without a plugin mail sender, the original Chat receives no notification. |
+| Native Bot Item | Read the question, recommendation and options | Answer in Orca’s Bot Items view. The Inbox shows the bot name and item number. |
+
+The live queue reports source coverage independently. A local submission can still be waiting for its originating Chat to be verified. A readable Bot Item whose workspace is unknown appears under **All workspaces**. If a source read fails, inspect the source details for what could not be loaded. Paired Bot Item reads use the local host’s saved pairing. Intake from ordinary Chats on a paired host and plugin-originated mail delivery still require host support.
+
 ## Use on an Orca desktop
 
-Load the folder as an approved trusted plugin using `orca plugin install .` and Orca's approval flow. Open its panel with `orca plugin open decision-inbox --panel inbox`. Review and settings tabs use reference files under `.orca-decision-inbox/` in the current local workspace. The references contain only a question ID or the settings selector. The worker uses the host-installed Orca CLI where available. For a local workspace Chat, follow the [agent skill](agent/decision-inbox/SKILL.md) and run:
+For a GitHub installation, run `orca plugin update stevenhei.decision-inbox` on the Orca host that runs the plugin. For a first install, run `orca plugin install stevenhei/orca-inbox@main` and follow Orca’s approval prompt. Open the dashboard from the editor’s **+** menu or open the sidebar with `orca plugin open stevenhei.decision-inbox --panel inbox`. Review and settings tabs use reference files under `.orca-decision-inbox/` in the current local workspace. The references contain only a question ID or the settings selector. The worker uses the host-installed Orca CLI where available. For a local workspace Chat, follow the [agent skill](agent/decision-inbox/SKILL.md) and run:
 
 ```sh
 node /path/to/orca-inbox/agent/decision-inbox/inbox.mjs submit INPUT.json
