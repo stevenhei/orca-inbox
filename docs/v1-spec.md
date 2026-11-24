@@ -1,5 +1,7 @@
 # Orca Decision Inbox V1
 
+For the selected D dashboard, follow the [frontend and plugin contract](frontend-plugin-contract.md) for workspace selection, interaction ownership and migration.
+
 The Inbox organizes two sources. Genuine Orca Bot Items are a read-only view of authorized local Items. An ordinary Claude or Codex Orca workspace Chat can submit a separate Inbox-owned decision. The owner can save an answer to that decision through the desktop Inbox. Native Items are answered in Orca's Bot Items view. The desktop right sidebar opens in **This workspace**. The owner can explicitly select **All workspaces**, and that choice survives workspace focus changes. An open decision and its draft stay bound to the original question ID. The proposed file-backed wide review opens a decision from another repo without switching the active workspace. That behavior requires desktop proof. Left navigation is a possible later Orca core extension.
 
 Rows show question, project, workspace, priority P0–P3, optional deadline, and blocked work. Sort P0 first, then overdue or due today, then the remaining rows. Within each group sort by priority, then oldest first. Search within the selected scope by Chinese or English keyword and by identifier. Index title, background, recommendation, options, and reply. Include history only when toggled on. A package may share context and evidence across independently answerable questions. Each question maintains its own answer, delivery state, and receipts.
