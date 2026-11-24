@@ -14,6 +14,8 @@ Local implementation scaffold for owner decisions and reviews in desktop Orca. T
 | [Shared contract](src/contract.ts) | Domain, operation shapes, origin, and delivery states |
 | [Fixtures](fixtures/decisions.ts), [sample review file](fixtures/scaffold.orca-decision) | Synthetic cases and a custom editor sample |
 | [Scaffold checks](src/scaffold.test.ts), [TS config](tsconfig.json) | Local panel and fixture tests and strict TypeScript config |
+| [FE design handoff](docs/design-handoff.md) | Interaction decisions, state representations, acceptance coverage, open assumptions |
+| [View-model](src/model.ts), [DOM tests](scripts/dom-smoke.mjs) | Shared sort, search and scope logic; editor tests (`npm run test:dom`) |
 
 ## Local validation
 

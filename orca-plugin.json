@@ -1,6 +1,6 @@
 {
   "manifestVersion": 2,
-  "id": "orca-decision-inbox",
+  "id": "decision-inbox",
   "name": "Decision Inbox",
   "version": "0.1.0",
   "description": "Development scaffold for owner decisions and reviews.",
@@ -16,5 +16,8 @@
       { "id": "review", "title": "Decision Review", "extensions": [".orca-decision"], "entry": "src/review.ts", "frame": "isolated" }
     ]
   },
-  "capabilities": []
+  "capabilities": [
+    { "kind": "storage:own" },
+    { "kind": "workspace:read" }
+  ]
 }

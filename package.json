@@ -1,0 +1,11 @@
+{
+  "name": "orca-decision-inbox",
+  "private": true,
+  "description": "Scripts only. Install nothing in this folder: Orca refuses plugins that contain symlinks, which node_modules/.bin creates. The DOM tests install their tools in a temporary directory.",
+  "scripts": {
+    "typecheck": "npm exec --yes --package typescript@5.9.3 -- tsc -p tsconfig.json",
+    "test:plugin": "orca plugin test . && orca plugin check .",
+    "test:dom": "node scripts/dom-smoke.mjs",
+    "test": "npm run typecheck && npm run test:plugin && npm run test:dom"
+  }
+}
