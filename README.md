@@ -1,45 +1,49 @@
-# Orca Decision Inbox V1
+# Decision Inbox Preview
 
-Decision Inbox organizes authorized Orca Bot Items and plugin-owned decisions from ordinary workspace Chats. Read native Items in the merged queue and answer them in Orca. Save plugin-owned answers in the Inbox. Mail delivery requires a legitimate Orca plugin sender.
+A try-it-now preview of the Orca Decision Inbox with built-in synthetic sample decisions. Answers you save stay in the preview on your desktop. Nothing is sent to a Chat, mail, or Bot Items.
 
-## Use on an Orca desktop
+This branch (`preview`) contains only the preview plugin. The production Decision Inbox lives on `main`, under its own plugin id (`decision-inbox`). The two plugins never share storage.
 
-Load the folder as an approved trusted plugin using `orca plugin install .` and Orca's approval flow. Open its panel with `orca plugin open decision-inbox --panel inbox`. Review and settings tabs use reference files under `.orca-decision-inbox/` in the current local workspace. The references contain only a question ID or the settings selector. The worker uses the host-installed Orca CLI where available. For a local workspace Chat, follow the [agent skill](agent/decision-inbox/SKILL.md) and run:
+## Install and open
 
 ```sh
-node /path/to/orca-inbox/agent/decision-inbox/inbox.mjs submit INPUT.json
+orca plugin install stevenhei/orca-inbox@preview
+orca plugin open stevenhei.decision-inbox-preview --panel inbox
 ```
 
-Put the emitted line in the Chat's visible assistant response, then open or refresh the desktop Inbox. On this release path only the local plugin can save the answer. On the inspected host the Inbox reports mail unavailable and saves the reply as undelivered. An Orca mail acceptance, when implemented on a supported surface, will leave the reply awaiting explicit acknowledgement.
+Orca asks you to approve a `sandboxed-ui` panel with no capabilities. Approve it with the `--approve <fingerprint>` command Orca prints. The repository is private, so the Orca host needs Git access to it (for example `gh auth setup-git`).
 
-## File map
+## What you can try
+
+- **Queue**: eight sample cards that need an answer, sorted most urgent first (P0, then overdue or due today, then priority and age). Sample dates are placed relative to the moment you first open the panel.
+- **Review in the panel**: select a card to read its project, deadline, blocked work, background, recommendation, evidence and options. **Back to list** returns to the queue.
+- **Search**: by title, background, option, ID or Chinese text, for example `錄音`, `vd-` or `fold-out`.
+- **Include history**: shows the sample history card and anything you answered in the preview.
+- **Answer**: choose an option and add optional detail, or type a reply. Save with **Save test answer** or Ctrl+Enter (Cmd+Enter on macOS). The result appears straight away, and you can add follow-ups.
+- **Multi-question package**: *Community Garden · volunteer-day* has three questions, each answered on its own.
+- **Seven images**: *Compare seven paper model views* has a large viewer, Previous and Next buttons, numbered thumbnails and a note for each image.
+- **Reset**: the refresh icon at the top clears every saved test answer after you confirm.
+
+## Files
 
 | Path | Contents |
 | --- | --- |
-| [AGENTS.md](AGENTS.md) | Session ownership, role authority, and language |
-| [Approved V1 scope](docs/v1-spec.md) | Product behavior and release gate |
-| [Implementation handoff](docs/implementation-handoff.md) | Phase 1 operation, Phase 2 context, and acceptance matrix |
-| [orca-plugin.json](orca-plugin.json) | Sidebar, worker, and isolated custom editor contributions |
-| [Sidebar](src/panel.tsx), [worker](src/worker.ts), [review](src/review.ts) | Minimal Orca entry points |
-| [Shared contract](src/contract.ts) | Domain, operation shapes, origin, and delivery states |
-| [Fixtures](fixtures/decisions.ts), [sample review file](fixtures/scaffold.orca-decision) | Synthetic cases and a custom editor sample |
-| [Scaffold checks](src/scaffold.test.ts), [TS config](tsconfig.json) | Local panel and fixture tests and strict TypeScript config |
-| [FE design handoff](docs/design-handoff.md) | Interaction decisions, state representations, acceptance coverage, open assumptions |
-| [View-model](src/model.ts), [DOM tests](scripts/dom-smoke.mjs) | Shared sort, search and scope logic; editor tests (`npm run test:dom`) |
+| `orca-plugin.json` | Manifest: `decision-inbox-preview`, one components panel, no worker or capabilities |
+| `src/panel.tsx` | The panel: queue, in-panel review, answers, reset |
+| `src/preview-model.ts` | Sorting, search, deadline text and answer rules, following the production model |
+| `src/sample.ts` | Synthetic sample decisions, shaped by the production contract and fixtures |
+| `src/contract.ts` | The shared Decision Inbox contract (unchanged from `main`) |
+| `assets/sample/*.png` | Seven distinct synthetic images |
+| `src/panel.test.tsx`, `src/panel.check.ts` | Interaction tests and render scenarios |
 
-## Local validation
-
-Run from this folder with Orca CLI and Node available. Orca loads the TypeScript entries directly. The TypeScript command uses a pinned compiler via npm's cache.
+## Check locally
 
 ```sh
-orca skills get orca-plugin-authoring
 orca plugin types .
 npm exec --yes --package typescript@5.9.3 -- tsc -p tsconfig.json
 orca plugin validate . --json
-orca plugin test . --json
+orca plugin test .
 orca plugin check . --json
 ```
 
-## Current evidence
-
-The host-supplied Orca CLI 1.4.271 can read authorized Bot Items and ordinary Chat records. The PATH CLI 1.4.264 lacks Bot Item commands. The inspected headless runtime did not expose the plugin service or an approved plugin mail sender. The disposable ordinary-Chat transport control used a genuine Chat sender. Desktop and paired acceptance are pending. See the [handoff](docs/implementation-handoff.md) and [Phase 2 audit](docs/native-integration-audit.md).
+Do not run `npm install` here. Orca refuses plugins that contain symlinks.

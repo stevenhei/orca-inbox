@@ -1,24 +1,15 @@
 {
   "manifestVersion": 2,
-  "id": "decision-inbox",
-  "name": "Decision Inbox",
-  "version": "0.1.0",
-  "description": "Read authorized Bot Items and save answers to workspace Chat decisions.",
+  "id": "decision-inbox-preview",
+  "name": "Decision Inbox Preview",
+  "version": "0.1.0-preview.1",
+  "description": "Try the Decision Inbox with built-in sample decisions. Answers stay in this preview; nothing is sent.",
   "engines": { "orca": ">=1.4.248" },
-  "execution": "trusted-worker",
+  "execution": "sandboxed-ui",
   "pluginApi": 1,
-  "main": "src/worker.ts",
   "contributes": {
     "panels": [
-      { "id": "inbox", "title": "Decision Inbox", "icon": "flag", "entry": "src/panel.tsx", "ui": "components" }
-    ],
-    "customEditors": [
-      { "id": "review", "title": "Decision Review", "extensions": [".orca-decision"], "entry": "src/review.ts", "frame": "isolated" }
+      { "id": "inbox", "title": "Decision Inbox Preview", "icon": "flag", "entry": "src/panel.tsx", "ui": "components" }
     ]
-  },
-  "capabilities": [
-    { "kind": "storage:own" },
-    { "kind": "workspace:read" },
-    { "kind": "workspace:write" }
-  ]
+  }
 }
