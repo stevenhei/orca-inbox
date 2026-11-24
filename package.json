@@ -6,6 +6,7 @@
     "typecheck": "npm exec --yes --package typescript@5.9.3 -- tsc -p tsconfig.json",
     "test:plugin": "orca plugin test . && orca plugin check .",
     "test:dom": "node scripts/dom-smoke.mjs",
-    "test": "npm run typecheck && npm run test:plugin && npm run test:dom"
+    "test": "npm run typecheck && npm run test:plugin && npm run test:dom",
+    "preview:editor": "node scripts/preview-editor.mjs"
   }
 }

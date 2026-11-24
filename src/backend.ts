@@ -112,7 +112,7 @@ function checkDetailBudget(d: Decision) {
     : 'Decision thread exceeds the Inbox detail limit.')
 }
 
-function projectRow({ packageSummary: _summary, ...d }: Decision): Decision {
+function projectRow({ packageSummary: _summary, activity: _activity, nativeLinks: _nativeLinks, ...d }: Decision): Decision {
   const minimalReply = (r: RecordedReply): RecordedReply => ({
     ...r, answer: { kind: 'text', text: '' }, annotations: []
   })
@@ -265,8 +265,8 @@ export class InboxBackend {
           return [[e.attachmentId, snapshot.readerIds]]
         }))
         const createdAt = new Date(this.now()).toISOString()
-        const decisions = input.questions.map((q): Decision => ({
-          ...q, revision: 1, requestId: input.requestId, packageId: input.packageId,
+        const decisions = input.questions.map((q, index): Decision => ({
+          ...q, package: { index, size: input.questions.length }, revision: 1, requestId: input.requestId, packageId: input.packageId,
           ...(input.summary === undefined ? {} : { packageSummary: input.summary }),
           origin: source.origin, projectName: source.projectName, workspaceName: source.workspaceName,
           access: { participantIds: grant.participantIds, attachmentReaderIds }, createdAt,

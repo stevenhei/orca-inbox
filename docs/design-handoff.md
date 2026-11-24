@@ -53,6 +53,16 @@ Run everything: `npm test` (typecheck, `orca plugin test`, `orca plugin check`, 
 
 Proposed by design and **not explicitly confirmed** by the owner: the evidence layout below. Confirm it during review.
 
+## Reader layout (owner readability request)
+
+Both the in-panel reader and the wide review read top to bottom: item context, the active question as the heading, compact badges (source, status, P0/P1, deadline), **Background** and **Recommendation** as sanitized Markdown (paragraphs, bold, http(s) links, lists), blocked work, then the recorded thread. Secondary metadata (**Details**) and the verbatim source text (**Original activity**) are collapsed. Options appear once: in the reply area for Chat decisions, as option chips in the native footer for Bot Items. **Question i / N** with Previous / Next pages within a package (worker `package.index/size/questionIds`, else the loaded package page; unknown totals read `N+`); each question keeps its own draft.
+
+The reply area sits at the bottom. Wide review: a `position: sticky; bottom: 0` dock. Panel: Orca has no sticky/dock component, so the reader is a column `Box` (`height="100%"`) with the question in its own `Box grow scroll="y"` and the reply area in a non-shrinking `Box` after it; this keeps the reply area in view only when the host gives the panel a definite height (desktop-unverified). Native Items get a compact footer ("Answer in Orca's Bot Items: …", the options, read-only note) and no reply controls. Wide-review Markdown is built from text nodes with recorded source offsets, so anchored notes keep exact UTF-16 offsets.
+
+## Dashboard tab
+
+`+` menu / command palette → **Decision Inbox dashboard** (`newFiles` template `templates/dashboard.orca-decision`, content `{"view":"dashboard"}`) opens in the existing `review` editor. Wide: a compact queue (This workspace / All workspaces, search sent to the worker, Include history, source and mail notices, Load more, arrow keys between rows) beside the reader; the first decision opens by default. Narrow (≤800px): one surface at a time with **← Back to queue**. Selecting a decision rebinds the reader in the same tab (no new tabs); the previous draft is saved under its own question first; late answers from an earlier selection or search are dropped.
+
 ## Narrow panel
 
 Top to bottom: title and "N need you" badge with the settings gear; scope (`RadioGroup`, so the selected scope is exposed); search (sent to the worker, debounced); Include history; source and load notices; the list; **Load more** while pages remain. Invalidations refresh the loaded pages in place.

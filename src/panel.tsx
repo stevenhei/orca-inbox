@@ -1,7 +1,7 @@
 import {
   atom, read, set, on, plugin,
-  Badge, Button, Callout, Card, Checkbox, EmptyState, Heading, IconButton, Input, KeyValue, List,
-  ListItem, RadioGroup, Row, Select, Skeleton, Stack, Text, Textarea
+  Badge, Box, Button, Callout, Card, Checkbox, Collapsible, EmptyState, Heading, IconButton, Input, KeyValue, Link, List,
+  ListItem, Markdown, RadioGroup, Row, Select, Skeleton, Stack, Text, Textarea
 } from 'orca'
 import type { PanelContext } from 'orca'
 import type { Answer, Decision, Delivery, RecordedReply, SubmitReply, Workspace } from './contract.ts'
@@ -178,13 +178,62 @@ const detail = atom<Loadable<Decision>>({ state: 'loading' })
 /** The wide tab for the current view only: opening, opened, or why Orca did not open it. */
 const wide = atom<{ nav: number; state: 'opening' | 'opened' | 'failed'; text?: string } | null>(null)
 
+/**
+ * The questions of the open decision's package, for "Question i / N" paging. A bounded,
+ * server-searched page by package ID; `more` means the total is not known.
+ */
+const pkgRows = atom<{ packageId: string; rows: Decision[]; more: boolean } | null>(null)
+
 function openDecision(d: Decision) {
   void flushDraft()
   const mine = ++nav
   set(view, { kind: 'decision', questionId: d.questionId, title: d.title })
   set(openId, d.questionId)
   set(detail, { state: 'loading' }); set(wide, null); resetCompose(d.questionId)
+  if (read(pkgRows)?.packageId !== d.packageId) set(pkgRows, null)
   void loadDetail(mine, d.questionId)
+  void loadPackage(mine, d)
+}
+async function loadPackage(mine: number, d: Decision) {
+  const native = nativeOf(d)
+  const r = await call(req, 'listDecisionPage', {
+    scope: native && !native.workspaceAttributed ? { kind: 'all' } : { kind: 'workspace', workspace: { hostId: d.origin.hostId, workspaceId: d.origin.workspaceId } },
+    query: d.packageId, includeHistory: true, timeZone: clock.zone()
+  })
+  if (mine !== nav || !r.ok) return
+  const rows = r.value.rows.filter((x) => x.packageId === d.packageId)
+  set(pkgRows, { packageId: d.packageId, rows: rows.some((x) => x.questionId === d.questionId) ? rows : [...rows, d], more: !!r.value.nextCursor })
+}
+/** Position of the open question in its package; `total` is null when unknown. */
+function packagePosition(d: Decision): { index: number; total: number | null; known: number; prev?: Decision; next?: Decision } {
+  const declared = d.package
+  const loaded = read(pkgRows)
+  const rows = loaded?.packageId === d.packageId ? [...loaded.rows].sort(packageOrder) : [d]
+  // Native asks declare their sibling IDs, so paging works even when sibling rows were not loaded.
+  if (declared?.questionIds?.length) {
+    const ids = declared.questionIds
+    const at = Math.max(0, ids.indexOf(d.questionId))
+    const byId = (id?: string) => id === undefined ? undefined : rows.find((x) => x.questionId === id) ?? { ...d, questionId: id, title: `Question ${ids.indexOf(id) + 1}` }
+    return { index: declared.index ?? at, total: ids.length, known: ids.length, prev: byId(ids[at - 1]), next: byId(ids[at + 1]) }
+  }
+  const at = Math.max(0, rows.findIndex((x) => x.questionId === d.questionId))
+  const index = declared?.index ?? at
+  const total = declared ? declared.size : loaded?.more ? null : rows.length
+  return { index, total, known: rows.length, prev: rows[at - 1], next: rows[at + 1] }
+}
+const packageOrder = (a: Decision, b: Decision) => {
+  const ia = (a as RichDecision).package?.index, ib = (b as RichDecision).package?.index
+  if (ia !== undefined && ib !== undefined) return ia - ib
+  const na = Number(a.questionId.split(':').at(-1)), nb = Number(b.questionId.split(':').at(-1))
+  if (nativeOf(a) && Number.isInteger(na) && Number.isInteger(nb)) return na - nb
+  return Date.parse(a.createdAt) - Date.parse(b.createdAt) || a.questionId.localeCompare(b.questionId)
+}
+/** Optional reader fields agreed with the BE worker (absent on older workers). */
+type RichDecision = Decision & {
+  context?: string
+  activity?: { label: string; at?: string; text: string }[]
+  package?: { index: number; size: number | null }
+  nativeLinks?: { kind: string; ref: string; label: string; url?: string }[]
 }
 async function loadDetail(mine: number, questionId: string, passive = false) {
   const r = await call(req, 'getDecision', { questionId })
@@ -224,7 +273,10 @@ async function loadDraft(mine: number, d: Decision) {
   if (read(cMeta).loaded && read(cMeta).questionId === d.questionId) return reconcileDraft(d)
   const r = await call(req, 'draft.get', { questionId: d.questionId })
   if (mine !== nav) return
-  if (r.ok) { set(cDraft, r.value.draft ?? emptyDraft()); set(cMeta, { questionId: d.questionId, revision: r.value.revision, loaded: true }); set(cFail, null) }
+  if (r.ok) {
+    knownRevision.set(d.questionId, r.value.revision)
+    set(cDraft, r.value.draft ?? emptyDraft()); set(cMeta, { questionId: d.questionId, revision: r.value.revision, loaded: true }); set(cFail, null)
+  }
   else { set(cMeta, { questionId: d.questionId, revision: null, loaded: true }); set(cFail, r) }
   reconcileDraft(d)
 }
@@ -243,12 +295,31 @@ function reconcileDraft(d: Decision) {
 }
 function editDraft(patch: Partial<Draft>) {
   const d = read(detail)
-  const cur = { ...read(cDraft), ...patch }
+  // Fields set to undefined are removed: worker requests carry JSON only, and an undefined field
+  // makes the host refuse the save.
+  const cur = Object.fromEntries(Object.entries({ ...read(cDraft), ...patch }).filter(([, v]) => v !== undefined)) as unknown as Draft
   if (!cur.kind && d.state === 'ok') cur.kind = d.value.answerState.state === 'answered' ? 'follow-up' : 'initial'
   set(cDraft, cur)
   if (saveTimer) clearTimeout(saveTimer)
   saveTimer = setTimeout(() => { saveTimer = null; void saveDraftNow() }, 400)
 }
+/**
+ * The draft revision this panel last read or wrote, per question: the revision the owner's edits are
+ * based on. A queued save always writes against it (compare-and-set) and never re-reads the latest
+ * revision, so a save that runs after navigation cannot overwrite a newer draft from the wide tab.
+ */
+const knownRevision = new Map<string, number>()
+/** Panel edits that could not be saved because the draft changed elsewhere, kept for recovery. */
+const recovered = atom<Record<string, Draft>>({})
+function keepRecoverable(questionId: string, draft: Draft | null) {
+  if (!draft || draftIsEmpty(draft)) return
+  set(recovered, { ...read(recovered), [questionId]: draft })
+}
+function dropRecoverable(questionId: string) {
+  if (!(questionId in read(recovered))) return
+  const { [questionId]: _gone, ...rest } = read(recovered); set(recovered, rest)
+}
+
 /** Compare-and-set save for the draft's own question; resolves true only when durable. */
 function saveDraftNow(): Promise<boolean> {
   if (saveTimer) { clearTimeout(saveTimer); saveTimer = null }
@@ -258,23 +329,34 @@ function saveDraftNow(): Promise<boolean> {
   const draft = read(cDraft)
   const value: Draft | null = draftIsEmpty(draft) && !draft.replyId ? null : draft
   const p = saving.then(async (): Promise<boolean> => {
-    let revision = read(cMeta).questionId === questionId ? read(cMeta).revision : null
-    if (revision === null) {
-      const g = await call(req, 'draft.get', { questionId })
-      if (!g.ok) { if (read(cMeta).questionId === questionId) set(cFail, g); return false }
-      revision = g.value.revision
+    // Our own earlier save of this question may have advanced the revision; that is still the
+    // lineage the owner saw. No known revision means the draft could not be read: do not write.
+    const revision = knownRevision.get(questionId)
+    if (revision === undefined) {
+      keepRecoverable(questionId, value)
+      if (read(cMeta).questionId === questionId) set(cFail, { ok: false, code: 'unavailable', message: 'The stored draft could not be read, so this edit was not saved.' })
+      return false
     }
     const r = await call(req, 'draft.save', { questionId, draft: value, revision })
     const here = read(cMeta).questionId === questionId
-    if (r.ok) { if (here) { set(cMeta, { ...read(cMeta), revision: r.value.revision }); set(cFail, null) }; return true }
-    if (here && r.code === 'conflict') {
-      const g = await call(req, 'draft.get', { questionId })
-      if (g.ok && read(cMeta).questionId === questionId) {
-        set(cDraft, g.value.draft ?? emptyDraft()); set(cMeta, { ...read(cMeta), revision: g.value.revision })
-        set(cNotice, { tone: 'warning', text: 'This draft was changed in another tab or window, so your latest edit was not saved. The saved draft is shown.' })
-      }
+    if (r.ok) {
+      knownRevision.set(questionId, r.value.revision)
+      if (here) { set(cMeta, { ...read(cMeta), revision: r.value.revision }); set(cFail, null) }
+      return true
+    }
+    if (r.code === 'conflict') {
+      // The newer draft stays as it is; this edit is kept so the owner can choose to use it.
+      keepRecoverable(questionId, value)
+      if (here) {
+        const g = await call(req, 'draft.get', { questionId })
+        if (g.ok && read(cMeta).questionId === questionId) {
+          knownRevision.set(questionId, g.value.revision)
+          set(cDraft, g.value.draft ?? emptyDraft()); set(cMeta, { ...read(cMeta), revision: g.value.revision })
+        }
+      } else knownRevision.delete(questionId) // re-read when the question is opened again
       return false
     }
+    keepRecoverable(questionId, value)
     if (here) set(cFail, r)
     return false
   })
@@ -342,9 +424,17 @@ const REASON: Record<Extract<Delivery, { state: 'undelivered' }>['reason'], stri
   'delivery-failed': 'Orca could not hand it to that chat.'
 }
 const when = (iso: string) => formatInstant(iso, clock.zone())
+/**
+ * Saved, never sent: the worker reports no mail sender on this host and offers no retry, so a
+ * `delivery-failed` reply was never handed to the chat. Real delivery failures keep their wording.
+ */
+const mailUnavailable = () => read(rows)?.mail?.state === 'unavailable'
+const awaitingDelivery = (r: RecordedReply, d: Decision) =>
+  r.delivery.state === 'undelivered' && r.delivery.reason === 'delivery-failed' && mailUnavailable() && !actionsOf(d).includes('retry')
 function deliveryText(r: RecordedReply, d: Decision): string {
   const state = replyState(r, d)
   if (state === 'agent-received' && r.delivery.state === 'agent-received') return `Agent received · receipt ${r.delivery.receipt.receiptId} · ${when(r.delivery.receipt.receivedAt)}.`
+  if (awaitingDelivery(r, d)) return 'Saved in Decision Inbox and awaiting delivery. Orca mail from this plugin is unavailable on this host, so it has not been sent to the original chat yet.'
   if (r.delivery.state === 'undelivered') return `Saved in Decision Inbox, but not delivered to the original chat. ${REASON[r.delivery.reason]}${actionsOf(d).includes('retry') ? ' Retry it from the wide review.' : ' Retry is not available here; paste the reply into that chat yourself if it is needed now.'}`
   const t = transportOf(r.delivery)
   return t ? `Mail submitted to the original chat at ${when(t.acceptedAt)} (message ${t.messageId}); waiting for that chat to acknowledge it.`
@@ -420,7 +510,10 @@ function DecisionRow(props: { d: Decision; all: readonly Decision[]; at: number;
   // The canonical state stays the initial answer's; a failed follow-up gets its own badge.
   const failedFollowUps = native ? 0 : undeliveredReplies(d).filter((r) => r.kind === 'follow-up').length
   // Without a supported retry, an undelivered reply is a saved answer waiting for mail: say so.
-  const saved = !actionsOf(d).includes('retry')
+  // Saved but never sent (no mail sender) reads differently from a delivery that actually failed.
+  const initial = d.answerState.state === 'answered' ? d.answerState.initial : null
+  const initialAwaiting = !native && !!initial && awaitingDelivery(initial, d)
+  const followAwaiting = !native && undeliveredReplies(d).some((r) => r.kind === 'follow-up' && awaitingDelivery(r, d))
   const where = native && !native.workspaceAttributed
     ? 'No workspace attribution'
     : `${d.projectName} · ${d.workspaceName}${d.origin.hostId !== 'local' ? ` · ${d.origin.hostId}` : ''}`
@@ -439,10 +532,10 @@ function DecisionRow(props: { d: Decision; all: readonly Decision[]; at: number;
         {due && <Badge tone={due.overdue ? 'danger' : 'warning'}>{due.text}</Badge>}
         {native
           ? <Badge tone={nativeNeedsYou(native) ? 'accent' : 'neutral'}>{nativeStatusLabel(native.itemStatus)}</Badge>
-          : state !== 'awaiting-answer' && <Badge tone={state === 'undelivered' ? 'danger' : 'accent'}>{state === 'undelivered' && saved ? 'Saved · not delivered' : STATE_LABEL[state]}</Badge>}
+          : state !== 'awaiting-answer' && <Badge tone={state === 'undelivered' ? 'danger' : 'accent'}>{state === 'undelivered' && initialAwaiting ? 'Saved · awaiting delivery' : STATE_LABEL[state]}</Badge>}
         {/* Compact rows carry at most one failed follow-up, so the total is unknown here: name
             the condition, not a count. The review lists every reply. */}
-        {failedFollowUps > 0 && <Badge tone="danger">{saved ? 'Follow-up saved · not delivered' : 'Follow-up delivery failed'}</Badge>}
+        {failedFollowUps > 0 && <Badge tone="danger">{followAwaiting ? 'Follow-up saved · awaiting delivery' : 'Follow-up delivery failed'}</Badge>}
         {/* Only the loaded page is known; say "shown" unless every package member is loaded. */}
         {pkg > 0 && <Badge>{complete ? `Package · ${pkg + 1} questions` : `Package · ${pkg + 1} shown`}</Badge>}
       </Row>
@@ -515,59 +608,57 @@ function ViewHeader(props: { title: string; wideLabel: string }) {
 }
 const NOTICE_TITLE: Record<Notice['tone'], string> = { neutral: 'Recorded', warning: 'Check before you continue', danger: 'Not sent' }
 
-function NativeDetail(props: { d: Decision }) {
-  const { d } = props
-  const n = nativeOf(d)!
-  const item = [n.botName && `bot “${n.botName}”`, n.itemLabel && `item ${n.itemLabel}`].filter(Boolean).join(', ')
+/** Sanitized GitHub-flavoured Markdown (Orca's own renderer): paragraphs, bold, links and lists. */
+function Rich(props: { text: string }) {
+  return <Markdown content={props.text} />
+}
+function Section(props: { title: string; text?: string }) {
+  if (!props.text?.trim()) return null
   return (
-    <Stack gap="sm">
-      <Row gap="xs" wrap>
-        <Badge tone="neutral">Bot Item · read-only</Badge>
-        <Badge tone={nativeNeedsYou(n) ? 'accent' : 'neutral'}>{nativeStatusLabel(n.itemStatus)}</Badge>
-        <Badge tone={d.priority === 'P0' ? 'danger' : 'neutral'}>{d.priority}</Badge>
-      </Row>
-      <Callout tone="neutral" title="Where to answer">
-        {`Answer this in Orca's Bot Items${item ? `: ${item}` : ''}. Decision Inbox shows a read-only copy and cannot answer, resolve or open this item for you.`}
-      </Callout>
-      <KeyValue label="Item" items={[
-        { label: 'Status in Orca', value: nativeStatusLabel(n.itemStatus) },
-        ...(n.observedAt ? [{ label: 'As of', value: when(n.observedAt) }] : []),
-        ...(n.botName ? [{ label: 'Bot', value: n.botName }] : []),
-        ...(n.itemLabel ? [{ label: 'Item', value: n.itemLabel }] : []),
-        { label: 'Workspace', value: n.workspaceAttributed ? `${d.projectName} · ${d.workspaceName}` : 'No workspace attribution' }
-      ]} />
-      {d.background && <Text>{d.background}</Text>}
-      {d.recommendation && <Text muted>{`Recommendation: ${d.recommendation}`}</Text>}
-      {d.options.length > 0 && (
-        <List label="Options offered in Orca">
-          {d.options.map((o) => <ListItem key={o.optionId} title={o.label} description={o.detail} />)}
-        </List>
-      )}
+    <Stack gap="xs">
+      <Text weight="semibold" size="sm">{props.title}</Text>
+      <Rich text={props.text} />
     </Stack>
   )
 }
 
-function ChatDetail(props: { d: Decision }) {
-  const { d } = props
-  const draft = read(cDraft); const meta = read(cMeta); const sending = read(cSending); const notice = read(cNotice); const fail = read(cFail)
-  const answered = d.answerState.state === 'answered'
-  const canSend = actionsOf(d).includes(answered ? 'follow-up' : 'reply')
-  const held = heldInitial(d, draft)
-  const answer = buildAnswer(d, draft)
+/** "Question i / N" with Previous / Next; each question keeps its own draft. */
+function Pager(props: { d: Decision }) {
+  const p = packagePosition(props.d)
+  const total = p.total === null ? `${Math.max(p.known, p.index + 1)}+` : String(p.total)
+  if (p.total === 1 && !p.prev && !p.next) return <Text muted size="xs">Question 1 / 1</Text>
+  return (
+    <Row gap="xs" align="center" wrap>
+      <Text muted size="xs">{`Question ${p.index + 1} / ${total}`}</Text>
+      <Button size="sm" variant="ghost" disabled={!p.prev} onPress={() => p.prev && openDecision(p.prev)}>‹ Previous</Button>
+      <Button size="sm" variant="ghost" disabled={!p.next} onPress={() => p.next && openDecision(p.next)}>Next ›</Button>
+    </Row>
+  )
+}
+
+/** The question and its context: what the owner reads first, then the rest on demand. */
+function QuestionBody(props: { d: Decision }) {
+  const d = props.d as RichDecision
+  const n = nativeOf(d)
   const due = deadlineLabel(d, read(now))
   const thread = replies(d)
+  const state = shownState(d)
+  const awaiting = d.answerState.state === 'answered' && awaitingDelivery(d.answerState.initial, d)
   return (
     <Stack gap="sm">
+      {d.context && d.context !== d.title && <Text muted size="sm">{d.context}</Text>}
+      <Heading level={2}>{d.title}</Heading>
       <Row gap="xs" wrap>
-        <Badge tone="neutral">Chat decision</Badge>
-        <Badge tone={d.priority === 'P0' ? 'danger' : d.priority === 'P1' ? 'warning' : 'neutral'}>{d.priority}</Badge>
+        <Badge tone="neutral">{n ? 'Bot Item · read-only' : 'Chat decision'}</Badge>
+        {n ? <Badge tone={nativeNeedsYou(n) ? 'accent' : 'neutral'}>{nativeStatusLabel(n.itemStatus)}</Badge>
+          : <Badge tone={state === 'undelivered' ? 'danger' : 'accent'}>{state === 'undelivered' && awaiting ? 'Saved · awaiting delivery' : STATE_LABEL[state]}</Badge>}
+        {(d.priority === 'P0' || d.priority === 'P1') && <Badge tone={d.priority === 'P0' ? 'danger' : 'warning'}>{d.priority}</Badge>}
         {due && <Badge tone={due.overdue ? 'danger' : 'warning'}>{due.text}</Badge>}
-        <Badge tone={shownState(d) === 'undelivered' ? 'danger' : 'accent'}>{STATE_LABEL[shownState(d)]}</Badge>
       </Row>
-      <Text muted size="xs">{`${d.projectName} · ${d.workspaceName}${d.origin.hostId !== 'local' ? ` · host ${d.origin.hostId}` : ''}. Replies go only to the original chat.`}</Text>
-      {d.background && <Text>{d.background}</Text>}
-      {d.recommendation && <Text muted>{`Recommendation: ${d.recommendation}`}</Text>}
-      {d.evidence.length > 0 && <Text muted size="xs">{`${d.evidence.length} evidence item${d.evidence.length > 1 ? 's' : ''}: open the wide review to view them.`}</Text>}
+      <Section title="Background" text={d.background} />
+      <Section title="Recommendation" text={d.recommendation} />
+      {d.blockedWork.length > 0 && <Section title="Blocks" text={d.blockedWork.map((x) => `- ${x}`).join('\n')} />}
+      {!n && d.evidence.length > 0 && <Text muted size="xs">{`${d.evidence.length} evidence item${d.evidence.length > 1 ? 's' : ''} (${d.evidence.map((e) => e.label).join(', ')}): open the wide review to view them.`}</Text>}
       {thread.length > 0 && (
         <List label="Recorded answer and follow-ups">
           {thread.map((r, i) => (
@@ -577,13 +668,74 @@ function ChatDetail(props: { d: Decision }) {
           ))}
         </List>
       )}
-      {notice && (
-        <Callout tone={notice.tone} title={NOTICE_TITLE[notice.tone]}>
-          {notice.text}
-        </Callout>
+      <Collapsible title="Details">
+        <KeyValue label="Details" items={[
+          ...(n ? [{ label: 'Status in Orca', value: nativeStatusLabel(n.itemStatus) }, ...(n.observedAt ? [{ label: 'As of', value: when(n.observedAt) }] : []),
+            ...(n.botName ? [{ label: 'Bot', value: n.botName }] : []), ...(n.itemLabel ? [{ label: 'Item', value: n.itemLabel }] : [])] : []),
+          { label: 'Workspace', value: n && !n.workspaceAttributed ? 'No workspace attribution' : `${d.projectName} · ${d.workspaceName}` },
+          ...(d.origin.hostId && d.origin.hostId !== 'local' ? [{ label: 'Host', value: d.origin.hostId }] : []),
+          { label: 'Priority', value: d.priority },
+          ...(d.deadline ? [{ label: 'Deadline', value: when(d.deadline) }] : []),
+          { label: 'Created', value: when(d.createdAt) },
+          { label: 'Question ID', value: d.questionId, code: true }
+        ]} />
+        {(d.nativeLinks ?? []).map((l) => l.url ? <Link key={l.ref} href={l.url}>{l.label}</Link> : <Text key={l.ref} size="xs">{`${l.label} (${l.kind} ${l.ref})`}</Text>)}
+        {d.sourceLinks.map((l) => <Link key={l.url} href={l.url}>{l.label}</Link>)}
+      </Collapsible>
+      {(d.activity ?? []).length > 0 && (
+        <Collapsible title="Original activity" description="As recorded at the source, unchanged">
+          {d.activity!.map((a, i) => (
+            <Stack key={`${i}`} gap="xs">
+              <Text muted size="xs">{a.at ? `${a.label} · ${when(a.at)}` : a.label}</Text>
+              <Rich text={a.text} />
+            </Stack>
+          ))}
+        </Collapsible>
       )}
+    </Stack>
+  )
+}
+
+/** Native Items are answered in Orca: a compact footer with the options, and no reply controls. */
+function NativeFooter(props: { d: Decision }) {
+  const n = nativeOf(props.d)!
+  const item = [n.botName && `bot “${n.botName}”`, n.itemLabel && `item ${n.itemLabel}`].filter(Boolean).join(', ')
+  return (
+    <Stack gap="xs">
+      <Text weight="semibold" size="sm">{`Answer in Orca's Bot Items${item ? `: ${item}` : ''}`}</Text>
+      {props.d.options.length > 0 && (
+        <Row gap="xs" wrap>
+          {props.d.options.map((o) => <Badge key={o.optionId} tone="neutral">{o.detail ? `${o.label} — ${o.detail}` : o.label}</Badge>)}
+        </Row>
+      )}
+      <Text muted size="xs">Read-only copy: Decision Inbox cannot answer, resolve or open this Item for you.</Text>
+    </Stack>
+  )
+}
+
+/** The reply area for a Chat decision: notices, options and the composer, always at the bottom. */
+function ChatFooter(props: { d: Decision }) {
+  const { d } = props
+  const draft = read(cDraft); const meta = read(cMeta); const sending = read(cSending); const notice = read(cNotice); const fail = read(cFail)
+  const answered = d.answerState.state === 'answered'
+  const canSend = actionsOf(d).includes(answered ? 'follow-up' : 'reply')
+  const held = heldInitial(d, draft)
+  const answer = buildAnswer(d, draft)
+  const mineRecovered = read(recovered)[d.questionId]
+  return (
+    <Stack gap="xs">
+      {notice && <Callout tone={notice.tone} title={NOTICE_TITLE[notice.tone]}>{notice.text}</Callout>}
       {notice?.retry && draft.replyId && <Button size="sm" variant="outline" onPress={send}>{`Retry (same reply ID ${draft.replyId})`}</Button>}
       {fail && <Callout tone="warning" title="Draft not saved">{`${failureText(fail)} It is kept in this panel only.`}</Callout>}
+      {mineRecovered && (
+        <Card title="A panel edit was not saved" description="This draft changed in another tab or window, so your edit from this panel was not saved. The saved draft is shown below.">
+          <Text>{`Your edit: “${[mineRecovered.optionId && `Option: ${d.options.find((o) => o.optionId === mineRecovered.optionId)?.label ?? mineRecovered.optionId}`, mineRecovered.text.trim()].filter(Boolean).join(' — ')}”`}</Text>
+          <Row gap="xs" wrap>
+            <Button size="sm" onPress={() => { dropRecoverable(d.questionId); const { replyId: _r, ...rest } = mineRecovered; set(cDraft, emptyDraft()); editDraft(rest); set(cNotice, null) }}>Use my panel edit</Button>
+            <Button size="sm" variant="ghost" onPress={() => dropRecoverable(d.questionId)}>Discard my panel edit</Button>
+          </Row>
+        </Card>
+      )}
       {!meta.loaded ? <Skeleton shape="text" lines={2} label="Loading your draft" />
         : held ? (
           <Card title="Your unsent answer" description="Another answer was recorded first, so this was not sent. Nothing is sent unless you choose to.">
@@ -600,33 +752,58 @@ function ChatDetail(props: { d: Decision }) {
                 options={d.options.map((o) => ({ value: o.optionId, label: o.label, description: o.detail }))}
                 onChange={(v) => editDraft({ optionId: v, kind: 'initial' })} />
             )}
-            <Textarea label={answered ? 'Follow-up' : 'Reply text'} rows={4} value={draft.text} disabled={sending}
-              placeholder={answered ? 'Follow-up to the agent (Ctrl+Enter to send)' : draft.optionId ? 'Optional detail with your option' : 'Free-text answer'}
+            <Textarea label={answered ? 'Follow-up' : 'Reply text'} rows={3} value={draft.text} disabled={sending}
+              placeholder={answered ? 'Follow-up to the agent (Ctrl+Enter to send)' : draft.optionId ? 'Optional detail with your option (Ctrl+Enter to submit)' : 'Free-text answer (Ctrl+Enter to submit)'}
               onChange={(v) => editDraft({ text: v })} onSubmit={() => { void send() }} />
             {draft.annotations.length > 0 && <Text muted size="xs">{`${draft.annotations.length} note${draft.annotations.length > 1 ? 's' : ''} from the wide review will be sent with this reply.`}</Text>}
-            <Button disabled={sending || !answer} onPress={send}>{sending ? 'Sending…' : answered ? 'Send follow-up' : 'Submit reply'}</Button>
+            <Row gap="xs" align="center" justify="between">
+              <Text muted size="xs">Replies go only to the original chat.</Text>
+              <Button disabled={sending || !answer} onPress={send}>{sending ? 'Sending…' : answered ? 'Send follow-up' : 'Submit reply'}</Button>
+            </Row>
           </Stack>
         ) : <Text muted>Replying here is not available for this decision right now.</Text>}
     </Stack>
   )
 }
 
+/**
+ * Reader layout: header (Back, wide tab, question pager), the question in its own scroll area, and
+ * the reply area below it. Orca has no sticky or docked component; the question area scrolls
+ * inside a column that fills the panel, so the reply area stays below it in view whenever the host
+ * gives the panel a definite height.
+ */
 function DecisionView(props: { title: string }) {
   const r = read(detail)
   const d = r.state === 'ok' ? r.value : null
   return (
-    <Stack gap="sm">
-      <ViewHeader title={d?.title ?? props.title} wideLabel="Open wide review" />
-      <WideNotice what="the decision" />
-      {r.state === 'loading' && <Skeleton shape="block" lines={4} label="Loading decision" />}
-      {r.state === 'fail' && (
-        <Callout tone="danger" title={r.f.code === 'not-found' ? 'Decision not found' : r.f.code === 'forbidden' ? 'No access to this decision' : 'Could not read this decision'}>
-          {r.f.code === 'not-found' ? 'It may have been withdrawn, or you may not have access.' : failureText(r.f)}
-        </Callout>
+    <Box direction="column" height="100%" gap="sm">
+      <Box shrink={false} gap="xs">
+        <Row justify="between" align="center">
+          <Button size="sm" variant="ghost" onPress={back}>← Back to list</Button>
+          <Button size="sm" variant="outline" icon="open-external" disabled={read(wide)?.state === 'opening'} onPress={openWide}>Open wide review</Button>
+        </Row>
+        {d && <Pager d={d} />}
+        <WideNotice what="the decision" />
+      </Box>
+      <Box grow scroll="y" minHeight={0} gap="sm">
+        {r.state === 'loading' && <Stack gap="sm"><Heading level={2}>{props.title}</Heading><Skeleton shape="block" lines={4} label="Loading decision" /></Stack>}
+        {r.state === 'fail' && (
+          <Stack gap="sm">
+            <Heading level={2}>{props.title}</Heading>
+            <Callout tone="danger" title={r.f.code === 'not-found' ? 'Decision not found' : r.f.code === 'forbidden' ? 'No access to this decision' : 'Could not read this decision'}>
+              {r.f.code === 'not-found' ? 'It may have been withdrawn, or you may not have access.' : failureText(r.f)}
+            </Callout>
+            {r.f.code === 'unavailable' && <Button size="sm" variant="outline" onPress={() => { const v = read(view); if (v.kind === 'decision') { set(detail, { state: 'loading' }); void loadDetail(nav, v.questionId) } }}>Try again</Button>}
+          </Stack>
+        )}
+        {d && <QuestionBody d={d} />}
+      </Box>
+      {d && (
+        <Box shrink={false} border padding="sm" radius="md" background="card">
+          {nativeOf(d) ? <NativeFooter d={d} /> : <ChatFooter d={d} />}
+        </Box>
       )}
-      {r.state === 'fail' && r.f.code === 'unavailable' && <Button size="sm" variant="outline" onPress={() => { const v = read(view); if (v.kind === 'decision') { set(detail, { state: 'loading' }); void loadDetail(nav, v.questionId) } }}>Try again</Button>}
-      {d && (nativeOf(d) ? <NativeDetail d={d} /> : <ChatDetail d={d} />)}
-    </Stack>
+    </Box>
   )
 }
 

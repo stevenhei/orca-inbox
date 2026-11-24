@@ -22,7 +22,7 @@ const LINKEDOM = '0.18.5'
 const TYPESCRIPT = '5.9.3'
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.join(here, '..')
-const SCENARIOS = ['review', 'quiet', 'ime', 'restart', 'ambiguous', 'inflight', 'durable', 'draftcas', 'winner', 'noreceipt', 'bind', 'followup', 'receipt', 'package', 'narrow', 'errors', 'offline', 'settings', 'settings2', 'native', 'mail', 'noactions', 'race', 'racebtn', 'localonly']
+const SCENARIOS = ['review', 'quiet', 'ime', 'restart', 'ambiguous', 'inflight', 'durable', 'draftcas', 'winner', 'noreceipt', 'bind', 'followup', 'receipt', 'package', 'narrow', 'errors', 'offline', 'settings', 'settings2', 'native', 'mail', 'noactions', 'race', 'racebtn', 'localonly', 'reader', 'dashboard', 'dashnarrow', 'dashfocus']
 const scenario = process.argv[2]
 
 if (!scenario) {
@@ -87,7 +87,7 @@ const select = (r) => { selection = { rangeCount: 1, isCollapsed: false, getRang
 Object.assign(globalThis, {
   document, window,
   // The narrow scenario runs at the ≤800px layout (no sidebar; notes in a dialog).
-  matchMedia: () => ({ matches: scenario === 'narrow', addEventListener() {} }),
+  matchMedia: () => ({ matches: scenario === 'narrow' || scenario === 'dashnarrow', addEventListener() {} }),
   getSelection: () => selection,
   CSS: { escape: (s) => String(s).replace(/["\\]/g, '\\$&') },
   Range: RANGE
@@ -138,6 +138,7 @@ const base = {
   },
   getSnapshot: () => okR({ mimeType: 'image/png', base64: PNG }),
   'review.open': () => okR(null),
+  'workspace.resolve': ({ workspaceId }) => workspaceId === 'studio-local' ? okR({ hostId: 'local', workspaceId: 'studio' }) : errR('not-found', 'Unknown workspace.'),
   submitReply: (input) => {
     const d = db.get(input.questionId)
     const rec = { ...clone(input), acceptedAt: '2030-06-14T12:03:00Z', delivery: { state: 'submitted' } }
@@ -163,7 +164,7 @@ const files = {
   package: '{"questionId":"room-route"}', errors: '{"questionId":"nope"}', offline: '{"questionId":"image-review"}',
   settings: '{"view":"settings"}', settings2: '{"view":"settings"}', quiet: '{"questionId":"image-review"}', ime: '{"questionId":"schedule"}',
   native: '{"questionId":"native-x"}', mail: '{"questionId":"layout"}', noactions: '{"questionId":"schedule"}',
-  race: '{"questionId":"schedule"}', racebtn: '{"questionId":"schedule"}', localonly: '{"questionId":"schedule"}',
+  reader: '{"questionId":"pkg-a-1"}', dashboard: '{"view":"dashboard"}', dashnarrow: '{"view":"dashboard"}', dashfocus: '{"view":"dashboard"}', race: '{"questionId":"schedule"}', racebtn: '{"questionId":"schedule"}', localonly: '{"questionId":"schedule"}',
   ambiguous: '{"questionId":"schedule"}', inflight: '{"questionId":"schedule"}', noreceipt: '{"questionId":"schedule"}', narrow: '{"questionId":"image-review"}'
 }
 const opened = []
@@ -171,6 +172,8 @@ globalThis.orca = {
   document: { session: async () => ({ value: files[scenario], onReplace(fn) { replace = fn }, change() {} }) },
   shell: { openExternal: async (url) => { opened.push(url); return { opened: true } } },
   plugin: worker,
+  // The focused workspace, as the editor frame's host API reports it.
+  host: { call: async (method) => { calls.push({ name: `host:${method}` }); return method === 'workspace.readContext' ? { workspaceId: 'studio-local', branch: 'main', displayName: 'studio', terminals: [] } : null } },
   on: () => ({ dispose() {} })
 }
 
@@ -308,6 +311,22 @@ if (scenario === 'review') {
 } else if (scenario === 'noactions') {
   // The worker reports no supported owner action (for example no owner principal on this host).
   db.get('schedule').actions = []
+} else if (scenario === 'dashboard') {
+  globalThis.__holdImage = false
+  const get = base.getDecision
+  handlers.getDecision = (input) => input.questionId === 'image-review' && globalThis.__holdImage
+    ? new Promise((r) => { globalThis.__releaseImage = () => r(get(input)) }) : get(input)
+} else if (scenario === 'dashfocus') {
+  handlers['workspace.resolve'] = () => errR('unavailable', 'Two workspaces on different hosts use this ID.')
+  handlers.getDecision = ({ questionId }) => questionId === 'stage' ? errR('unavailable', 'Bot reads are unavailable for this bot.')
+    : questionId === 'layout' ? errR('forbidden', 'Not a participant.') : questionId === 'schedule' ? errR('not-found', 'Missing.') : base.getDecision({ questionId })
+} else if (scenario === 'reader') {
+  // Two questions in one package, Markdown background and a long Chinese recommendation (synthetic).
+  const md = '確認發佈流程。**請決定是否發佈第 42 版。** 參考 [執行紀錄](https://example.invalid/run/42)。另見 https://example.invalid/notes/7。\n\n- 測試全部通過\n- 文件已更新'
+  const long = Array.from({ length: 30 }, (_, i) => `第 ${i + 1} 段：很長的中文建議。`).join('\n\n')
+  for (const [i, title] of [[1, '第一題：是否發佈？'], [2, '第二題：何時發佈？']]) {
+    db.set(`pkg-a-${i}`, { ...clone(db.get('schedule')), questionId: `pkg-a-${i}`, packageId: 'pkg-a', title, background: md, recommendation: long, createdAt: `2030-06-1${i}T09:00:00Z` })
+  }
 } else if (scenario === 'localonly') {
   // This host: the worker saves the answer plugin-locally, Orca mail has no supported plugin sender,
   // so the recorded reply is undelivered and retry is not offered.
@@ -393,7 +412,7 @@ if (scenario === 'review') {
   assert.equal(byLabel('Note for Side square').value, 'Check the fold twice'); ok('typing survives a worker-driven re-render')
   await setValue(byLabel('Note for Side square'), 'Check the fold')
   // Select "Paper models" in Background: UTF-16 offsets [0, 12) at revision 1.
-  const bg = document.querySelector('[data-field="background"]').firstChild
+  const bg = document.querySelector('[data-field="background"] p').firstChild
   select(range(bg, 0, 12))
   await key({ altKey: true, key: 'n' })
   assert.match(document.querySelector('.side').textContent, /Notes \(2\)/); ok('Alt+N adds a note from the selection')
@@ -559,7 +578,7 @@ if (scenario === 'review') {
   await click(find('button', 'Copy decision link'))
   assert.deepEqual(copied, ['https://example.invalid/inbox/room-route']); ok('decision link copied')
   // L7: a triple-click ends at the start of the next element; the quote is clipped to the field.
-  const bgNode = document.querySelector('[data-field="background"]').firstChild
+  const bgNode = document.querySelector('[data-field="background"] p').firstChild
   const full = fx.decisions.find((x) => x.questionId === 'room-route').background
   select(range(bgNode, 0, 0, { endAfter: true, endContainer: document.querySelectorAll('h2')[2] }))
   // L6: macOS Option+N reports a dead key; the physical key code still matches.
@@ -583,7 +602,7 @@ if (scenario === 'review') {
   await click(find('button', 'Done'))
   assert.ok(!dlg.hasAttribute('open'))
   // Add a note from a selection at narrow width.
-  const bg = document.querySelector('[data-field="background"]').firstChild
+  const bg = document.querySelector('[data-field="background"] p').firstChild
   select(range(bg, 13, 16))
   await key({ altKey: true, key: 'n', code: 'KeyN' })
   assert.ok(dlg.hasAttribute('open')); await setValue(byLabel('New note'), 'Check angles', 'input')
@@ -611,15 +630,18 @@ if (scenario === 'review') {
 } else if (scenario === 'native') {
   assert.equal(document.querySelector('h1').textContent, 'Ship the lantern build?'); ok('native item title')
   assert.match(text(), /Bot Item · read-only/); assert.match(text(), /No workspace attribution/); ok('source and missing workspace attribution are labelled')
-  assert.match(text(), /Answer this in Orca's Bot Items: bot “Release bot”, item #12\. The Inbox shows a read-only copy and cannot answer, resolve or open this item for you\./); ok('says where to answer, without a deep link or a write')
-  assert.match(text(), /Status in OrcaNeeds you · as of 14 Jun 2030, 11:30 UTC/); ok('status as Orca reported it, with time')
-  assert.deepEqual(all('li').map((e) => e.textContent), ['Ship it', 'HoldWait for the next build']); ok('options listed as text')
+  const dock = document.querySelector('.dock')
+  assert.match(dock.textContent, /^Answer in Orca's Bot Items: bot “Release bot”, item #12/); assert.match(dock.textContent, /Read-only copy: Decision Inbox cannot answer, resolve or open this Item for you\./); ok('docked footer says where to answer, without a deep link or a write')
+  assert.match(text(), /Status in OrcaNeeds you · as of 14 Jun 2030, 11:30 UTC/); ok('status as Orca reported it, with time (in Details)')
+  assert.deepEqual(all('.dock li').map((e) => e.textContent), ['Ship it', 'Hold — Wait for the next build']); ok('options listed once, in the footer')
+  assert.equal(text().split('Ship it').length - 1, 1); ok('no duplicated options')
+  assert.ok(document.querySelector('h1').compareDocumentPosition(dock) & 4); ok('question before the footer')
   assert.equal(all('input, textarea, select').length, 0); assert.equal(find('button', 'Submit reply'), undefined); ok('no reply, note or option controls')
   assert.equal(document.querySelector('.strip'), null); assert.equal(document.querySelector('aside'), null); ok('no plugin delivery strip or notes sidebar')
   assert.equal(all('a').length, 1); assert.equal(all('a')[0].textContent.trim(), 'Synthetic project record ↗'); ok('no fabricated link to the item')
   await key({ ctrlKey: true, key: 'Enter' })
   assert.equal(document.querySelector('[data-field]'), null); ok('no selectable note fields')
-  assert.deepEqual(calls.map((c) => c.name), ['getDecision']); ok('only the read: no draft, package, snapshot or reply requests')
+  assert.deepEqual(calls.map((c) => c.name), ['getDecision', 'listDecisionPage']); ok('only reads (detail and its package page): no draft, snapshot or reply requests')
 } else if (scenario === 'mail') {
   assert.match(text(), /Receipt layout-receipt/); ok('initial answer: origin acknowledgement shown')
   assert.match(text(), /Follow-up 1[^]*● Submitted \/ awaiting confirmationMail submitted to the original chat at 14 Jun 2030, 12:05 UTC \(message mail-77\); waiting for that chat to acknowledge it\./); ok('follow-up: mail submitted is not shown as received')
@@ -631,6 +653,118 @@ if (scenario === 'review') {
   assert.match(text(), /Replying here is not available for this decision right now\./); ok('plain explanation instead')
   await key({ ctrlKey: true, key: 'Enter' })
   assert.equal(callsOf('submitReply').length, 0); ok('Ctrl+Enter sends nothing')
+} else if (scenario === 'dashboard') {
+  // The newFiles template is the reference this editor opens.
+  const tpl = readFileSync(path.join(root, 'templates/dashboard.orca-decision'), 'utf8')
+  assert.equal(tpl.trim(), files.dashboard); ok('the newFiles template is the dashboard reference')
+  const manifest = JSON.parse(readFileSync(path.join(root, 'orca-plugin.json'), 'utf8'))
+  const nf = manifest.contributes.newFiles.find((x) => x.id === 'dashboard')
+  assert.equal(nf.template, 'templates/dashboard.orca-decision'); assert.ok(manifest.contributes.customEditors.find((x) => x.id === 'review').extensions.includes(nf.extension)); ok('newFiles opens in the existing review editor')
+  const rows = () => all('.qrow').map((b) => b.querySelector('.qt').textContent)
+  assert.deepEqual(rows(), ['Compare seven paper model views', 'Pick a rehearsal slot']); ok('This workspace queue, most urgent first')
+  assert.deepEqual(last('listDecisionPage').scope, { kind: 'workspace', workspace: { hostId: 'local', workspaceId: 'studio' } }); ok('scoped by host + workspace')
+  assert.equal(document.querySelector('.rpane h1').textContent, 'Compare seven paper model views'); ok('wide: first decision opens beside the queue')
+  await click(find('.qrow .qt', 'Pick a rehearsal slot').parentElement)
+  assert.equal(document.querySelector('.rpane h1').textContent, 'Pick a rehearsal slot'); assert.equal(document.querySelector('.qrow[aria-current="true"] .qt').textContent, 'Pick a rehearsal slot'); ok('selecting a row opens it in this tab')
+  await setValue(byLabel('Reply text'), 'Tuesday morning', 'input')
+  await click(find('.qrow .qt', 'Compare seven paper model views').parentElement)
+  const iSave = calls.findIndex((c) => c.name === 'draft.save' && c.input.questionId === 'schedule' && c.input.draft?.text === 'Tuesday morning')
+  assert.ok(iSave >= 0); ok('the previous draft is saved under its own question when switching')
+  await click(find('.qrow .qt', 'Pick a rehearsal slot').parentElement)
+  assert.equal(byLabel('Reply text').value, 'Tuesday morning'); ok('and restored when returning')
+  assert.equal(callsOf('review.open').length, 0); ok('no extra tabs opened')
+  // Race: a slow decision must not replace the one selected after it.
+  globalThis.__holdImage = true
+  const slow = click(find('.qrow .qt', 'Compare seven paper model views').parentElement)
+  await settle()
+  await click(find('.qrow .qt', 'Pick a rehearsal slot').parentElement)
+  globalThis.__releaseImage(); await slow; await settle()
+  assert.equal(document.querySelector('.rpane h1').textContent, 'Pick a rehearsal slot'); ok('a late answer never replaces the selected decision')
+  // Search keeps focus while the list repaints; scope changes.
+  const search = byLabel('Search decisions'); search.focus()
+  await setValue(search, 'layout', 'input'); await sleep(300); await settle()
+  assert.equal(last('listDecisionPage').query, 'layout'); assert.equal(document.activeElement, search); ok('search runs on the worker and the field keeps focus')
+  // A slow, older search answer never replaces the newer one.
+  let releaseOld = () => {}
+  handlers.listDecisionPage = (i) => i.query === 'zzz' ? new Promise((r) => { releaseOld = () => r(okR({ rows: [] })) }) : base.listDecisionPage(i)
+  await setValue(search, 'zzz', 'input'); await sleep(300); await settle()
+  await setValue(search, '', 'input'); await sleep(300); await settle()
+  releaseOld(); await settle()
+  assert.deepEqual(rows(), ['Compare seven paper model views', 'Pick a rehearsal slot']); ok('a stale search answer is dropped')
+  delete handlers.listDecisionPage
+  const allRadio = all('input[name="dash-scope"]').find((r) => r.getAttribute('value') === 'all')
+  allRadio.dispatchEvent(new window.Event('change', { bubbles: true })); await settle()
+  assert.deepEqual(last('listDecisionPage').scope, { kind: 'all' }); assert.ok(rows().includes('Approve the first lantern trial')); ok('All workspaces scope')
+  // Keyboard: arrow keys move between rows.
+  const first = all('.qrow')[0]; first.focus()
+  const ev = new window.Event('keydown', { bubbles: true }); Object.assign(ev, { key: 'ArrowDown' }); first.dispatchEvent(ev)
+  assert.equal(document.activeElement, all('.qrow')[1]); ok('ArrowDown moves to the next row')
+  // Source availability and mail, once each.
+  handlers.listDecisionPage = (i) => ({ ...base.listDecisionPage(i), value: { ...base.listDecisionPage(i).value,
+    sources: [{ source: 'plugin', state: 'available' }, { source: 'native-item', state: 'unavailable', message: 'No authorized Bot Items reader.' }],
+    mail: { state: 'unavailable', message: 'Answers are saved in Decision Inbox. Orca mail from this plugin is unavailable on this host.' } } })
+  await changed()
+  assert.match(text(), /Bot Items are unavailable\. No authorized Bot Items reader\. Chat decisions below are not affected\./); ok('source availability shown')
+  assert.equal(text().split('Answers are saved in Decision Inbox').length - 1, 1); ok('mail notice once')
+  assert.match(document.head.textContent, /@media\(max-width:800px\)\{\.dash-grid\{grid-template-columns:minmax\(0,1fr\)\}/); ok('narrow layout rule present')
+} else if (scenario === 'dashnarrow') {
+  assert.equal(document.querySelector('.dash-grid').getAttribute('data-mode'), 'queue'); assert.equal(document.querySelector('.rpane h1'), null); ok('narrow: queue first, nothing auto-opened')
+  await click(find('.qrow .qt', 'Pick a rehearsal slot').parentElement)
+  assert.equal(document.querySelector('.dash-grid').getAttribute('data-mode'), 'reader'); assert.equal(document.querySelector('.rpane h1').textContent, 'Pick a rehearsal slot'); ok('narrow: one surface, the reader')
+  await setValue(byLabel('Reply text'), 'Thursday', 'input')
+  await click(find('button', '← Back to queue'))
+  assert.equal(document.querySelector('.dash-grid').getAttribute('data-mode'), 'queue'); ok('Back returns to the queue')
+  await sleep(10)
+  assert.ok(calls.some((c) => c.name === 'draft.save' && c.input.draft?.text === 'Thursday')); ok('draft saved on Back')
+  await click(find('.qrow .qt', 'Pick a rehearsal slot').parentElement)
+  assert.equal(byLabel('Reply text').value, 'Thursday'); ok('draft still there when reopened')
+} else if (scenario === 'dashfocus') {
+  assert.match(text(), /Could not identify this workspace\. The Decision Inbox is unavailable\. Two workspaces on different hosts use this ID\./); ok('ambiguous focus is explained')
+  assert.equal(callsOf('listDecisionPage').length, 0); assert.ok(!/Nothing needs you/.test(text())); ok('no list is read and no "nothing needs you" claim')
+  await click(find('button', 'Show all workspaces'))
+  assert.equal(callsOf('listDecisionPage').filter((c) => !c.query).every((c) => c.scope.kind === 'all'), true)
+  assert.ok(callsOf('listDecisionPage').some((c) => !c.query && c.scope.kind === 'all')); ok('All workspaces only on the explicit action')
+  await click(find('.qrow .qt', 'Approve the first lantern trial').parentElement)
+  assert.match(document.querySelector('.rpane').textContent, /Could not load decision "stage"\. The Decision Inbox is unavailable\. Bot reads are unavailable for this bot\./); assert.ok(find('button', 'Try again')); ok('read failure: says so, with Try again')
+  await click(find('.qrow .qt', 'Choose the catalogue layout').parentElement)
+  assert.match(document.querySelector('.rpane').textContent, /You do not have access to decision "layout"/); ok('no access is distinct')
+  await click(find('.qrow .qt', 'Pick a rehearsal slot').parentElement)
+  assert.match(document.querySelector('.rpane').textContent, /Decision "schedule" was not found/); ok('missing record is distinct')
+} else if (scenario === 'reader') {
+  assert.equal(document.querySelector('h1').textContent, '第一題：是否發佈？'); ok('active question first')
+  assert.match(document.querySelector('.pager').textContent, /^Question 1 \/ 2/); ok('Question 1 / 2')
+  const bgField = document.querySelector('[data-field="background"]')
+  assert.equal(bgField.querySelector('strong').textContent, '請決定是否發佈第 42 版。'); ok('bold rendered')
+  assert.equal(bgField.querySelector('a').getAttribute('href'), 'https://example.invalid/run/42'); assert.equal(bgField.querySelector('a').textContent, '執行紀錄'); ok('link rendered, http(s) only')
+  assert.deepEqual(all('[data-field="background"] li').map((e) => e.textContent), ['測試全部通過', '文件已更新']); ok('list breaks rendered')
+  assert.ok(!/\*\*|\]\(https/.test(bgField.textContent)); ok('no literal Markdown')
+  const bare = [...bgField.querySelectorAll('a')].find((a) => a.textContent.startsWith('https://example.invalid/notes'))
+  assert.equal(bare.getAttribute('href'), 'https://example.invalid/notes/7'); assert.ok(bgField.textContent.includes('notes/7。')); ok('bare URL linked; trailing 。 stays text')
+  const toggle = document.querySelector('[data-k="dock-toggle"]')
+  assert.equal(toggle.getAttribute('aria-expanded'), 'false'); assert.equal(byLabel('Reply text').getAttribute('rows'), '2'); ok('dock starts compact')
+  await click(toggle)
+  assert.equal(document.querySelector('[data-k="dock-toggle"]').getAttribute('aria-expanded'), 'true'); assert.ok(document.querySelector('.dock').classList.contains('open')); assert.equal(byLabel('Reply text').getAttribute('rows'), '6'); ok('Expand reply opens the full composer')
+  await click(document.querySelector('[data-k="dock-toggle"]'))
+  assert.equal(byLabel('Reply text').getAttribute('rows'), '2'); ok('and collapses again')
+  // A selection inside bold maps to the exact raw offsets.
+  const raw = db.get('pkg-a-1').background
+  const node = document.querySelector('[data-field="background"] strong').firstChild // re-read: the toggles re-rendered
+  select(range(node, 0, 4))
+  await key({ altKey: true, key: 'n', code: 'KeyN' })
+  await setValue(byLabel('Note text 1'), 'check', 'input'); await sleep(450)
+  const n = last('draft.save').draft.annotations[0]
+  assert.equal(n.quote, raw.slice(n.start, n.end)); assert.equal(n.quote, '請決定是'); assert.equal(n.start, raw.indexOf('請決定')); ok('note anchors map through formatting to exact UTF-16 offsets')
+  const dock = document.querySelector('.dock')
+  assert.ok(dock && dock.querySelector('[aria-label="Reply text"]') && dock.querySelector('input[type=radio]')); ok('options and composer are in the docked reply area')
+  assert.ok(document.querySelector('[data-field="recommendation"]').compareDocumentPosition(dock) & 4); ok('the dock follows the (long) question')
+  assert.match(document.head.textContent, /\.dock\{position:sticky;bottom:0/); ok('the dock is sticky at the bottom of the reader')
+  await setValue(byLabel('Reply text'), '下週二發佈', 'input')
+  await click(find('button', 'Next ›')); await settle()
+  assert.equal(document.querySelector('h1').textContent, '第二題：何時發佈？'); assert.match(document.querySelector('.pager').textContent, /^Question 2 \/ 2/); ok('Next pages to question 2')
+  assert.equal(byLabel('Reply text').value, ''); ok('question 2 has its own draft')
+  await click(find('button', '‹ Previous')); await settle()
+  assert.equal(byLabel('Reply text').value, '下週二發佈'); ok('paging back restores question 1 draft')
+  assert.equal(drafts.get('pkg-a-1').draft.text, '下週二發佈'); ok('draft persisted under its own question ID')
 } else if (scenario === 'localonly') {
   await setValue(byLabel('Reply text'), 'Tuesday', 'input')
   await click(find('button', 'Submit reply'))

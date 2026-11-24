@@ -1,13 +1,14 @@
-import type { Annotation, Answer, Decision, Delivery, Evidence, RecordedReply, SubmitReply } from './contract.ts'
-import type { EffectivePolicy, InboxSettings } from './backend-protocol.ts'
-import { STATE_LABEL, actionsOf, deadlineLabel, nativeOf, nativeStatusLabel, replyState, shownState, type NativeSource, type ShownState } from './model.ts'
+import type { Annotation, Answer, Decision, Delivery, Evidence, RecordedReply, SubmitReply, Workspace } from './contract.ts'
+import type { DecisionPage, EffectivePolicy, InboxSettings } from './backend-protocol.ts'
+import { STATE_LABEL, actionsOf, deadlineLabel, isActionable, nativeOf, nativeStatusLabel, order, replyState, shownState, type NativeSource, type ShownState } from './model.ts'
 import {
   call, clock, draftIsEmpty, emptyDraft, failureText, formatInstant, newReplyId, reconcile, replies,
-  transportOf, type Draft, type Failure, type Requester
+  sourcesOf, transportOf, type Draft, type Failure, type Requester, type SourceStatus
 } from './client.ts'
 
 // Wide review tab: an isolated custom editor on a `.orca-decision` reference file whose content is
-// `{"questionId": "..."}` (a review) or `{"view": "settings"}` (Inbox Settings). Every decision,
+// `{"questionId": "..."}` (a review), `{"view": "dashboard"}` (queue + reader in one tab) or
+// `{"view": "settings"}` (Inbox Settings). Every decision,
 // draft, reply, snapshot and setting comes from the plugin worker; there is no fixture fallback.
 // Plain DOM, themed only through `--orca-*` (only foreground/background are confirmed, so the rest
 // is derived with color-mix). Notes live in a sticky sidebar; below 800px they move to a modal.
@@ -25,8 +26,15 @@ const css = `
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.55 system-ui,sans-serif}
 .layout{max-width:1120px;margin:0 auto;padding:16px 20px 48px;display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:24px;align-items:start}
-@media(max-width:800px){.layout{grid-template-columns:1fr}.side{display:none}}
-@media(min-width:801px){.only-narrow{display:none}}
+/* The reader's own width decides its layout (container queries), so a reader beside the dashboard
+   queue drops the Notes sidebar for the Notes dialog even in a wide window. */
+body{container-type:inline-size}
+/* A contained body no longer paints the page canvas: paint the root too, or short pages show white. */
+html{background:var(--orca-background)}
+.rpane{container-type:inline-size}
+@container (max-width:820px){.layout{grid-template-columns:minmax(0,1fr);padding:12px 14px 32px}.side{display:none}}
+@container (min-width:821px){.only-narrow{display:none}}
+.layout>main.full{grid-column:1/-1}
 .side{position:sticky;top:12px;border:1px solid var(--line);border-radius:8px;padding:10px;max-height:calc(100vh - 24px);overflow:auto}
 h1{font-size:18px;margin:2px 0 4px;text-wrap:balance}h2{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--mute);margin:20px 0 6px}
 .meta{color:var(--mute);display:flex;gap:8px;flex-wrap:wrap;align-items:center}
@@ -62,6 +70,44 @@ dialog .note textarea{margin-top:4px}
 #pop{position:fixed;display:none;z-index:5}
 dialog{background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:10px;padding:14px;width:min(440px,92vw)}
 dialog::backdrop{background:color-mix(in srgb,#000 45%,transparent)}
+.rich p{margin:0 0 8px}.rich ul,.rich ol{margin:0 0 8px;padding-left:22px}.rich li{margin:2px 0}.rich a{color:var(--acc)}
+.rich code{font:12px ui-monospace,monospace;background:var(--soft);padding:0 3px;border-radius:3px}
+/* The reply area stays in view at the bottom of the reader while the question scrolls above it. */
+.dock{position:sticky;bottom:0;z-index:3;background:var(--bg);border-top:1px solid var(--line);padding:6px 0 8px;margin-top:16px;max-height:70vh;overflow:auto;box-shadow:0 -6px 12px -10px color-mix(in srgb,var(--fg) 40%,transparent)}
+.dock h2{margin-top:4px}
+.ctx{color:var(--mute);margin:0 0 2px}
+.dash{max-width:none;margin:0;padding:0}
+.dash-grid{display:grid;grid-template-columns:minmax(220px,300px) minmax(0,1fr);gap:16px;padding:12px 16px;align-items:start}
+.qpane{position:sticky;top:0;max-height:100vh;overflow:auto;padding-right:4px}.qpane h1{font-size:16px}
+.qpane input[type=search]{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;margin:6px 0}
+.qitems{display:flex;flex-direction:column;gap:4px}
+.qrow{display:flex;flex-direction:column;align-items:flex-start;gap:2px;width:100%;text-align:left;padding:6px 8px}
+.qrow .qt{font-weight:600;overflow-wrap:anywhere}.qrow[aria-current=true]{border-color:var(--acc);background:color-mix(in srgb,var(--acc) 14%,transparent)}
+.rpane .layout{max-width:none;padding:0 0 32px}
+.dash-back{margin:8px 0}
+@media(min-width:801px){.dash-back{display:none}}
+@media(max-width:800px){.dash-grid{grid-template-columns:minmax(0,1fr)}.dash-grid[data-mode=reader] .qpane{display:none}.dash-grid[data-mode=queue] .rpane{display:none}.qpane{position:static;max-height:none}}
+/* Compact scope filter: pills, not answer-option cards. */
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:99px;padding:2px;gap:2px;margin:4px 0}
+.seg label{display:inline-flex;align-items:center;gap:4px;padding:2px 10px;border-radius:99px;cursor:pointer;font-size:12px}
+.seg input{position:absolute;opacity:0;width:1px;height:1px}
+.seg label:has(input:checked){background:color-mix(in srgb,var(--acc) 22%,transparent);font-weight:600}
+.seg label:has(input:focus-visible){outline:2px solid var(--ring);outline-offset:1px}
+/* A slim sticky bar keeps the question in view while its text scrolls. */
+.qbar{position:sticky;top:0;z-index:2;background:var(--bg);display:flex;gap:8px;align-items:center;padding:4px 0;border-bottom:1px solid var(--line);font-size:12px}
+.qbar .qbt{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+.qbar .pager{margin:0;flex:none}
+/* Compact dock: options as chips, a short reply box and only the current delivery state; Expand
+   opens the full composer. */
+.dock-head{display:flex;gap:8px;align-items:center;justify-content:space-between;margin-bottom:4px}
+.dock:not(.open) h2,.dock:not(.open) .fu-help,.dock:not(.open) .opt .meta{display:none}
+.dock:not(.open) [role=radiogroup]{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px}
+.dock:not(.open) .opt{display:inline-flex;padding:2px 10px;margin:0;border-radius:99px}
+.dock:not(.open) .step:not([aria-current=step]){display:none}
+.dock:not(.open) .strip{margin:4px 0 0}
+.dock .bar{padding:4px 0}
+.pager{display:flex;gap:6px;align-items:center;color:var(--mute);margin:4px 0}
+details{border-top:1px solid var(--line);padding:6px 0}details>summary{cursor:pointer;color:var(--mute);padding:2px 0}
 .raw{white-space:pre-wrap;border-left:3px solid var(--line);padding:2px 10px;color:var(--mute);margin:6px 0}
 .sr{position:absolute;left:-9999px}
 .reply{border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin:8px 0}
@@ -98,12 +144,81 @@ const field = (tag: 'textarea' | 'input', props: K, value: string) => {
 const req: Requester = (name, input, options) =>
   (orca.plugin.request as unknown as Requester)(name, input, options)
 
+// ---- safe Markdown (paragraphs, line breaks, lists, bold, links, code) -----------------------------
+// Built from text nodes only (never innerHTML). Each text node records the offset of its text in the
+// raw source string, so a selection maps back to exact UTF-16 offsets for anchored notes.
+const rawOffset = new WeakMap<Node, number>()
+const textAt = (s: string, at: number) => { const n = document.createTextNode(s); rawOffset.set(n, at); return n }
+const LIST = /^(\s*)([-*+]|\d+[.)])\s+/
+function inline(parent: HTMLElement, raw: string, start: number, end: number) {
+  const re = /\*\*([^*]+?)\*\*|\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|`([^`\n]+)`|(https?:\/\/[^\s<>()\[\]「」（）]+)/g
+  const part = raw.slice(start, end)
+  let last = 0; let m: RegExpExecArray | null
+  while ((m = re.exec(part))) {
+    if (m.index > last) parent.append(textAt(part.slice(last, m.index), start + last))
+    const at = start + m.index
+    if (m[1] !== undefined) parent.append(el('strong', {}, textAt(m[1], at + 2)))
+    else if (m[2] !== undefined) {
+      const url = m[3]
+      parent.append(el('a', { href: url, onclick: (ev: Event) => { ev.preventDefault(); void openLink(url) } }, textAt(m[2], at + 1)))
+    } else if (m[4] !== undefined) parent.append(el('code', {}, textAt(m[4], at + 1)))
+    else {
+      // A bare URL: trailing punctuation (. , ; : ! ? 。 ， 、) stays text, not part of the link.
+      const url = m[5].replace(/[.,;:!?。，、；：！？]+$/u, '')
+      parent.append(el('a', { href: url, onclick: (ev: Event) => { ev.preventDefault(); void openLink(url) } }, textAt(url, at)))
+      last = m.index + url.length; re.lastIndex = last; continue
+    }
+    last = m.index + m[0].length
+  }
+  if (last < part.length) parent.append(textAt(part.slice(last), start + last))
+}
+function rich(raw: string, attrs: K = {}): HTMLElement {
+  const box = el('div', { class: 'rich', ...attrs })
+  const lines: { text: string; at: number }[] = []
+  let at = 0
+  for (const text of raw.split('\n')) { lines.push({ text, at }); at += text.length + 1 }
+  let para: HTMLElement | null = null
+  let list: HTMLElement | null = null
+  for (const line of lines) {
+    const m = LIST.exec(line.text)
+    if (!line.text.trim()) { para = null; list = null; continue }
+    if (m) {
+      const ordered = /\d/.test(m[2])
+      if (!list || list.tagName !== (ordered ? 'OL' : 'UL')) { list = el(ordered ? 'ol' : 'ul'); box.append(list) }
+      const li = el('li'); inline(li, raw, line.at + m[0].length, line.at + line.text.length); list.append(li)
+      para = null
+    } else {
+      list = null
+      if (!para) { para = el('p'); box.append(para) } else para.append(el('br'))
+      inline(para, raw, line.at, line.at + line.text.length)
+    }
+  }
+  return box
+}
+/** Raw [start, end) of a selection inside a rich field, from its text nodes' recorded offsets. */
+function rawRange(r: Range, field: Element): [number, number] | null {
+  let start = Infinity, end = -Infinity
+  const walk = (n: Node) => {
+    const at = rawOffset.get(n)
+    if (at !== undefined && r.intersectsNode(n)) {
+      const len = (n.textContent ?? '').length
+      const s = n === r.startContainer ? r.startOffset : 0
+      const e = n === r.endContainer ? r.endOffset : len
+      start = Math.min(start, at + s); end = Math.max(end, at + e)
+    }
+    n.childNodes.forEach(walk)
+  }
+  walk(field)
+  return end > start ? [start, end] : null
+}
+
 // ---- reference file ---------------------------------------------------------------------------
-type Ref = { view: 'review'; questionId: string } | { view: 'settings' } | { view: 'invalid' }
+type Ref = { view: 'review'; questionId: string } | { view: 'settings' } | { view: 'dashboard' } | { view: 'invalid' }
 const readRef = (text: string): Ref => {
   try {
     const v = JSON.parse(text)
     if (v?.view === 'settings') return { view: 'settings' }
+    if (v?.view === 'dashboard') return { view: 'dashboard' }
     if (typeof v?.questionId === 'string' && v.questionId) return { view: 'review', questionId: v.questionId }
   } catch { /* fall through */ }
   return { view: 'invalid' }
@@ -121,6 +236,14 @@ document.body.append(root, pop, live, composer)
 const narrow = matchMedia('(max-width: 800px)')
 narrow.addEventListener('change', () => render())
 const say = (m: string) => { live.textContent = m }
+/** Notes use the dialog when the reader is too narrow for its sidebar (window or container). */
+const notesInDialog = () => {
+  if (narrow.matches) return true
+  const side = root.querySelector('aside.side')
+  return !!side && typeof getComputedStyle === 'function' && getComputedStyle(side).display === 'none'
+}
+/** The reply dock starts compact; the owner expands it for the full composer. */
+let dockOpen = false
 
 // ---- background re-renders wait for the owner ---------------------------------------------------
 // render() rebuilds the DOM. Background causes (worker invalidations, the minute clock, snapshot
@@ -163,6 +286,8 @@ let d: Decision | null = null
 let loadFail: Failure | null = null
 let pkg: Decision[] = []
 let pkgFail: Failure | null = null
+/** The package page had more rows: its total is not known. */
+let pkgMore = false
 let draft: Draft = emptyDraft()
 let draftFor: string | null = null
 let draftFail: Failure | null = null
@@ -233,16 +358,18 @@ async function loadReview(questionId: string, keepNotice = false, passive = fals
   }
   if (!passive) render()
   else if (changed) requestRender(true)
-  if (native) return
+  // Native siblings declared by ID need no package read.
+  if (native && d.package?.questionIds) { pkg = []; pkgMore = false; return }
   // Same-package questions from the same origin workspace, each with its own state.
   // One bounded, server-searched page by package ID; only exact package members are kept.
+  const unattributed = native && !native.workspaceAttributed
   const pr = await call(req, 'listDecisionPage', {
-    scope: { kind: 'workspace', workspace: { hostId: d.origin.hostId, workspaceId: d.origin.workspaceId } },
+    scope: unattributed ? { kind: 'all' } : { kind: 'workspace', workspace: { hostId: d.origin.hostId, workspaceId: d.origin.workspaceId } },
     query: d.packageId, includeHistory: true, timeZone: clock.zone()
   })
   if (mine !== seq || !d) return
   const pkgBefore = JSON.stringify([pkg, pkgFail])
-  if (pr.ok) { pkg = pr.value.rows.filter((x) => x.packageId === d!.packageId && x.questionId !== d!.questionId); pkgFail = null }
+  if (pr.ok) { pkgMore = !!pr.value.nextCursor; pkg = pr.value.rows.filter((x) => x.packageId === d!.packageId && x.questionId !== d!.questionId); pkgFail = null }
   else if (!passive) { pkg = []; pkgFail = pr }
   if (JSON.stringify([pkg, pkgFail]) !== pkgBefore) requestRender(passive)
   if (passive && !busy() && !saveTimer) await checkExternalDraft(questionId)
@@ -338,7 +465,7 @@ function addSelection(note: string) {
 function addQuoteNote() {
   const q = quote; pop.style.display = 'none'
   if (!q || (d && nativeOf(d))) return
-  if (narrow.matches) return openComposer(q)
+  if (notesInDialog()) return openComposer(q)
   addSelection('')
   focusNote = draft.annotations.length - 1
   quote = null; render(); say('Note added in the sidebar')
@@ -380,14 +507,11 @@ document.addEventListener('selectionchange', () => {
   if (sel && sel.rangeCount && !sel.isCollapsed && d) {
     const r = sel.getRangeAt(0)
     for (const f of ['background', 'recommendation'] as const) {
-      const p = root.querySelector(`[data-field="${f}"]`); const node = p?.firstChild
-      if (!p || !node || !r.intersectsNode(node)) continue
-      const len = d[f].length
-      const whole = document.createRange(); whole.selectNodeContents(node)
-      const start = r.startContainer === node ? r.startOffset : r.compareBoundaryPoints(Range.START_TO_START, whole) <= 0 ? 0 : len
-      const end = r.endContainer === node ? r.endOffset : r.compareBoundaryPoints(Range.END_TO_END, whole) >= 0 ? len : 0
-      const text = d[f].slice(start, end)
-      if (end > start && text.trim()) quote = { field: f, text, start, end }
+      const field = root.querySelector(`[data-field="${f}"]`)
+      const span = field && rawRange(r, field)
+      if (!span) continue
+      const text = d[f].slice(span[0], span[1])
+      if (text.trim()) quote = { field: f, text, start: span[0], end: span[1] }
       break
     }
   }
@@ -404,7 +528,7 @@ document.addEventListener('keydown', (e) => {
   // e.code: on macOS Option+N is a dead key, so e.key is not "n" there.
   if (e.altKey && (e.code === 'KeyN' || e.key.toLowerCase() === 'n')) { e.preventDefault(); if (quote) addQuoteNote() }
   if (e.key === 'Escape') pop.style.display = 'none'
-  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && ref.view === 'review') { e.preventDefault(); void send() }
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && (ref.view === 'review' || (ref.view === 'dashboard' && dashSel))) { e.preventDefault(); void send() }
 })
 
 // ---- reply --------------------------------------------------------------------------------------
@@ -423,7 +547,7 @@ function buildAnswer(x: Decision): Answer | null {
 /** Opens the notes that block sending: the dialog on narrow layouts, the sidebar otherwise. */
 function reviewNotes() {
   const x = d; if (!x) return
-  if (narrow.matches) return openComposer(null)
+  if (notesInDialog()) return openComposer(null)
   const i = draft.annotations.findIndex((n) => noteProblem(n, x))
   root.querySelector<HTMLElement>(`[data-note="${Math.max(0, i)}"]`)?.focus()
 }
@@ -705,13 +829,13 @@ function composeArea(x: Decision): HTMLElement[] {
   const label = isFollow ? 'Send follow-up' : 'Submit reply'
   const sendBtn = el<HTMLButtonElement>('button', { type: 'button', class: 'pri', 'data-k': 'send', 'aria-disabled': empty || sending, onclick: () => send() }, sending ? 'Sending…' : label)
   const ta = field('textarea', {
-    rows: 3, 'data-k': 'reply', 'aria-label': isFollow ? 'Follow-up' : 'Reply text', readonly: sending, 'aria-busy': sending,
+    rows: dockOpen ? 6 : 2, 'data-k': 'reply', 'aria-label': isFollow ? 'Follow-up' : 'Reply text', readonly: sending, 'aria-busy': sending,
     placeholder: isFollow ? 'Follow-up to the agent (Ctrl+Enter to send)' : draft.optionId ? 'Optional detail with your option (Ctrl+Enter to submit)' : 'Free-text answer (Ctrl+Enter to submit)'
   }, draft.text)
   const onEdit = () => { draft.text = ta.value; scheduleSave(); sendBtn.setAttribute('aria-disabled', String(!buildAnswer(x) || sending)) }
   ta.addEventListener('input', onEdit); ta.addEventListener('change', onEdit)
   return [
-    ...(isFollow ? [el('h2', {}, 'Add a follow-up'), el('p', { class: 'meta' }, 'Your first answer stays exactly as recorded. A follow-up is added below it and has its own receipt.')]
+    ...(isFollow ? [el('h2', {}, 'Add a follow-up'), el('p', { class: 'meta fu-help' }, 'Your first answer stays exactly as recorded. A follow-up is added below it and has its own receipt.')]
       : [el('h2', {}, 'Reply')]),
     el('button', { type: 'button', class: 'only-narrow', 'data-k': 'notes-open', style: 'margin-bottom:6px', onclick: () => openComposer(quote) }, notesLabel(x)),
     ta,
@@ -725,11 +849,62 @@ function composeArea(x: Decision): HTMLElement[] {
 }
 
 const STEPS: ShownState[] = ['awaiting-answer', 'submitted', 'agent-received', 'undelivered']
+/** Optional reader fields agreed with the BE worker (absent on older workers). */
+type RichDecision = Decision & {
+  context?: string
+  activity?: { label: string; at?: string; text: string }[]
+  package?: { index: number; size: number | null }
+  nativeLinks?: { kind: string; ref: string; label: string; url?: string }[]
+}
+const pkgOrder = (a: Decision, b: Decision) => {
+  const ia = (a as RichDecision).package?.index, ib = (b as RichDecision).package?.index
+  if (ia !== undefined && ib !== undefined) return ia - ib
+  const na = Number(a.questionId.split(':').at(-1)), nb = Number(b.questionId.split(':').at(-1))
+  if (nativeOf(a) && Number.isInteger(na) && Number.isInteger(nb)) return na - nb
+  return Date.parse(a.createdAt) - Date.parse(b.createdAt) || a.questionId.localeCompare(b.questionId)
+}
+/** Rebinds this editor to another question of the package; drafts stay with their own question. */
+function goTo(questionId: string) {
+  if (ref.view === 'dashboard') return void selectInDashboard(questionId)
+  ref = { view: 'review', questionId }; void bind()
+}
+/** "Question i / N" with Previous / Next over the package (siblings from one bounded page). */
+function pager(x: Decision): HTMLElement {
+  const declared = x.package
+  // Sibling IDs: declared by the worker (native asks), else from the loaded package page.
+  const ids = declared?.questionIds ?? [...pkg.filter((s) => s.questionId !== x.questionId), x].sort(pkgOrder).map((s) => s.questionId)
+  const at = Math.max(0, ids.indexOf(x.questionId))
+  const index = declared?.index ?? at
+  const known = declared?.questionIds ? ids.length : declared?.size ?? null
+  const total = known !== null ? String(known) : declared ? `${Math.max(ids.length, index + 1)}+` : pkgMore ? `${ids.length}+` : String(ids.length)
+  const prev = ids[at - 1], next = ids[at + 1]
+  return el('nav', { class: 'pager', 'aria-label': 'Questions in this package' }, `Question ${index + 1} / ${total}`,
+    el('button', { type: 'button', 'data-k': 'q-prev', 'aria-disabled': !prev, onclick: () => prev && goTo(prev) }, '‹ Previous'),
+    el('button', { type: 'button', 'data-k': 'q-next', 'aria-disabled': !next, onclick: () => next && goTo(next) }, 'Next ›'))
+}
+/** Pager plus a one-line copy of the question, sticky at the top while the question scrolls. */
+function qbar(x: Decision): HTMLElement {
+  return el('div', { class: 'qbar' }, pager(x), el('span', { class: 'qbt', 'aria-hidden': 'true', title: x.title }, x.title))
+}
+/** Secondary metadata and the original source text, on demand. */
+function disclosures(x: Decision, rows: [string, string][]): HTMLElement[] {
+  const r = x as RichDecision
+  return [
+    el('details', {}, el('summary', {}, 'Details'),
+      el('dl', { class: 'meta', style: 'display:grid;grid-template-columns:max-content 1fr;gap:2px 10px;margin:6px 0' },
+        ...rows.flatMap(([k, v]) => [el('dt', {}, k), el('dd', { style: 'margin:0;color:var(--fg)' }, v)])),
+      ...(r.nativeLinks ?? []).map((l) => el('p', { class: 'meta', style: 'margin:2px 0' }, l.url
+        ? el('a', { href: l.url, onclick: (ev: Event) => { ev.preventDefault(); void openLink(l.url!) } }, `${l.label} ↗`) : `${l.label} (${l.kind} ${l.ref})`)),
+      ...(x.sourceLinks.length ? [el('p', { style: 'margin:4px 0' }, ...x.sourceLinks.map((l) => el('a', { href: l.url, onclick: (ev: Event) => { ev.preventDefault(); void openLink(l.url) } }, `${l.label} ↗  `)))] : [])),
+    ...((r.activity ?? []).length ? [el('details', {}, el('summary', {}, 'Original activity'),
+      ...r.activity!.map((a) => el('section', {}, el('p', { class: 'meta', style: 'margin:6px 0 2px' }, a.at ? `${a.label} · ${when(a.at)}` : a.label), rich(a.text))))] : [])
+  ]
+}
 function renderReview(questionId: string) {
   const x = d
   if (!x) {
     shownD = null
-    root.replaceChildren(el('main', {}, loadFail
+    readerHost.replaceChildren(el('main', {}, loadFail
       ? el('div', { class: 'callout', ...alertRole(`load:${questionId}:${loadFail.code}`) }, loadFail.code === 'not-found'
         ? `Decision "${questionId}" was not found. It may have been withdrawn, or you may not have access.`
         : loadFail.code === 'forbidden' ? `You do not have access to decision "${questionId}".`
@@ -754,21 +929,13 @@ function renderReview(questionId: string) {
       el('span', { class: `chip ${x.priority === 'P0' ? 'bad' : ''}` }, x.priority),
       ...(x.deadline ? [el('span', { class: `chip ${due?.overdue ? 'bad' : ''}` }, `${due!.text} · ${when(x.deadline)}`)] : []),
       ...(x.blockedWork.length ? [`Blocks: ${x.blockedWork.join(', ')}`] : [])),
+    qbar(x),
+    ...((x as RichDecision).context && (x as RichDecision).context !== x.title ? [el('p', { class: 'ctx' }, (x as RichDecision).context!)] : []),
     el('h1', {}, x.title),
-    el('div', { class: 'callout warn' }, `Replies go only to the original chat in ${x.projectName} / ${x.workspaceName}${remote ? ` on host “${x.origin.hostId}”` : ''}, whichever workspace you are in. Agent received appears only after that chat confirms this reply.`),
     ...(due?.overdue ? [el('div', { class: 'callout', ...alertRole(`due:${due.text}`) }, `${due.text}.`)] : []),
-    ...(pkg.length || pkgFail ? [el('h2', {}, 'Same package · shared background and evidence'),
-      pkgFail ? el('p', { class: 'meta' }, `Could not load the other questions in this package. ${failureText(pkgFail)}`)
-        : el('div', { class: 'pkg' }, ...pkg.map((s) => el('span', { class: 'chip' }, `${s.title} · ${STATE_LABEL[shownState(s)]} `,
-          el('button', { type: 'button', 'data-k': `open-${s.questionId}`, 'aria-label': `Open ${s.title}`, onclick: () => openOther(s.questionId) }, 'Open'))))] : []),
-    el('h2', {}, 'Background'), el('p', { 'data-field': 'background', style: 'margin:0;user-select:text' }, x.background),
-    el('h2', {}, 'Recommendation'), el('p', { 'data-field': 'recommendation', style: 'margin:0;user-select:text' }, x.recommendation),
-    ...(answered(x) ? [] : [el('h2', {}, 'Options'),
-      ...(x.options.length
-        ? [el('div', { role: 'radiogroup', 'aria-label': 'Options' }, ...x.options.map((o) =>
-            el('label', { class: 'opt' }, el<HTMLInputElement>('input', { type: 'radio', name: 'opt', 'data-k': `opt-${o.optionId}`, checked: draft.optionId === o.optionId, disabled: sending, onchange: () => { draft.optionId = o.optionId; scheduleSave(); render() } }),
-              el('span', {}, o.label, ...(o.detail ? [el('div', { class: 'meta' }, o.detail)] : [])))))]
-        : [el('p', { class: 'meta' }, 'No fixed options. Answer in text.')])]),
+    el('h2', {}, 'Background'), rich(x.background, { 'data-field': 'background', style: 'user-select:text' }),
+    ...(x.recommendation.trim() ? [el('h2', {}, 'Recommendation'), rich(x.recommendation, { 'data-field': 'recommendation', style: 'user-select:text' })] : []),
+
     ...(imgs.length ? [el('h2', {}, `Evidence · ${imgs.length} private snapshot${imgs.length > 1 ? 's' : ''}`),
       el('div', { class: 'film', role: 'group', 'aria-label': 'Snapshots' }, ...imgs.map((e, i) => el('button', {
         type: 'button', 'data-k': `thumb-${i}`, 'aria-pressed': a === i || b === i,
@@ -783,14 +950,32 @@ function renderReview(questionId: string) {
     ...(links.length ? [el('h2', {}, 'Linked evidence'), el('p', { style: 'margin:0' }, ...links.map((l) => l.kind === 'link'
       ? el('a', { href: l.url, onclick: (ev: Event) => { ev.preventDefault(); void openLink(l.url) } }, `${l.label} · v${l.version} ↗  `) : ''))] : []),
     ...(answered(x) ? [el('h2', {}, 'Recorded answer and follow-ups'), ...thread(x)] : []),
-    ...(actionsOf(x).includes(answered(x) ? 'follow-up' : 'reply') ? composeArea(x)
-      : [el('h2', {}, answered(x) ? 'Add a follow-up' : 'Reply'), el('p', { class: 'meta' }, 'Replying here is not available for this decision right now.')]),
-    el('ol', { class: 'strip', 'aria-label': 'Delivery state of the answer' }, ...STEPS.map((s) =>
-      el('li', { class: `step ${s === 'undelivered' ? 'bad' : ''}`, 'aria-current': s === state ? 'step' : false }, `${s === state ? '● ' : '○ '}${STATE_LABEL[s]}`))),
-    el('h2', {}, 'Source links'),
-    el('p', { style: 'margin:0' }, ...x.sourceLinks.map((l) => el('a', { href: l.url, onclick: (ev: Event) => { ev.preventDefault(); void openLink(l.url) } }, `${l.label} ↗  `)),
-      el('button', { type: 'button', onclick: () => copy(x.decisionLink, 'Decision link') }, 'Copy decision link')))
-  root.replaceChildren(main, el('aside', { class: 'side', 'aria-label': 'Notes' }, sidebar(x)))
+    ...(pkg.length || pkgFail ? [el('h2', {}, 'Same package · shared background and evidence'),
+      pkgFail ? el('p', { class: 'meta' }, `Could not load the other questions in this package. ${failureText(pkgFail)}`)
+        : el('div', { class: 'pkg' }, ...pkg.map((s) => el('span', { class: 'chip' }, `${s.title} · ${STATE_LABEL[shownState(s)]} `,
+          el('button', { type: 'button', 'data-k': `open-${s.questionId}`, 'aria-label': `Open ${s.title}`, onclick: () => openOther(s.questionId) }, 'Open'))))] : []),
+    ...disclosures(x, [['Project', x.projectName], ['Workspace', x.workspaceName], ...(remote ? [['Host', x.origin.hostId] as [string, string]] : []),
+      ['Priority', x.priority], ...(x.deadline ? [['Deadline', when(x.deadline)] as [string, string]] : []), ['Created', when(x.createdAt)], ['Question ID', x.questionId]]),
+    el('p', { style: 'margin:6px 0' }, el('button', { type: 'button', onclick: () => copy(x.decisionLink, 'Decision link') }, 'Copy decision link')),
+    // The reply area: options, composer and delivery state, docked at the bottom while the question scrolls.
+    el('section', { class: `dock${dockOpen ? ' open' : ''}`, 'aria-label': 'Reply' },
+      el('div', { class: 'dock-head' },
+        el('span', { class: 'meta' }, dockOpen ? '' : 'Replies go only to the original chat.'),
+        el('button', { type: 'button', 'data-k': 'dock-toggle', 'aria-expanded': dockOpen, onclick: () => {
+          dockOpen = !dockOpen; render(); root.querySelector<HTMLElement>('[data-k="reply"]')?.focus()
+        } }, dockOpen ? 'Collapse reply' : 'Expand reply')),
+      ...(dockOpen ? [el('p', { class: 'meta', style: 'margin:0 0 4px' }, `Replies go only to the original chat in ${x.projectName} / ${x.workspaceName}${remote ? ` on host “${x.origin.hostId}”` : ''}, whichever workspace you are in. Agent received appears only after that chat confirms this reply.`)] : []),
+      ...(answered(x) ? [] : [el('h2', {}, 'Options'),
+        ...(x.options.length
+          ? [el('div', { role: 'radiogroup', 'aria-label': 'Options' }, ...x.options.map((o) =>
+              el('label', { class: 'opt' }, el<HTMLInputElement>('input', { type: 'radio', name: 'opt', 'data-k': `opt-${o.optionId}`, checked: draft.optionId === o.optionId, disabled: sending, onchange: () => { draft.optionId = o.optionId; scheduleSave(); render() } }),
+                el('span', {}, o.label, ...(o.detail ? [el('div', { class: 'meta' }, o.detail)] : [])))))]
+          : [el('p', { class: 'meta' }, 'No fixed options. Answer in text.')])]),
+      ...(actionsOf(x).includes(answered(x) ? 'follow-up' : 'reply') ? composeArea(x)
+        : [el('h2', {}, answered(x) ? 'Add a follow-up' : 'Reply'), el('p', { class: 'meta' }, 'Replying here is not available for this decision right now.')]),
+      el('ol', { class: 'strip', 'aria-label': 'Delivery state of the answer' }, ...STEPS.map((s) =>
+        el('li', { class: `step ${s === 'undelivered' ? 'bad' : ''}`, 'aria-current': s === state ? 'step' : false }, `${s === state ? '● ' : '○ '}${STATE_LABEL[s]}`)))))
+  readerHost.replaceChildren(main, el('aside', { class: 'side', 'aria-label': 'Notes' }, sidebar(x)))
   shownD = x
   if (focusNote !== null) { root.querySelector<HTMLInputElement>(`[data-note="${focusNote}"]`)?.focus(); focusNote = null }
 }
@@ -804,29 +989,33 @@ function renderNative(x: Decision, n: NativeSource) {
   const due = deadlineLabel(x, clock.now())
   const links = x.evidence.filter((e) => e.kind === 'link')
   const item = [n.botName && `bot “${n.botName}”`, n.itemLabel && `item ${n.itemLabel}`].filter(Boolean).join(', ')
-  const main = el('main', {},
+  const main = el('main', { class: 'full' },
+    qbar(x),
+    ...(x.context && x.context !== x.title ? [el('p', { class: 'ctx' }, x.context)] : []),
+    el('h1', {}, x.title),
     el('div', { class: 'meta' },
       el('span', { class: 'chip' }, 'Bot Item · read-only'),
-      ...(n.workspaceAttributed ? [x.projectName, '·', x.workspaceName] : [el('span', { class: 'chip' }, 'No workspace attribution')]),
-      ...(x.origin.hostId && x.origin.hostId !== 'local' ? [el('span', { class: 'chip' }, `host: ${x.origin.hostId}`)] : []),
-      el('span', { class: `chip ${x.priority === 'P0' ? 'bad' : ''}` }, x.priority),
-      ...(x.deadline ? [el('span', { class: `chip ${due?.overdue ? 'bad' : ''}` }, `${due!.text} · ${when(x.deadline)}`)] : [])),
-    el('h1', {}, x.title),
-    el('section', { class: 'callout info', 'aria-labelledby': 'answer-where' },
-      el('h2', { id: 'answer-where', style: 'margin-top:0' }, 'Where to answer'),
-      el('p', { style: 'margin:0' }, `Answer this in Orca's Bot Items${item ? `: ${item}` : ''}. The Inbox shows a read-only copy and cannot answer, resolve or open this item for you.`)),
-    el('h2', {}, 'Status in Orca'),
-    el('p', { style: 'margin:0' }, nativeStatusLabel(n.itemStatus), ...(n.observedAt ? [el('span', { class: 'meta' }, ` · as of ${when(n.observedAt)}`)] : [])),
-    ...(x.background ? [el('h2', {}, 'Details'), el('p', { style: 'margin:0;white-space:pre-wrap' }, x.background)] : []),
-    ...(x.recommendation ? [el('h2', {}, 'Recommendation'), el('p', { style: 'margin:0;white-space:pre-wrap' }, x.recommendation)] : []),
-    ...(x.options.length ? [el('h2', {}, 'Options offered in Orca'),
-      el('ul', {}, ...x.options.map((o) => el('li', {}, o.label, ...(o.detail ? [el('div', { class: 'meta' }, o.detail)] : []))))] : []),
-    ...(x.blockedWork.length ? [el('h2', {}, 'Blocks'), el('p', { style: 'margin:0' }, x.blockedWork.join(', '))] : []),
+      el('span', { class: 'chip' }, nativeStatusLabel(n.itemStatus)),
+      ...(x.priority === 'P0' || x.priority === 'P1' ? [el('span', { class: `chip ${x.priority === 'P0' ? 'bad' : ''}` }, x.priority)] : []),
+      ...(x.deadline ? [el('span', { class: `chip ${due?.overdue ? 'bad' : ''}` }, `${due!.text} · ${when(x.deadline)}`)] : []),
+      ...(n.workspaceAttributed ? [] : [el('span', { class: 'chip' }, 'No workspace attribution')])),
+    ...(x.background.trim() ? [el('h2', {}, 'Background'), rich(x.background)] : []),
+    ...(x.recommendation.trim() ? [el('h2', {}, 'Recommendation'), rich(x.recommendation)] : []),
+    ...(x.blockedWork.length ? [el('h2', {}, 'Blocks'), el('ul', {}, ...x.blockedWork.map((w) => el('li', {}, w)))] : []),
     ...(links.length ? [el('h2', {}, 'Linked evidence'), el('p', { style: 'margin:0' }, ...links.map((l) => l.kind === 'link'
       ? el('a', { href: l.url, onclick: (ev: Event) => { ev.preventDefault(); void openLink(l.url) } }, `${l.label} · v${l.version} ↗  `) : ''))] : []),
-    ...(x.sourceLinks.length ? [el('h2', {}, 'Source links'), el('p', { style: 'margin:0' }, ...x.sourceLinks.map((l) =>
-      el('a', { href: l.url, onclick: (ev: Event) => { ev.preventDefault(); void openLink(l.url) } }, `${l.label} ↗  `)))] : []))
-  root.replaceChildren(main)
+    ...disclosures(x, [['Status in Orca', `${nativeStatusLabel(n.itemStatus)}${n.observedAt ? ` · as of ${when(n.observedAt)}` : ''}`],
+      ...(n.botName ? [['Bot', n.botName] as [string, string]] : []), ...(n.itemLabel ? [['Item', n.itemLabel] as [string, string]] : []),
+      ['Workspace', n.workspaceAttributed ? `${x.projectName} · ${x.workspaceName}` : 'No workspace attribution'],
+      ...(x.origin.hostId && x.origin.hostId !== 'local' ? [['Host', n.hostLabel ?? x.origin.hostId] as [string, string]] : []),
+      ['Priority', x.priority], ['Question ID', x.questionId]]),
+    // Native Items are answered in Orca: a compact footer with the options, no reply controls.
+    el('section', { class: 'dock', 'aria-label': 'Where to answer' },
+      el('p', { style: 'margin:0 0 4px;font-weight:600' }, `Answer in Orca's Bot Items${item ? `: ${item}` : ''}`),
+      ...(x.options.length ? [el('ul', { class: 'pkg', style: 'list-style:none;padding:0;margin:0 0 4px' }, ...x.options.map((o) =>
+        el('li', { class: 'chip' }, o.detail ? `${o.label} — ${o.detail}` : o.label)))] : []),
+      el('p', { class: 'meta', style: 'margin:0' }, 'Read-only copy: Decision Inbox cannot answer, resolve or open this Item for you.')))
+  readerHost.replaceChildren(main)
   shownD = x
 }
 
@@ -980,6 +1169,175 @@ function settingsChrome() {
   }
 }
 
+
+// ---- dashboard: queue and reader in one main-area tab (`{"view":"dashboard"}`) ---------------------
+// One editor tab holds the queue and the selected decision. Selecting another decision rebinds the
+// reader in place (no new tab), flushing the previous draft under its own question ID first. Wide:
+// queue and reader side by side. Narrow (≤800px): one surface at a time, with Back to the queue.
+let readerHost: HTMLElement = root
+let dashSel: string | null = null
+let dashMode: 'queue' | 'reader' = 'queue'
+let dashSeq = 0
+let dashTimer: ReturnType<typeof setTimeout> | null = null
+const dash = {
+  scope: 'workspace' as 'workspace' | 'all', term: '', history: false,
+  focus: undefined as Workspace | null | undefined, focusFail: null as Failure | null,
+  rows: [] as Decision[], next: undefined as string | undefined, sources: [] as SourceStatus[], mail: undefined as { state: 'available' | 'unavailable'; message?: string } | undefined,
+  loading: false as false | 'first' | 'more', fail: null as Failure | null, loaded: false
+}
+let shell: { el: HTMLElement; list: HTMLElement; reader: HTMLElement } | null = null
+
+async function resolveFocus() {
+  if (dash.focus !== undefined) return
+  const host = (orca as unknown as { host?: { call?: (m: string, p?: unknown) => Promise<{ workspaceId?: string } | null> } }).host
+  let ctx: { workspaceId?: string } | null = null
+  try { ctx = host?.call ? await host.call('workspace.readContext') : null } catch { ctx = null }
+  if (!ctx?.workspaceId) { dash.focus = null; return }
+  const r = await call(req, 'workspace.resolve', { workspaceId: ctx.workspaceId })
+  if (r.ok) dash.focus = r.value
+  else { dash.focus = null; dash.focusFail = r }
+}
+function pageInput(cursor?: string) {
+  return {
+    scope: dash.scope === 'all' || !dash.focus ? { kind: 'all' as const } : { kind: 'workspace' as const, workspace: { hostId: dash.focus.hostId, workspaceId: dash.focus.workspaceId } },
+    ...(dash.term.trim() ? { query: dash.term.trim() } : {}), includeHistory: dash.history, timeZone: clock.zone(), ...(cursor ? { cursor } : {})
+  }
+}
+/** First page, or the next one with `more`. Stale answers (an older query) are dropped. */
+async function loadQueue(more = false) {
+  if (dash.scope === 'workspace') await resolveFocus()
+  if (dash.scope === 'workspace' && !dash.focus) { dash.loaded = true; dash.rows = []; paintQueue(); return }
+  const mine = ++dashSeq
+  dash.loading = more ? 'more' : 'first'; paintQueue()
+  const r = await call(req, 'listDecisionPage', pageInput(more ? dash.next : undefined))
+  if (mine !== dashSeq) return
+  dash.loading = false; dash.loaded = true
+  if (r.ok) {
+    const seen = new Set(more ? dash.rows.map((x) => x.questionId) : [])
+    dash.rows = more ? [...dash.rows, ...r.value.rows.filter((x) => !seen.has(x.questionId))] : r.value.rows
+    dash.next = r.value.nextCursor; dash.fail = null
+    if (!more) { dash.sources = sourcesOf(r.value); dash.mail = r.value.mail }
+    // Wide: open the first decision by default; narrow opens only on an explicit choice.
+    if (!dashSel && !narrow.matches && dash.rows.length) { void selectInDashboard(order(dash.rows, clock.now(), clock.zone())[0].questionId, false); return }
+  } else dash.fail = r
+  paintQueue()
+}
+/** After an invalidation: re-read as many rows as were loaded, without collapsing Load more. */
+async function refreshQueue() {
+  if (dash.scope === 'workspace' && !dash.focus) return
+  const want = dash.rows.length
+  const mine = ++dashSeq
+  const rows: Decision[] = []; const seen = new Set<string>()
+  let cursor: string | undefined; let pages = 0; let first: DecisionPage | null = null
+  do {
+    const r = await call(req, 'listDecisionPage', pageInput(cursor))
+    if (mine !== dashSeq) return
+    if (!r.ok) { dash.fail = r; paintQueue(); return }
+    if (!first) first = r.value
+    for (const x of r.value.rows) if (!seen.has(x.questionId)) { seen.add(x.questionId); rows.push(x) }
+    cursor = r.value.nextCursor
+  } while (cursor && rows.length < want && ++pages < 20)
+  dash.rows = rows; dash.next = cursor; dash.fail = null
+  if (first) { dash.sources = sourcesOf(first); dash.mail = first.mail }
+  paintQueue()
+}
+/** Opens a decision in this tab's reader; the old draft is saved under its own question first. */
+async function selectInDashboard(questionId: string, show = true) {
+  if (show) dashMode = 'reader'
+  if (dashSel === questionId) { render(); return }
+  if (draftFor && draftFor !== questionId) await flushDraft()
+  draftFor = null; draft = emptyDraft(); draftRevision = null; draftFail = null; d = null; pkg = []; notice = null
+  dashSel = questionId
+  render()
+  await loadReview(questionId)
+}
+
+const SRC_NAME: Record<SourceStatus['source'], string> = { plugin: 'Chat decisions', 'native-item': 'Bot Items' }
+function rowNode(x: Decision, now: number) {
+  const n = nativeOf(x)
+  const due = deadlineLabel(x, now)
+  const state = shownState(x)
+  const where = n && !n.workspaceAttributed ? 'No workspace attribution' : `${x.projectName} · ${x.workspaceName}`
+  const bits = [n ? 'Bot Item' : 'Chat decision', n ? nativeStatusLabel(n.itemStatus) : STATE_LABEL[state], x.priority, ...(due ? [due.text] : []), where]
+  return el('button', {
+    type: 'button', class: 'qrow', 'data-k': `row-${x.questionId}`, 'data-q': x.questionId, 'aria-current': dashSel === x.questionId ? 'true' : false,
+    onclick: () => void selectInDashboard(x.questionId)
+  }, el('span', { class: 'qt' }, x.title), el('span', { class: 'meta' }, bits.join(' · ')))
+}
+/** Repaints only the queue list: the search field keeps focus, caret and IME state. */
+function paintQueue() {
+  if (!shell) return
+  const now = clock.now()
+  const rows = order(dash.rows, now, clock.zone())
+  const need = dash.rows.filter(isActionable).length
+  const label = dash.scope === 'all' ? 'all workspaces' : 'this workspace'
+  const degraded = dash.sources.some((x) => x.state !== 'available')
+  const kids: (HTMLElement | string)[] = []
+  kids.push(el('p', { class: 'meta', role: 'status' }, dash.loading === 'first' ? 'Loading decisions…' : `${need}${dash.next ? '+' : ''} ${dash.term.trim() ? 'matching ' : ''}need you`))
+  for (const x of dash.sources.filter((y) => y.state !== 'available')) {
+    kids.push(el('div', { class: 'callout warn' }, `${x.state === 'partial' ? `Some ${SRC_NAME[x.source]} could not be read.` : `${SRC_NAME[x.source]} are unavailable.`} ${x.message ?? ''} ${x.source === 'plugin' ? 'Bot Items' : 'Chat decisions'} below are not affected.`))
+  }
+  if (dash.mail?.state === 'unavailable') kids.push(el('div', { class: 'callout info' }, dash.mail.message && /saved in Decision Inbox/i.test(dash.mail.message) ? dash.mail.message : 'Answers to Chat decisions are saved in Decision Inbox. Orca mail from this plugin is unavailable on this host, so saved answers are not delivered to the chat yet.'))
+  if (dash.fail) kids.push(el('div', { class: 'callout', ...alertRole(`dash:${dash.fail.message}`) }, `${dash.rows.length ? 'Showing the last loaded list. ' : 'Could not load decisions. '}${failureText(dash.fail)} `,
+    el('button', { type: 'button', onclick: () => void loadQueue() }, 'Retry loading')))
+  if (dash.scope === 'workspace' && dash.focus === null) {
+    kids.push(el('p', {}, dash.focusFail ? `Could not identify this workspace. ${failureText(dash.focusFail)}` : 'No workspace is focused.'),
+      el('button', { type: 'button', onclick: () => setScope('all') }, 'Show all workspaces'))
+  } else if (dash.loaded && !rows.length && !dash.loading) {
+    kids.push(el('p', {}, dash.term.trim() ? 'No matches. Try another word, or turn on Include history.'
+      : degraded ? `Nothing found in ${label} from the sources that could be read.` : `Nothing needs you in ${label}.`))
+    if (dash.scope === 'workspace' && !dash.term.trim()) kids.push(el('button', { type: 'button', onclick: () => setScope('all') }, 'Show all workspaces'))
+  } else kids.push(el('div', { role: 'list', 'aria-label': `Decisions in ${label}, most urgent first`, class: 'qitems' }, ...rows.map((x) => el('div', { role: 'listitem' }, rowNode(x, now)))))
+  if (dash.next) kids.push(el('button', { type: 'button', 'data-k': 'dash-more', 'aria-disabled': dash.loading === 'more', onclick: () => dash.loading !== 'more' && void loadQueue(true) }, dash.loading === 'more' ? 'Loading more…' : 'Load more'))
+  const focusedKey = document.activeElement && shell.list.contains(document.activeElement) ? document.activeElement.getAttribute('data-k') : null
+  shell.list.replaceChildren(...kids)
+  if (focusedKey) shell.list.querySelector<HTMLElement>(`[data-k="${CSS.escape(focusedKey)}"]`)?.focus({ preventScroll: true })
+}
+function setScope(scope: 'workspace' | 'all') {
+  dash.scope = scope
+  shell?.el.querySelectorAll<HTMLInputElement>('input[name="dash-scope"]').forEach((i) => { i.checked = i.value === scope; if (i.checked) i.setAttribute('checked', ''); else i.removeAttribute('checked') })
+  void loadQueue()
+}
+function buildShell() {
+  const search = el<HTMLInputElement>('input', { type: 'search', 'aria-label': 'Search decisions', 'data-k': 'dash-search', placeholder: 'Title, background, option, ID, 中文…',
+    oninput: (ev: Event) => { dash.term = (ev.target as HTMLInputElement).value; if (dashTimer) clearTimeout(dashTimer); dashTimer = setTimeout(() => { dashTimer = null; void loadQueue() }, 250) } })
+  const radio = (value: 'workspace' | 'all', text: string) => el('label', {},
+    el('input', { type: 'radio', name: 'dash-scope', value, checked: dash.scope === value, onchange: () => setScope(value) }), text)
+  const list = el('div', { class: 'qlist' })
+  // Arrow keys move between queue rows.
+  list.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'ArrowDown' && ev.key !== 'ArrowUp') return
+    const items = Array.from(list.querySelectorAll<HTMLElement>('.qrow'))
+    const i = items.indexOf(document.activeElement as HTMLElement)
+    if (i < 0) return
+    ev.preventDefault(); items[Math.min(items.length - 1, Math.max(0, i + (ev.key === 'ArrowDown' ? 1 : -1)))]?.focus()
+  })
+  const reader = el('div', { class: 'layout' })
+  const rpane = el('div', { class: 'rpane' }, reader)
+  const queue = el('section', { class: 'qpane', 'aria-label': 'Decision queue' },
+    el('h1', {}, 'Decision Inbox'),
+    el('div', { role: 'radiogroup', 'aria-label': 'Scope', class: 'seg' }, radio('workspace', 'This workspace'), radio('all', 'All workspaces')),
+    search,
+    el('label', { class: 'meta' }, el('input', { type: 'checkbox', 'aria-label': 'Include history', onchange: (ev: Event) => { dash.history = (ev.target as HTMLInputElement).checked; void loadQueue() } }), ' Include history'),
+    list)
+  shell = { el: el('div', { class: 'dash-grid' }, queue, rpane), list, reader }
+}
+function renderDashboard() {
+  if (!shell) buildShell()
+  shell!.el.setAttribute('data-mode', dashMode)
+  if (!root.contains(shell!.el)) root.replaceChildren(shell!.el)
+  paintQueue()
+  readerHost = shell!.reader
+  try {
+    if (!dashSel) shell!.reader.replaceChildren(el('main', {}, el('p', { class: 'meta' }, 'Select a decision in the queue.')))
+    else renderReview(dashSel)
+  } finally { readerHost = root }
+  // Narrow: one surface at a time; Back returns to the queue without losing the draft.
+  shell!.reader.parentElement!.querySelector('.dash-back')?.remove()
+  shell!.reader.before(el('button', { type: 'button', class: 'dash-back', 'data-k': 'dash-back',
+    onclick: () => { dashMode = 'queue'; void flushDraft(); render(); shell?.list.querySelector<HTMLElement>(`[data-q="${CSS.escape(dashSel ?? '')}"]`)?.focus() } }, '← Back to queue'))
+}
+
 // ---- render with focus kept ---------------------------------------------------------------------
 function render() {
   pendingRender = false; pendingAnnounced = false
@@ -993,8 +1351,10 @@ function render() {
   const page = document.scrollingElement
   const pageTop = page?.scrollTop ?? 0
   nextAlerts = new Set()
+  root.className = ref.view === 'dashboard' ? 'dash' : 'layout'
   if (ref.view === 'settings') renderSettings()
   else if (ref.view === 'review') renderReview(ref.questionId)
+  else if (ref.view === 'dashboard') renderDashboard()
   else root.replaceChildren(el('main', {}, el('div', { class: 'callout', role: 'alert' }, 'This review file does not name a decision.')))
   if (k) {
     const next = root.querySelector<HTMLElement & { setSelectionRange?: (s: number, e: number) => void }>(`[data-k="${CSS.escape(k)}"]`)
@@ -1013,6 +1373,11 @@ function render() {
 
 /** Opens what the reference file names. A new question flushes the old draft under its own ID. */
 async function bind() {
+  if (ref.view === 'dashboard') {
+    render()
+    await loadQueue()
+    return
+  }
   if (ref.view === 'review') {
     if (draftFor && draftFor !== ref.questionId) { await flushDraft(); draftFor = null; draft = emptyDraft(); draftRevision = null; draftFail = null; d = null; pkg = []; notice = null }
     render()
@@ -1032,9 +1397,10 @@ orca.plugin.on('inbox.changed', () => {
   invalidTimer = setTimeout(() => {
     invalidTimer = null
     if (ref.view === 'review') void loadReview(ref.questionId, true, true)
+    else if (ref.view === 'dashboard') { void refreshQueue(); if (dashSel) void loadReview(dashSel, true, true) }
     else if (ref.view === 'settings') void settingsInvalidated()
   }, 150)
 })
 // Live clock: deadlines and relative text stay current, without interrupting typing.
-setInterval(() => { if (ref.view === 'review' && d) requestRender() }, 60_000)
+setInterval(() => { if ((ref.view === 'review' || ref.view === 'dashboard') && d) requestRender() }, 60_000)
 await bind()

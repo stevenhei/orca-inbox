@@ -5,7 +5,7 @@ import { decisions, historyExample, clock as fixtureClock, origins } from '../fi
 import { actionsOf, dayKey, deadlineLabel, group, isActionable, nativeStatusLabel, order, receiptMatches, searchText, shownState, visible, workspaceKey } from './model'
 import { clock, reconcile } from './client'
 import type { Decision, ListDecisions, Result, SubmitReply } from './contract'
-import type { DecisionPage, InboxSettings, SourceAvailability } from './backend-protocol'
+import type { DecisionPage, DraftRecord, InboxSettings, SourceAvailability } from './backend-protocol'
 
 // Fixtures, the fixed clock and UTC are injected here only; production reads the live clock and
 // the desktop zone (see the last test).
@@ -348,15 +348,15 @@ test('panel: a Bot Item card shows its details and options in the panel; a faile
     await view.select({ label: 'Scope' }, 'all')
     await view.press({ label: 'Item #7 question' })
     assert.ok(view.find({ role: 'heading', text: 'Item #7 question' }), 'detail heading')
-    assert.ok(view.find({ label: 'Where to answer' }))
-    assert.ok(view.find({ label: 'Ship it' }) && view.find({ label: 'Hold' }), 'options visible in the panel')
+    assert.ok(view.find({ text: /^Answer in Orca's Bot Items/ }), 'native footer says where to answer')
+    assert.ok(view.find({ text: 'Ship it' }) && view.find({ text: 'Hold — Wait for the next build' }), 'options visible in the panel footer')
     assert.ok(view.find({ text: /Release bot asks whether build 42 can ship\./ }))
     assert.equal(requestsOf(view, 'review.open').length, 0, 'no wide tab needed to read it')
     assert.ok(!view.summary().some((x) => /danger/.test(x)), 'no error for a readable item')
     await view.press({ text: 'Open wide review' })
     assert.ok(view.find({ label: 'The wide tab did not open' }))
     assert.ok(view.find({ text: /Inbox storage or host integration is unavailable\. Only the wide tab failed; the decision below is read from Decision Inbox and works here\./ }))
-    assert.ok(view.find({ label: 'Ship it' }), 'details stay after the wide-tab failure')
+    assert.ok(view.find({ text: 'Ship it' }), 'details stay after the wide-tab failure')
     await view.press({ text: '← Back to list' })
     assert.deepEqual(titles(view), ['Item #2 question', 'Item #7 question'])
     assert.ok(!view.find({ label: 'The wide tab did not open' }), 'wide failure does not follow to the list')
@@ -427,6 +427,83 @@ test('panel: a stored initial draft that lost to another answer is kept, never s
     await view.press({ text: 'Write a follow-up from this text' })
     assert.equal(view.valueOf({ label: 'Follow-up' }), 'Grid, but larger labels')
     assert.equal(requestsOf(view, 'submitReply').length, 0, 'nothing sent automatically')
+    await wait(450); await view.settled()
+    assert.deepEqual(st.drafts.get('layout')?.draft, { text: 'Grid, but larger labels', kind: 'follow-up', annotations: [] }, 'the follow-up draft is saved (no undefined fields)')
+    assert.ok(!view.find({ label: 'Draft not saved' }))
+  })
+})
+
+test('panel: leaving the panel never overwrites a newer draft from the wide tab; the panel edit stays recoverable', async () => {
+  // Controlled interleaving: save #1 commits but its answer is held; meanwhile the wide tab saves a
+  // newer draft; then Back flushes the queued panel edit. Old code re-read the latest revision for
+  // that queued save and wrote over the wide tab's draft.
+  const st = stores()
+  const save = st.requests['draft.save'] as (i: { questionId: string; draft: unknown; revision: number }) => Result<{ draft: unknown; revision: number }>
+  let releaseFirst: () => void = () => {}
+  let held = true
+  await withPanel(worker(decisions, { ...st.requests,
+    'draft.save': (i: { questionId: string; draft: unknown; revision: number }): Promise<Result<DraftRecord>> | Result<DraftRecord> => {
+      const r = save(i) as Result<DraftRecord> // commits now
+      if (held && i.questionId === 'schedule') { held = false; return new Promise<Result<DraftRecord>>((res) => { releaseFirst = () => res(r) }) }
+      return r
+    }
+  }), async (view) => {
+    await view.emit('workspace.changed', ctx('studio-local'))
+    await view.press({ label: 'Pick a rehearsal slot' })
+    const t1 = view.type({ label: 'Reply text' }, 'A')
+    await wait(450) // save #1 (revision 0 -> 1) committed, answer held
+    const t2 = view.type({ label: 'Reply text' }, 'B') // panel edit "AB", not yet saved
+    await wait(10)
+    st.drafts.set('schedule', { draft: { text: 'Written in the wide tab', annotations: [], kind: 'initial' }, revision: 2 }) // wide tab saves rev 2
+    const back = view.press({ text: '← Back to list' }) // flushes "AB" behind save #1
+    await wait(10)
+    const other = view.press({ label: 'Compare seven paper model views' })
+    await wait(10)
+    releaseFirst()
+    await Promise.all([t1, t2, back, other]); await wait(50); await view.settled()
+    assert.deepEqual(st.drafts.get('schedule')?.draft, { text: 'Written in the wide tab', annotations: [], kind: 'initial' }, 'the newer wide-tab draft is intact')
+    assert.equal(st.drafts.get('schedule')?.revision, 2)
+    // Back on the question: the saved draft is shown and the panel edit can be recovered.
+    await view.press({ text: '← Back to list' })
+    await view.press({ label: 'Pick a rehearsal slot' })
+    assert.equal(view.valueOf({ label: 'Reply text' }), 'Written in the wide tab')
+    assert.ok(view.find({ label: 'A panel edit was not saved' }))
+    assert.ok(view.find({ text: /Your edit: “AB”/ }))
+    await view.press({ text: 'Use my panel edit' })
+    assert.equal(view.valueOf({ label: 'Reply text' }), 'AB')
+    await wait(450); await view.settled()
+    assert.deepEqual((st.drafts.get('schedule')?.draft as { text: string }).text, 'AB', 'restored edit saved against the revision it was shown')
+    assert.equal(st.drafts.get('schedule')?.revision, 3)
+  })
+})
+
+test('panel: a reply saved while no mail sender exists says awaiting delivery; a real failure stays distinct', async () => {
+  const s0 = historyExample.answerState
+  assert.ok(s0.state === 'answered')
+  if (s0.state !== 'answered') return
+  const failedOnce = { ...s0.initial, delivery: { state: 'undelivered' as const, reason: 'delivery-failed' as const } }
+  const saved: Decision = { ...historyExample, actions: ['follow-up'], answerState: { ...s0, initial: failedOnce } }
+  const closed: Decision = { ...historyExample, questionId: 'layout-closed', title: 'Closed chat layout', actions: ['follow-up'],
+    answerState: { ...s0, initial: { ...failedOnce, delivery: { state: 'undelivered', reason: 'closed-origin' } } } }
+  const list = decisions.map((d) => (d.questionId === 'layout' ? saved : d)).concat(closed)
+  // No sender on this host: never attempted.
+  await withPanel(worker(list, stores().requests, 50, allAvailable, mailOff), async (view) => {
+    await view.emit('workspace.changed', ctx('library-local'))
+    await view.press({ label: 'Choose the catalogue layout' })
+    assert.ok(view.find({ text: 'Saved · awaiting delivery' }), 'card badge matches the list')
+    assert.ok(view.find({ text: /Saved in Decision Inbox and awaiting delivery\. Orca mail from this plugin is unavailable on this host, so it has not been sent to the original chat yet\./ }))
+    assert.ok(!view.find({ text: /could not hand it/ }), 'does not imply a hand-off was attempted')
+    await view.press({ text: '← Back to list' })
+    await view.press({ label: 'Closed chat layout' })
+    assert.ok(view.find({ text: 'Undelivered' }), 'a real failure keeps Undelivered')
+    assert.ok(view.find({ text: /not delivered to the original chat\. The original chat is closed\./ }))
+  })
+  // A sender exists and the hand-off failed: real failure wording.
+  await withPanel(worker(list, stores().requests, 50, allAvailable, { state: 'available' }), async (view) => {
+    await view.emit('workspace.changed', ctx('library-local'))
+    assert.ok(!view.find({ text: 'Saved · awaiting delivery' }))
+    await view.press({ label: 'Choose the catalogue layout' })
+    assert.ok(view.find({ text: /Saved in Decision Inbox, but not delivered to the original chat\. Orca could not hand it to that chat\./ }))
   })
 })
 
@@ -514,7 +591,7 @@ test('panel: a failed read is truthful and Try again recovers; not-found and for
     await view.press({ label: 'Item #7 question' })
     assert.ok(view.find({ label: 'Could not read this decision' }), 'a read failure is a read failure, not a wide-tab one')
     await view.press({ text: 'Try again' })
-    assert.ok(view.find({ label: 'Where to answer' }))
+    assert.ok(view.find({ text: /^Answer in Orca's Bot Items/ }))
   })
   for (const [code, title] of [['not-found', 'Decision not found'], ['forbidden', 'No access to this decision']] as const) {
     await withPanel(worker([item7], { getDecision: { ok: false, code, message: 'Decision is missing or inaccessible.' } }, 50, allAvailable), async (view) => {
@@ -668,8 +745,109 @@ test('panel: a saved-but-undelivered answer stays in the default queue (owner-ap
   return withPanel(worker(decisions.map((d) => (d.questionId === 'layout' ? saved : d)).concat(retryable), {}, 50, allAvailable, mailOff), async (view) => {
     await view.emit('workspace.changed', ctx('library-local'))
     assert.ok(titles(view).includes('Choose the catalogue layout'), 'still needs you with history off')
-    assert.ok(view.find({ text: 'Saved · not delivered' }), 'no retry offered: says it is saved')
+    assert.ok(view.find({ text: 'Saved · awaiting delivery' }), 'no sender, no retry: saved and awaiting delivery')
     assert.ok(view.find({ text: 'Undelivered' }), 'retry offered: plain Undelivered')
+  })
+})
+
+// ---- readable reader: Markdown, single options, disclosure, paging, bottom reply area --------------
+const md = '確認發佈流程。**請決定是否發佈第 42 版。** 參考 [執行紀錄](https://example.invalid/run/42)。\n\n- 測試全部通過\n- 文件已更新'
+const nativeQ = (i: number, size: number | null, more = {}) => nativeRow({ id: `bot-item:u9:e20:${i}`, title: `第 ${i + 1} 題：是否發佈？`, attributed: false, packageId: 'bot-item:u9',
+  background: md, recommendation: '發佈', options: [{ optionId: '0', label: '發佈' }, { optionId: '1', label: '暫緩', detail: '等下一版' }],
+  context: 'Release bot: 第 42 版發佈', activity: [{ label: 'Original ask', at: '2030-06-14T11:00:00Z', text: '問題：是否發佈？\n選項：\n1. 發佈\n2. 暫緩' }],
+  ...(size === undefined ? {} : { package: { index: i, size } }), ...more } as Partial<Decision> & { id: string; title: string })
+/** Every Text node's string in the drawn tree (what reads as plain text, not Markdown). */
+const plainTexts = (view: TestPanel) => {
+  const out: string[] = []
+  const walk = (n: unknown) => {
+    if (!n || typeof n !== 'object') return
+    const t = n as { type?: string; children?: unknown[] }
+    if (t.type === 'Text') out.push((t.children ?? []).filter((c) => typeof c === 'string').join(''))
+    for (const c of t.children ?? []) walk(c)
+  }
+  walk(view.tree()); return out
+}
+
+test('reader: a native Item reads as question, Markdown sections and one set of options, with details on demand', async () => {
+  await withPanel(worker([nativeQ(0, 1)], {}, 50, allAvailable), async (view) => {
+    await view.select({ label: 'Scope' }, 'all')
+    await view.press({ label: '第 1 題：是否發佈？' })
+    assert.ok(view.find({ role: 'heading', text: '第 1 題：是否發佈？' }), 'the active question is the heading')
+    assert.ok(view.find({ text: 'Release bot: 第 42 版發佈' }), 'item context above it')
+    const markdown = view.findAll({ type: 'Markdown' }).map((m) => m.props.content)
+    assert.ok(markdown.includes(md), 'background goes to the sanitized Markdown renderer, bold, links and lists intact')
+    assert.ok(!plainTexts(view).some((t) => /\*\*|\]\(https?:/.test(t)), 'no literal Markdown in plain text')
+    assert.equal(view.findAll({ text: '暫緩 — 等下一版' }).length, 1, 'options shown once (footer)')
+    assert.ok(!view.findAll({ type: 'Markdown' }).some((m) => /選項：/.test(String(m.props.content))), 'the original ask is not drawn until opened')
+    assert.ok(!view.find({ label: 'Status in Orca' }), 'secondary metadata starts collapsed')
+    await view.toggle({ label: 'Details' })
+    assert.ok(view.find({ type: 'KeyValue' }), 'details on demand')
+    await view.toggle({ label: 'Original activity' })
+    assert.ok(view.findAll({ type: 'Markdown' }).some((m) => /選項：/.test(String(m.props.content))), 'original activity verbatim on demand')
+    assert.ok(view.find({ text: 'Question 1 / 1' }))
+    assert.ok(!view.find({ text: 'Submit reply' }) && !view.find({ label: 'Reply text' }), 'no fake reply actions on a native Item')
+  })
+})
+
+test('reader: the reply area is the last, non-scrolling block; the question scrolls above it', async () => {
+  const long = Array.from({ length: 40 }, (_, i) => `第 ${i + 1} 段：這是一段很長的中文背景說明，用來確認回覆區不會被推到看不見的位置。`).join('\n\n')
+  const d = { ...decisions.find((x) => x.questionId === 'schedule')!, background: long }
+  await withPanel(worker(decisions.map((x) => (x.questionId === 'schedule' ? d : x)), stores().requests), async (view) => {
+    await view.emit('workspace.changed', ctx('studio-local'))
+    await view.press({ label: 'Pick a rehearsal slot' })
+    const root = view.tree() as { type: string; props: Record<string, unknown>; children: { type: string; props: Record<string, unknown>; children: unknown[] }[] }
+    assert.equal(root.type, 'Box'); assert.equal(root.props.height, '100%')
+    const [head, body, foot] = root.children
+    assert.equal(head.props.shrink, false); assert.equal(body.props.scroll, 'y'); assert.equal(body.props.grow, true)
+    assert.equal(foot.props.shrink, false, 'reply area keeps its size')
+    const inFoot = JSON.stringify(foot)
+    assert.ok(inFoot.includes('"Reply text"') && inFoot.includes('Submit reply') && inFoot.includes('"Options"'), 'composer and options live in the bottom area')
+    assert.ok(!JSON.stringify(body).includes('"Reply text"'), 'not inside the scrolling question')
+    assert.ok(JSON.stringify(body).includes('第 40 段'), 'the long question is in the scroll area')
+  })
+})
+
+test('reader: Question i / N pages within the package, keeps each draft, and shows unknown totals', async () => {
+  const st = stores()
+  const base = decisions.find((x) => x.questionId === 'schedule')!
+  const q = (i: number) => ({ ...base, questionId: `pkg-q${i}`, title: `Package question ${i + 1}`, packageId: 'pkg-1', createdAt: `2030-06-1${i}T09:00:00Z`, options: [] })
+  await withPanel(worker([q(0), q(1), q(2)], st.requests), async (view) => {
+    await view.emit('workspace.changed', ctx('studio-local'))
+    await view.press({ label: 'Package question 1' })
+    assert.ok(view.find({ text: 'Question 1 / 3' }))
+    assert.equal(view.find({ text: '‹ Previous' })?.disabled, true)
+    await view.type({ label: 'Reply text' }, 'first answer')
+    await view.press({ text: 'Next ›' })
+    assert.ok(view.find({ role: 'heading', text: 'Package question 2' })); assert.ok(view.find({ text: 'Question 2 / 3' }))
+    assert.equal(view.valueOf({ label: 'Reply text' }), '', 'each question has its own draft')
+    await view.type({ label: 'Reply text' }, 'second answer')
+    await view.press({ text: '‹ Previous' })
+    assert.equal(view.valueOf({ label: 'Reply text' }), 'first answer', 'paging back keeps the first draft')
+    await view.press({ text: 'Next ›' })
+    assert.equal(view.valueOf({ label: 'Reply text' }), 'second answer')
+    assert.equal((st.drafts.get('pkg-q0')?.draft as { text: string }).text, 'first answer')
+    assert.equal((st.drafts.get('pkg-q1')?.draft as { text: string }).text, 'second answer')
+  })
+  // Unknown total: the package page has more.
+  await withPanel(worker([nativeQ(0, undefined as unknown as null), nativeQ(1, undefined as unknown as null)], {}, 1, allAvailable), async (view) => {
+    await view.select({ label: 'Scope' }, 'all')
+    await view.press({ label: '第 1 題：是否發佈？' })
+    assert.ok(view.find({ text: /^Question 1 \/ \d\+$/ }), 'unknown total marked with +')
+  })
+  // Declared size from the worker wins: 2 of 5.
+  await withPanel(worker([nativeQ(1, 5)], {}, 50, allAvailable), async (view) => {
+    await view.select({ label: 'Scope' }, 'all')
+    await view.press({ label: '第 2 題：是否發佈？' })
+    assert.ok(view.find({ text: 'Question 2 / 5' }))
+  })
+})
+
+test('reader: a seven-image Chat decision names its evidence and keeps the reply area usable', async () => {
+  await withPanel(worker(decisions, stores().requests), async (view) => {
+    await view.emit('workspace.changed', ctx('studio-local'))
+    await view.press({ label: 'Compare seven paper model views' })
+    assert.ok(view.find({ text: /^7 evidence items \(Front wide, Front portrait, .*Tall detail\): open the wide review to view them\.$/ }))
+    assert.ok(view.find({ label: 'Reply text' }) && view.find({ text: 'Submit reply' }))
   })
 })
 

@@ -2,7 +2,7 @@ import { assert, hostError, mockHost, mountWorker, test } from 'orca/testing'
 import { decisions, reviewReply } from '../fixtures/decisions.ts'
 import { InboxBackend } from './backend.ts'
 import { orcaStorage } from './backend-storage.ts'
-import type { JsonValue } from 'orca/worker'
+import type { JsonValue, PanelRequestContext } from 'orca/worker'
 import type { AgentCaller, DeliveryTarget, InboxBoundary, InboxStorage, SendOutcome } from './backend.ts'
 import type { OwnerCaller } from './backend-protocol.ts'
 import type { Decision, Result, SubmitDecision, SubmitReply } from './contract.ts'
@@ -859,5 +859,52 @@ test('wide navigation reports a sanitized failure stage and preserves independen
   assert.deepEqual(host.callsOf('editor.open').at(-1), { workspaceId: folderId, path: referencePath })
   assert.equal(host.callsOf('workspace.open').length, 0)
   assert.ok(worker.logs.every(line => !line.includes(secret)))
+  await worker.deactivate()
+})
+
+test('the dashboard uses the authorized review editor contribution for Inbox data operations', async () => {
+  const d = question('schedule')
+  const source: AgentCaller = { ...agentFor(d), origin: { ...d.origin, hostId: 'local' }, policyOwnerId: 'decision-inbox-local-desktop' }
+  const host = mockHost({ capabilities: ['storage:own', 'workspace:read'], results: {
+    'workspace.list': { workspaces: [{ id: source.origin.workspaceId, hostId: 'local', kind: 'worktree',
+      name: 'Studio', path: '/studio', branch: null }], truncated: false }
+  } })
+  let backend!: InboxBackend
+  let surface: 'panel' | 'editor' = 'editor'
+  const worker = await mountWorker({ default(orca) {
+    // The test bridge exposes only panel IDs. Use the same host context shape
+    // as an actual forwarded editor request.
+    const handle = ((name: string, handler: (input: unknown, context: PanelRequestContext) => unknown) =>
+      Reflect.apply(orca.panels.handle, orca.panels, [name, (input: unknown, context: PanelRequestContext) =>
+        handler(input, { ...context, panel: { ...context.panel, surface } })
+      ])) as typeof orca.panels.handle
+    backend = registerDesktopWorker({ ...orca, panels: { ...orca.panels, handle } }, {
+      hints: async () => [], removeHint: async () => {},
+      async cli(args) {
+        if (args.join(' ') === 'environment list') return { environments: [] }
+        if (args.join(' ') === 'bot list') return { bots: [] }
+        if (args[1] === 'show') return { kind: 'chat', orcaSessionId: source.origin.sessionId, places: [] }
+        throw new Error('Unexpected CLI command.')
+      }
+    })
+  } }, { host })
+  value(await backend.submitDecision(source, { ...packageInput([d]), evidence: [] }))
+  const dashboard = { panel: 'review' }
+  const page = value(await worker.request('listDecisionPage', { scope, includeHistory: false }, dashboard))
+  assert.equal(page.rows[0].questionId, d.questionId)
+  assert.equal(page.sources?.find(item => item.source === 'plugin')?.state, 'available')
+  assert.equal(page.mail?.state, 'unavailable')
+  const input = { questionId: d.questionId }
+  assert.deepEqual(value(await worker.request('getDecision', input, dashboard)).actions, ['reply'])
+  const draft = value(await worker.request('draft.get', input, dashboard))
+  assert.equal(value(await worker.request('draft.save', { ...input, revision: draft.revision,
+    draft: { text: 'Dashboard draft', annotations: [] }
+  }, dashboard)).revision, 1)
+  assert.equal(value(await worker.request('submitReply', initial(d.questionId, 'dashboard-answer'), dashboard))
+    .delivery.state, 'undelivered')
+  assert.equal(code(await worker.request('getDecision', input, { panel: 'unrelated' })), 'forbidden')
+  assert.equal(code(await worker.request('getDecision', input, { panel: 'dashboard' })), 'forbidden')
+  surface = 'panel'
+  assert.equal(code(await worker.request('listDecisionPage', { scope, includeHistory: true }, dashboard)), 'forbidden')
   await worker.deactivate()
 })

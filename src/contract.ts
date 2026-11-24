@@ -104,12 +104,17 @@ export type DecisionSource = { kind: 'plugin' } | {
   itemLabel?: string
   itemStatus?: string
   observedAt?: string
+  hostLabel?: string
 }
 
 export type DecisionAction = 'reply' | 'retry' | 'follow-up'
 
 export interface Decision extends QuestionInput {
   source?: DecisionSource
+  context?: string
+  activity?: { label: string; at?: string; text: string }[]
+  nativeLinks?: { kind: string; ref: string; label: string; url?: string }[]
+  package?: { index: number; size: number | null; questionIds?: string[] }
   actions?: DecisionAction[]
   revision: number
   requestId: string

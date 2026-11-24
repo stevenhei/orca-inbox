@@ -34,20 +34,29 @@ export async function removeHint(name) {
   if (hintPattern.test(name)) await rm(join(hintDirectory, name), { force: true })
 }
 
-export function localOrca(args) {
+export function localOrca(args, environment = 'local', runtimeId) {
   const bundled = join(homedir(), '.orca', 'cli', 'bin', 'orca')
   const env = { ...process.env }
   for (const key of ['ORCA_AGENT_SESSION_ID', 'ORCA_AGENT_SESSION_SPAWN_TOKEN', 'ORCA_AGENT_SESSION_TOOL_TOKEN',
     'ORCA_TERMINAL_HANDLE', 'ORCA_BOT_TOOLS_TOKEN', 'ORCA_PANE_KEY', 'ORCA_PAIRING_CODE', 'ORCA_ENVIRONMENT']) delete env[key]
   return new Promise((resolve, reject) => {
-    execFile(existsSync(bundled) ? bundled : 'orca', [...args, '--environment', 'local', '--json'],
-      { env, timeout: 2500, maxBuffer: 2 * 1024 * 1024, windowsHide: true }, (_error, stdout) => {
+    const route = args[0] === 'environment' && args[1] === 'list' ? [] : ['--environment', environment]
+    // The local Bot roster may wait for Orca's own four-second paired fan-out.
+    const timeout = environment === 'local' && args[0] === 'bot' && args[1] === 'list' ? 8500
+      : environment === 'local' ? 2500 : 4000
+    execFile(existsSync(bundled) ? bundled : 'orca', [...args, ...route, '--json'],
+      { env, timeout, maxBuffer: 2 * 1024 * 1024, windowsHide: true }, (_error, stdout) => {
         try {
           const envelope = JSON.parse(stdout)
-          if (envelope.ok === true) resolve(envelope.result)
-          else reject(new Error('Orca CLI denied or could not perform the operation.'))
+          if (envelope.ok === true) {
+            if (runtimeId && envelope._meta?.runtimeId !== runtimeId) {
+              reject(Object.assign(new Error('Orca returned a different runtime identity.'), { code: 'runtime_mismatch' }))
+            } else resolve(envelope.result)
+          } else {
+            reject(Object.assign(new Error('Orca CLI denied or could not perform the operation.'), { code: envelope.error?.code }))
+          }
         } catch {
-          reject(new Error('Local Orca CLI is unavailable.'))
+          reject(Object.assign(new Error('Orca CLI is unavailable.'), { code: _error?.killed ? 'timeout' : 'cli_unavailable' }))
         }
       })
   })

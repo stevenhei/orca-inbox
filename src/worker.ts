@@ -110,15 +110,23 @@ export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
     // Both host calls use Orca's canonical workspace ID. Confirm focus around
     // the inventory read, since a panel-supplied ID establishes no host binding.
     const before = await orca.host.call('workspace.readContext')
-    if (before?.workspaceId !== workspaceId) throw missing('Current focused workspace identity')
+    if (before?.workspaceId !== workspaceId) {
+      throw new InboxError('unavailable', 'The focused workspace could not be verified. Switch to All workspaces.')
+    }
     const { workspaces, truncated } = await orca.host.call('workspace.list')
     const after = await orca.host.call('workspace.readContext')
     const matches = workspaces.filter(item => item.id === workspaceId)
-    if (after?.workspaceId !== workspaceId || matches.length > 1 || (truncated && matches.length === 0)) {
-      throw missing('Unambiguous focused workspace identity')
+    if (after?.workspaceId !== workspaceId) {
+      throw new InboxError('unavailable', 'Workspace focus changed during verification. Switch to All workspaces.')
+    }
+    if (matches.length > 1) {
+      throw new InboxError('unavailable', 'Multiple hosts report the focused workspace ID. Switch to All workspaces.')
+    }
+    if (truncated && matches.length === 0) {
+      throw new InboxError('unavailable', 'The workspace inventory was incomplete. Switch to All workspaces.')
     }
     const workspace = matches[0]
-    if (!workspace) throw new InboxError('not-found', 'Workspace is missing.')
+    if (!workspace) throw new InboxError('unavailable', 'The focused workspace is missing from the inventory. Switch to All workspaces.')
     return { hostId: workspace.hostId ?? 'local', workspaceId }
   }))
 
@@ -145,10 +153,25 @@ export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
 
   orca.panels.handle('listDecisionPage', (input, context) => withOwner(context, async caller => {
     if (!local) return backend.listDecisionPage(caller, input)
-    const [pending, native] = await Promise.all([input?.cursor ? hintsPending : syncHints(caller), nativePage(local.cli)])
+    const selection = input?.scope
+    const host = selection?.kind === 'workspace' ? selection.workspace?.hostId : undefined
+    if (selection?.kind === 'workspace' && !caller.workspaces.some(workspace =>
+      workspace.hostId === host && workspace.workspaceId === selection.workspace?.workspaceId)) {
+      return result(() => { throw new InboxError('forbidden', 'Inbox workspace is missing or inaccessible.') })
+    }
+    const remoteScope = Boolean(host && host !== 'local')
+    const [pending, native] = await Promise.all([
+      remoteScope ? false : input?.cursor ? hintsPending : syncHints(caller),
+      nativePage(local.cli, caller.workspaces, host)
+    ])
     const page = await backend.listDecisionPage(caller, input, native.rows)
-    const plugin: SourceAvailability = pending
-      ? { source: 'plugin', state: 'partial', message: 'Some Chat submissions are waiting for verification.' }
+    const remoteGap = 'Paired Chat submissions cannot be read yet. The local lookup hint is not exposed by Orca’s paired CLI.'
+    const coverage = [pending ? 'Some Chat submissions are waiting for verification.' : '',
+      native.hasPairedCoverage || (!host && caller.workspaces.some(workspace => workspace.hostId !== 'local')) ? remoteGap : ''
+    ].filter(Boolean)
+    const plugin: SourceAvailability = remoteScope
+      ? { source: 'plugin', state: 'unavailable', message: remoteGap }
+      : coverage.length ? { source: 'plugin', state: 'partial', message: coverage.join(' ') }
       : { source: 'plugin', state: 'available' }
     return page.ok ? { ...page, value: {
       ...page.value, rows: page.value.rows.map(localActions), sources: [plugin, native.source],
@@ -160,7 +183,7 @@ export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
   async function readDecision(caller: OwnerCaller, input: { questionId: string }) {
     const questionId = input?.questionId
     if (local && typeof questionId === 'string' && questionId.startsWith(nativePrefix)) {
-      return result(() => nativeDetail(local.cli, questionId))
+      return result(() => nativeDetail(local.cli, questionId, caller.workspaces))
     }
     const decision = await backend.getDecision(caller, input)
     return local && decision.ok ? { ...decision, value: localActions(decision.value) } : decision
