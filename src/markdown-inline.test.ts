@@ -63,3 +63,42 @@ test('host Markdown input: bare URLs become <url> autolinks; code, links and exi
   assert.equal(autolinkForMarkdown('```\nhttps://x.invalid/fenced\n```\nhttps://x.invalid/after'), '```\nhttps://x.invalid/fenced\n```\n<https://x.invalid/after>')
   assert.equal(autolinkForMarkdown('- 一\n- 二 https://x.invalid/b，結束'), '- 一\n- 二 <https://x.invalid/b>，結束')
 })
+
+// ---- recheck D1 and pre-wrapping lows -------------------------------------------------------------
+test('an unmatched ] ends a bare URL; balanced brackets (IPv6 hosts) are kept', () => {
+  const v = view('see [https://example.invalid/x] here')
+  assert.deepEqual(v.links.map((l) => l[0]), ['https://example.invalid/x'])
+  assert.deepEqual(v.texts, ['see [', '] here'])
+  assert.deepEqual(view('open http://[::1]:8080/a now').links.map((l) => l[0]), ['http://[::1]:8080/a'])
+  assert.deepEqual(view('(see http://[2001:db8::1]/x)').links.map((l) => l[0]), ['http://[2001:db8::1]/x'])
+  assert.deepEqual(view('見 http://[::1]/a]。').links.map((l) => l[0]), ['http://[::1]/a'])
+})
+
+test('a URL used as the label of a non-http(s) link stays plain: readable label, then the destination', () => {
+  for (const [s, dest] of [['[https://example.invalid/label](mailto:x@y.invalid)', '(mailto:x@y.invalid)'], ['[https://ok.invalid](javascript:alert(1))', '(javascript:alert(1))'], ['[file](file:///etc/passwd)', '(file:///etc/passwd)']] as const) {
+    const v = view(s)
+    assert.deepEqual(v.links, [], s)
+    assert.deepEqual(v.tokens.map((t) => t.text), [s.slice(1, s.indexOf(']')), ' ', dest], s)
+    for (const t of v.tokens) if (t.at >= 0) assert.equal(s.slice(t.at, t.at + t.text.length), t.text, 'anchored text matches the source')
+  }
+})
+
+test('URLs inside bold are links; multi-backtick code spans stay code', () => {
+  const v = tokenizeInline('**見 https://x.invalid/a。** 與 ``code `x` https://x.invalid/c``')
+  const strong = v[0] as Extract<InlineToken, { kind: 'strong' }>
+  assert.equal(strong.kind, 'strong')
+  assert.deepEqual(strong.children.map((c) => [c.kind, c.text]), [['text', '見 '], ['link', 'https://x.invalid/a'], ['text', '。']])
+  assert.deepEqual(v.slice(1).map((t) => [t.kind, t.text]), [['text', ' 與 '], ['code', 'code `x` https://x.invalid/c']])
+})
+
+test('panel pre-wrapping respects labels, destinations, multi-backtick and indented code, and HTML tags', () => {
+  assert.equal(autolinkForMarkdown('see [https://example.invalid/x] here'), 'see [<https://example.invalid/x>] here')
+  assert.equal(autolinkForMarkdown('[https://example.invalid/label](mailto:x@y.invalid) ok'), '`https://example.invalid/label (mailto:x@y.invalid)` ok')
+  assert.equal(autolinkForMarkdown('[x](javascript:alert(1))'), '`x (javascript:alert(1))`')
+  assert.equal(autolinkForMarkdown('[a `b`](mailto:z@y.invalid)'), '``a `b` (mailto:z@y.invalid)``')
+  assert.equal(autolinkForMarkdown('[維基](https://en.wikipedia.org/wiki/A_(b))'), '[維基](https://en.wikipedia.org/wiki/A_(b))')
+  assert.equal(autolinkForMarkdown('``x https://x.invalid/a``'), '``x https://x.invalid/a``')
+  assert.equal(autolinkForMarkdown('para\n\n    https://x.invalid/indented\n    more\n\nhttps://x.invalid/after'), 'para\n\n    https://x.invalid/indented\n    more\n\n<https://x.invalid/after>')
+  assert.equal(autolinkForMarkdown('<a href="https://x.invalid/a">a</a> https://x.invalid/b'), '<a href="https://x.invalid/a">a</a> <https://x.invalid/b>')
+  assert.equal(autolinkForMarkdown('open http://[::1]:8080/a now'), 'open <http://[::1]:8080/a> now')
+})

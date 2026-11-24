@@ -322,7 +322,7 @@ if (scenario === 'review') {
     : questionId === 'layout' ? errR('forbidden', 'Not a participant.') : questionId === 'schedule' ? errR('not-found', 'Missing.') : base.getDecision({ questionId })
 } else if (scenario === 'reader') {
   // Two questions in one package, Markdown background and a long Chinese recommendation (synthetic).
-  const md = '確認發佈流程。**請決定是否發佈第 42 版。** 參考 [執行紀錄](https://example.invalid/run/42)。另見 https://example.invalid/notes/7。\n\n- 測試全部通過\n- 文件已更新\n\n參考 https://a.invalid/1、https://b.invalid/2 與 [C 文件](https://en.wikipedia.org/wiki/A_(b))，另見 https://example.invalid/run/42。下一句不是連結。'
+  const md = '確認發佈流程。**請決定是否發佈第 42 版。** 參考 [執行紀錄](https://example.invalid/run/42)。另見 https://example.invalid/notes/7。\n\n- 測試全部通過\n- 文件已更新\n\n參考 https://a.invalid/1、https://b.invalid/2 與 [C 文件](https://en.wikipedia.org/wiki/A_(b))，另見 https://example.invalid/run/42。下一句不是連結。\n\nsee [https://example.invalid/x] here, [https://ok.invalid](javascript:alert(1)) and http://[::1]:8080/a.'
   const long = Array.from({ length: 30 }, (_, i) => `第 ${i + 1} 段：很長的中文建議。`).join('\n\n')
   for (const [i, title] of [[1, '第一題：是否發佈？'], [2, '第二題：何時發佈？']]) {
     db.set(`pkg-a-${i}`, { ...clone(db.get('schedule')), questionId: `pkg-a-${i}`, packageId: 'pkg-a', title, background: md, recommendation: long, createdAt: `2030-06-1${i}T09:00:00Z` })
@@ -741,10 +741,13 @@ if (scenario === 'review') {
   const bare = [...bgField.querySelectorAll('a')].find((a) => a.textContent.startsWith('https://example.invalid/notes'))
   assert.equal(bare.getAttribute('href'), 'https://example.invalid/notes/7'); assert.ok(bgField.textContent.includes('notes/7。')); ok('bare URL linked; trailing 。 stays text')
   // A multi-link CJK sentence: each anchor's href and text, and the text between them.
-  const lastP = [...bgField.querySelectorAll('p')].at(-1)
+  const lastP = [...bgField.querySelectorAll('p')].at(-2)
   assert.deepEqual([...lastP.querySelectorAll('a')].map((a) => [a.getAttribute('href'), a.textContent]),
     [['https://a.invalid/1', 'https://a.invalid/1'], ['https://b.invalid/2', 'https://b.invalid/2'], ['https://en.wikipedia.org/wiki/A_(b)', 'C 文件'], ['https://example.invalid/run/42', 'https://example.invalid/run/42']])
   assert.deepEqual([...lastP.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent), ['參考 ', '、', ' 與 ', '，另見 ', '。下一句不是連結。']); ok('multi-link sentence: hrefs, link text and sibling text exact')
+  const d1p = [...bgField.querySelectorAll('p')].at(-1)
+  assert.deepEqual([...d1p.querySelectorAll('a')].map((a) => [a.getAttribute('href'), a.textContent]), [['https://example.invalid/x', 'https://example.invalid/x'], ['http://[::1]:8080/a', 'http://[::1]:8080/a']])
+  assert.deepEqual([...d1p.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent), ['see [', '] here, ', 'https://ok.invalid', ' ', '(javascript:alert(1))', ' and ', '.']); ok('unmatched ], non-http label and IPv6: anchors and plain text exact')
   const toggle = document.querySelector('[data-k="dock-toggle"]')
   assert.equal(toggle.getAttribute('aria-expanded'), 'false'); assert.equal(byLabel('Reply text').getAttribute('rows'), '2'); ok('dock starts compact')
   await click(toggle)

@@ -797,6 +797,13 @@ test('reader: bare URLs reach Orca\'s Markdown as <url> autolinks with CJK-safe 
     const contents = view.findAll({ type: 'Markdown' }).map((m) => String(m.props.content))
     assert.ok(contents.includes('見 <https://example.invalid/run/42>。下一句，與 [維基](https://en.wikipedia.org/wiki/A_(b))。'), contents.join(' | '))
   })
+  const d1 = nativeQ(0, 1, { background: 'see [https://example.invalid/x] here, [https://ok.invalid](javascript:alert(1)) and http://[::1]:8080/a.' })
+  await withPanel(worker([d1], {}, 50, allAvailable), async (view) => {
+    await view.select({ label: 'Scope' }, 'all')
+    await view.press({ label: '第 1 題：是否發佈？' })
+    const contents = view.findAll({ type: 'Markdown' }).map((m) => String(m.props.content))
+    assert.ok(contents.includes('see [<https://example.invalid/x>] here, `https://ok.invalid (javascript:alert(1))` and <http://[::1]:8080/a>.'), contents.join(' | '))
+  })
 })
 
 test('reader: the reply area is the last, non-scrolling block; the question scrolls above it', async () => {

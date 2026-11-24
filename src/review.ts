@@ -1,6 +1,6 @@
 import type { Annotation, Answer, Decision, Delivery, Evidence, RecordedReply, SubmitReply, Workspace } from './contract.ts'
 import type { DecisionPage, EffectivePolicy, InboxSettings } from './backend-protocol.ts'
-import { tokenizeInline } from './markdown-inline.ts'
+import { tokenizeInline, type InlineToken } from './markdown-inline.ts'
 import { STATE_LABEL, actionsOf, deadlineLabel, isActionable, nativeOf, nativeStatusLabel, order, replyState, shownState, type NativeSource, type ShownState } from './model.ts'
 import {
   call, clock, draftIsEmpty, emptyDraft, failureText, formatInstant, newReplyId, reconcile, replies,
@@ -152,11 +152,14 @@ const rawOffset = new WeakMap<Node, number>()
 const textAt = (s: string, at: number) => { const n = document.createTextNode(s); rawOffset.set(n, at); return n }
 const LIST = /^(\s*)([-*+]|\d+[.)])\s+/
 function inline(parent: HTMLElement, raw: string, start: number, end: number) {
-  // Boundaries (bare URLs, CJK punctuation, balanced parentheses, http(s) only) come from the shared
+  // Boundaries (bare URLs, CJK punctuation, balanced brackets, http(s) only) come from the shared
   // tokenizer; every node keeps its offset in the raw string.
-  for (const t of tokenizeInline(raw, start, end)) {
-    if (t.kind === 'text') parent.append(textAt(t.text, t.at))
-    else if (t.kind === 'strong') parent.append(el('strong', {}, textAt(t.text, t.at)))
+  appendTokens(parent, tokenizeInline(raw, start, end))
+}
+function appendTokens(parent: HTMLElement, tokens: InlineToken[]) {
+  for (const t of tokens) {
+    if (t.kind === 'text') parent.append(t.at < 0 ? document.createTextNode(t.text) : textAt(t.text, t.at))
+    else if (t.kind === 'strong') { const b = el('strong'); appendTokens(b, t.children); parent.append(b) }
     else if (t.kind === 'code') parent.append(el('code', {}, textAt(t.text, t.at)))
     else {
       const href = t.href

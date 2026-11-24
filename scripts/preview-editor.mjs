@@ -192,10 +192,14 @@ async function runShots(dir, wsUrl) {
   }
   // Real Chrome anchors for the multi-link CJK sentence (in the long decision's recommendation).
   await open('?ref=preview-long', 820, 900)
-  const anchors = await evalJs(`(() => { const p = [...document.querySelectorAll('[data-field="recommendation"] p')].at(-1); return { links: [...p.querySelectorAll('a')].map((a) => [a.href, a.textContent]), texts: [...p.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent) } })()`)
+  const anchors = await evalJs(`(() => { const p = [...document.querySelectorAll('[data-field="recommendation"] p')].at(-2); return { links: [...p.querySelectorAll('a')].map((a) => [a.href, a.textContent]), texts: [...p.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent) } })()`)
   check('link boundaries in Chrome: hrefs, link text and following CJK text', JSON.stringify(anchors) === JSON.stringify({
     links: [['https://a.invalid/1', 'https://a.invalid/1'], ['https://b.invalid/2', 'https://b.invalid/2'], ['https://en.wikipedia.org/wiki/A_(b)', 'C 文件'], ['https://example.invalid/run/42', 'https://example.invalid/run/42']],
     texts: ['參考 ', '、', ' 與 ', '，另見 ', '。下一句不是連結。'] }), anchors)
+  const d1 = await evalJs(`(() => { const p = [...document.querySelectorAll('[data-field="recommendation"] p')].at(-1); return { links: [...p.querySelectorAll('a')].map((a) => [a.href, a.textContent]), texts: [...p.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent) } })()`)
+  check('unmatched ], non-http(s) label and IPv6 in Chrome: anchors and plain text', JSON.stringify(d1) === JSON.stringify({
+    links: [['https://example.invalid/x', 'https://example.invalid/x'], ['http://[::1]:8080/a', 'http://[::1]:8080/a']],
+    texts: ['see [', '] here, ', 'https://ok.invalid', ' ', '(javascript:alert(1))', ' and ', '.'] }), d1)
   await evalJs(`[...document.querySelectorAll('[data-field="recommendation"] p')].at(-1).scrollIntoView({ block: 'center' })`); await wait(200)
   files.push(await shot('links-820'))
   // Draft survives an editor source change (reload).
