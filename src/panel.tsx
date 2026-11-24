@@ -9,13 +9,16 @@ import type { InboxSettings } from './backend-protocol.ts'
 import { autolinkForMarkdown } from './markdown-inline.ts'
 import { STATE_LABEL, actionsOf, deadlineLabel, replyState, isActionable, nativeNeedsYou, nativeOf, nativeStatusLabel, order, sameWorkspace, shownState, siblings, undeliveredReplies } from './model.ts'
 import { call, clock, draftIsEmpty, emptyDraft, failureText, formatInstant, newReplyId, reconcile, replies, sourcesOf, transportOf, type Draft, type Failure, type Requester, type SourceStatus } from './client.ts'
-import type { DecisionPage } from './backend-protocol.ts'
+import type { DecisionPage, WorkspaceOptions } from './backend-protocol.ts'
+import { ALL_VALUE, effectiveScope, missing, queueInput, sameScope, scopeFromValue, scopeValue, workspaceChoices, workspaceLabel, type Scope } from './workspace-scope.ts'
 type MailStatus = NonNullable<DecisionPage['mail']>
 
 // Narrow right-sidebar panel, declarative Orca components only. Data comes from the plugin
 // worker (`listDecisionPage`); there is no fixture fallback. Rules:
-//  * Opens on This workspace. Picking All workspaces sticks across focus changes (a plain atom,
-//    never reset when the focused workspace changes).
+//  * One Workspace choice (workspace-scope.ts): All workspaces or one authorized workspace from
+//    `workspace.options`. It follows the focused workspace until the owner chooses; an explicit
+//    choice is never reset by focus changes. When focus is ambiguous or the chosen workspace is
+//    gone, the panel asks instead of widening the scope.
 //  * Scope identity is host + workspace. The focused workspace's host is resolved by the worker
 //    (`workspace.resolve`); the panel never guesses a host.
 //  * Only actionable rows (Awaiting answer, or any reply Undelivered) unless Include history is on.
@@ -25,7 +28,13 @@ type MailStatus = NonNullable<DecisionPage['mail']>
 
 const req: Requester = (name, input, options) => (plugin.request as Requester)(name, input, options)
 
-const scope = atom<'workspace' | 'all'>('workspace')
+/** The owner's explicit Workspace choice; undefined until they choose (then focus applies). */
+const chosen = atom<Scope | undefined>(undefined)
+/** Authorized workspaces (names, hosts), and why they could not be read. */
+const inv = atom<WorkspaceOptions | null>(null)
+const invError = atom<string | null>(null)
+/** The worker refused the chosen workspace (forbidden / not found): ask again. */
+const scopeLost = atom(false)
 const term = atom('')
 const history = atom(false)
 /** The decision whose review tab the worker last opened, by question ID. Set only on success. */
@@ -44,22 +53,16 @@ const now = atom(clock.now())
 let seq = 0
 let focusSeq = 0
 let searchTimer: ReturnType<typeof setTimeout> | null = null
-const queryKey = (sc: 'workspace' | 'all', w: Workspace | null | undefined, t: string, h: boolean) =>
-  `${sc === 'all' ? 'all' : w ? `ws:${w.hostId}:${w.workspaceId}` : 'ws:none'}|${h ? 'h' : '-'}|${t.trim()}`
-
-const pageInput = (sc: 'workspace' | 'all', w: Workspace | null | undefined, t: string, h: boolean, cursor?: string) => ({
-  scope: sc === 'all' ? { kind: 'all' as const } : { kind: 'workspace' as const, workspace: { hostId: w!.hostId, workspaceId: w!.workspaceId } },
-  ...(t ? { query: t } : {}),
-  includeHistory: h,
-  timeZone: clock.zone(),
-  ...(cursor ? { cursor } : {})
-})
+/** The scope listed now, or null when the owner must choose. */
+const scopeNow = () => (read(scopeLost) ? null : effectiveScope(read(chosen), read(current), read(inv)))
+const queryKey = (sc: Scope | null, t: string, h: boolean) => `${sc ? scopeValue(sc) : 'none'}|${h ? 'h' : '-'}|${t.trim()}`
+const pageInput = (sc: Scope, t: string, h: boolean, cursor?: string) => queueInput(sc, { query: t, includeHistory: h, timeZone: clock.zone(), cursor })
 
 /** Loads the first page of the current query, or the next page with `more`. */
 async function load(more = false) {
-  const sc = read(scope), w = read(current), t = read(term).trim(), h = read(history)
-  const key = queryKey(sc, w, t, h)
-  if (sc === 'workspace' && !w) { set(loading, false); return }
+  const sc = scopeNow(), t = read(term).trim(), h = read(history)
+  const key = queryKey(sc, t, h)
+  if (!sc) { ++seq; set(loading, false); return }
   const prev = read(rows)
   const cursor = more && prev?.key === key ? prev.nextCursor : undefined
   if (more && !cursor) return
@@ -68,9 +71,11 @@ async function load(more = false) {
   const supersededRefresh = refreshing
   refreshing = false
   set(loading, more ? 'more' : 'first')
-  const r = await call(req, 'listDecisionPage', pageInput(sc, w, t, h, cursor))
+  const r = await call(req, 'listDecisionPage', pageInput(sc, t, h, cursor))
   if (mine !== seq) return // a newer query, scope or refresh won; it owns the loading state
   set(loading, false)
+  // The worker refuses a chosen workspace that is no longer authorized: ask, never widen.
+  if (!r.ok && sc.kind === 'workspace' && read(chosen)?.kind === 'workspace' && (r.code === 'forbidden' || r.code === 'not-found')) { set(scopeLost, true); return }
   if (supersededRefresh && r.ok) invalidated()
   if (r.ok) {
     const seen = new Set(cursor ? prev!.list.map((d) => d.questionId) : [])
@@ -89,9 +94,10 @@ const MAX_REFRESH_PAGES = 20
  */
 let refreshing = false
 async function refresh() {
-  const sc = read(scope), w = read(current), t = read(term).trim(), h = read(history)
-  const key = queryKey(sc, w, t, h)
+  const sc = scopeNow(), t = read(term).trim(), h = read(history)
+  const key = queryKey(sc, t, h)
   const prev = read(rows)
+  if (!sc) return
   if (!prev || prev.key !== key) return load()
   // This refresh supersedes any in-flight load. If that was "Load more", read its page too, so
   // the owner's request is not dropped.
@@ -105,7 +111,7 @@ async function refresh() {
   let sources: SourceStatus[] = []
   let mail: MailStatus | undefined
   do {
-    const r = await call(req, 'listDecisionPage', pageInput(sc, w, t, h, cursor))
+    const r = await call(req, 'listDecisionPage', pageInput(sc, t, h, cursor))
     if (mine !== seq) return
     if (!r.ok) { refreshing = false; set(loading, false); set(loadError, { key, f: r }); return }
     const before = list.length
@@ -140,17 +146,27 @@ async function focus(context: { workspaceId?: string } | null) {
     // Reload when the workspace changed, or when the loaded rows belong to another query (for
     // example after the panel was reopened with state from an earlier run).
     const loadedKey = read(rows)?.key
-    const stale = loadedKey !== queryKey('workspace', r.value, read(term), read(history))
-    if (read(scope) === 'workspace' && (!prev || !sameWorkspace(prev, r.value) || stale)) await load()
+    const stale = loadedKey !== queryKey(scopeNow(), read(term), read(history))
+    if (!read(chosen) && (!prev || !sameWorkspace(prev, r.value) || stale)) await load()
   } else {
     set(current, null)
     set(focusError, failureText(r))
   }
 }
 
-function chooseScope(sc: 'workspace' | 'all') {
-  if (read(scope) === sc) return
-  set(scope, sc)
+/** Authorized workspaces for the Workspace choice; the list reloads if they change what it shows. */
+async function loadInventory() {
+  const before = queryKey(scopeNow(), read(term), read(history))
+  const r = await call(req, 'workspace.options')
+  if (r.ok) { set(inv, r.value); set(invError, null) } else set(invError, failureText(r))
+  if (queryKey(scopeNow(), read(term), read(history)) !== before || !read(rows)) void load()
+}
+/** An explicit Workspace choice: kept across focus changes; a new first-page query. */
+function chooseScope(v: string) {
+  const w = read(current), c = read(chosen)
+  const sc = scopeFromValue(v, read(inv)?.workspaces ?? [], [c?.kind === 'workspace' ? c.workspace : null, w ?? null].filter((x): x is Workspace => !!x))
+  if (!sc || (sameScope(sc, scopeNow()) && !read(scopeLost))) return
+  set(chosen, sc); set(scopeLost, false)
   void load()
 }
 
@@ -498,8 +514,9 @@ export function setup(ctx: PanelContext) {
     clearInterval(tick); if (searchTimer) clearTimeout(searchTimer); if (refreshTimer) clearTimeout(refreshTimer)
     void flushDraft() // never lose a draft when the panel closes
   })
-  // `all` needs no focused workspace; load it now in case the panel starts there.
-  if (read(scope) === 'all') void load()
+  // The Workspace list; `all` needs no focused workspace, so load it now if the panel starts there.
+  void loadInventory()
+  if (read(chosen)?.kind === 'all') void load()
 }
 
 function DecisionRow(props: { d: Decision; all: readonly Decision[]; at: number; complete: boolean }) {
@@ -860,12 +877,13 @@ export default function Panel() {
   const v = read(view)
   if (v.kind === 'decision') return <DecisionView title={v.title} />
   if (v.kind === 'settings') return <SettingsView />
-  const sc = read(scope)
+  const sc = scopeNow()
   const w = read(current)
+  const options = read(inv)?.workspaces ?? []
   const at = read(now)
   const t = read(term)
   const h = read(history)
-  const key = queryKey(sc, w, t, h)
+  const key = queryKey(sc, t, h)
   const scopePart = key.split('|')[0]
   const loaded = read(rows)
   // Rows loaded for another scope never show under this one. While a new search or history
@@ -879,19 +897,22 @@ export default function Panel() {
   const more = !updating && !!loaded?.nextCursor
   const complete = !updating && !more && h && !t.trim()
   const need = all ? all.filter(isActionable).length : 0
-  const label = sc === 'all' ? 'All workspaces' : 'This workspace'
+  const label = !sc ? 'No workspace' : sc.kind === 'all' ? 'All workspaces' : workspaceLabel(sc.workspace, options)
   const sources = all && loaded ? loaded.sources : []
   // "Nothing needs you" is only true for sources that could be read.
   const degraded = sources.some((x) => x.state !== 'available')
 
   let body
-  if (sc === 'workspace' && w === undefined) {
+  const intended = read(chosen) ?? (w ? { kind: 'workspace' as const, workspace: w } : null)
+  if (!sc && !read(chosen) && w === undefined) {
     body = <Skeleton shape="block" lines={4} label="Finding the focused workspace" />
-  } else if (sc === 'workspace' && w === null) {
+  } else if (!sc) {
+    // Ask; the scope is never widened without the owner's choice.
+    const lost = intended?.kind === 'workspace' && (read(scopeLost) || missing(intended.workspace, read(inv)))
     body = (
-      <EmptyState icon="flag" title={read(focusError) ? 'Could not identify this workspace' : 'No workspace is focused'}
-        description={read(focusError) ?? 'Focus a workspace, or show every workspace.'}>
-        <Button size="sm" onPress={() => chooseScope('all')}>Show all workspaces</Button>
+      <EmptyState icon="flag" title={lost ? `${workspaceLabel((intended as { workspace: Workspace }).workspace, options)} is no longer available` : read(focusError) ? 'Could not identify the focused workspace' : 'No workspace is focused'}
+        description={`${lost ? '' : read(focusError) ? `${read(focusError)} ` : ''}Choose a workspace or All workspaces in the Workspace list.`}>
+        <Button size="sm" onPress={() => chooseScope(ALL_VALUE)}>Show all workspaces</Button>
       </EmptyState>
     )
   } else if (!all && err) {
@@ -904,10 +925,10 @@ export default function Panel() {
         icon="check"
         title={t ? 'No matches' : degraded ? `Nothing found in ${label.toLowerCase()} from the sources that could be read` : `Nothing needs you in ${label.toLowerCase()}`}
         description={t ? 'Try another word, or turn on Include history.'
-          : sc === 'workspace' ? 'Switch to All workspaces to check other repos. Bot Items without a workspace appear only there.'
+          : sc.kind === 'workspace' ? 'Choose All workspaces to check other workspaces. Bot Items without a workspace appear only there.'
           : degraded ? 'See the notice above for what could not be checked.' : 'You are all caught up.'}
       >
-        {sc === 'workspace' && !t && <Button size="sm" onPress={() => chooseScope('all')}>Show all workspaces</Button>}
+        {sc.kind === 'workspace' && !t && <Button size="sm" onPress={() => chooseScope(ALL_VALUE)}>Show all workspaces</Button>}
       </EmptyState>
     )
   } else {
@@ -929,10 +950,12 @@ export default function Panel() {
         </Row>
       </Row>
 
-      {/* A radio group exposes which scope is selected to assistive technology. */}
-      <RadioGroup label="Scope" orientation="horizontal" value={sc}
-        options={[{ value: 'workspace', label: 'This workspace' }, { value: 'all', label: 'All workspaces' }]}
-        onChange={(v) => chooseScope(v === 'all' ? 'all' : 'workspace')} />
+      {/* One Workspace choice: All workspaces or one authorized workspace (host shown for equal names). */}
+      {/* Orca's Select shows its placeholder for no value; option values must be non-empty. */}
+      <Select label="Workspace" {...(sc ? { value: scopeValue(sc) } : {})} placeholder="Choose a workspace…"
+        options={workspaceChoices(read(inv), sc, sc ? null : w).filter((o) => o.value)} onChange={chooseScope} />
+      {read(invError) && <Text muted size="xs">{`Could not list your workspaces. ${read(invError)}`}</Text>}
+      {read(inv)?.truncated && <Text muted size="xs">Some workspaces could not be listed.</Text>}
 
       <Input label="Search" type="search" placeholder="Title, background, option, ID, 中文…" value={t} onChange={search} />
       <Checkbox label="Include history" description="Submitted, received and answered" checked={h} onChange={toggleHistory} />

@@ -90,6 +90,12 @@ export function createMockOrca({ ref, history = false }) {
   }
   const handlers = {
     'workspace.resolve': () => ok({ hostId: origins.studio.hostId, workspaceId: origins.studio.workspaceId }),
+    // Synthetic authorized inventory: equal names on two hosts and an empty workspace.
+    'workspace.options': () => ok({ workspaces: [
+      { hostId: 'local', workspaceId: 'studio', name: 'Paper Studio', hostLabel: 'Local Orca' },
+      { hostId: 'local', workspaceId: 'library', name: 'Seed Catalogue', hostLabel: 'Local Orca' },
+      { hostId: 'paired', workspaceId: 'studio', name: 'Paper Studio' },
+      { hostId: 'local', workspaceId: 'annex', name: 'Quiet Annex', hostLabel: 'Local Orca' }] }),
     listDecisionPage: page,
     getDecision: ({ questionId }) => (db.has(questionId) ? ok(clone(db.get(questionId))) : err('not-found', 'Decision is missing or inaccessible.')),
     'draft.get': ({ questionId }) => ok(draft(questionId)),

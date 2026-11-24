@@ -43,7 +43,13 @@ export interface DecisionPage {
   nextCursor?: string
 }
 
+export interface WorkspaceOptions {
+  workspaces: (Workspace & { name: string; hostLabel?: string })[]
+  truncated?: boolean
+}
+
 export interface InboxUiRequests {
+  'workspace.options': { input: undefined; output: Result<WorkspaceOptions> }
   'workspace.resolve': { input: { workspaceId: string }; output: Result<Workspace> }
   'settings.repos': { input: undefined; output: Result<string[]> }
   listDecisionPage: { input: DecisionPageInput; output: Result<DecisionPage> }
@@ -68,4 +74,4 @@ declare module 'orca' {
   }
 }
 
-export type OwnerCaller = { kind: 'owner'; id: string; workspaces: readonly Workspace[]; repos: readonly string[] }
+export type OwnerCaller = { kind: 'owner'; id: string; workspaces: readonly Workspace[]; repos: readonly string[]; workspaceOptions?: WorkspaceOptions }

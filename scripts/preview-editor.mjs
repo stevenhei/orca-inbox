@@ -303,6 +303,17 @@ async function runShots(dir, wsUrl) {
     const esc = await evalJs(`({ composer: !!document.querySelector('.d-nc'), sheet: !!document.querySelector('.d-sheet'), focus: document.activeElement?.getAttribute('data-k'), notes: document.querySelector('[data-k="notes-open"]').textContent })`)
     check(`image note (${label}): ✎ opens the composer with the caption; Esc dismisses only it, focus back on ✎`, inc.title === 'Note on Side square' && /fold depth/.test(inc.quote ?? '') && !esc.composer && esc.sheet && esc.focus === 'fig-note-model-3' && esc.notes === notesBefore, { inc, esc, notesBefore })
   }
+  // Workspace: one select, focused workspace by name, equal names with host, empty workspace, real scopes.
+  for (const [w, h, label] of [[1600, 900, 'wide-1600'], [820, 900, 'wide-820'], [390, 844, 'narrow-390']]) {
+    await open('?ref=dashboard', w, h)
+    const ws0 = await evalJs(`(() => { const s = document.querySelector('[data-k="ws-select"]'); return { label: s.getAttribute('aria-label'), value: s.value, text: s.selectedOptions[0]?.textContent, options: [...s.options].filter((o) => !o.disabled).map((o) => o.textContent), inTabsRow: !!s.closest('.d-tabs-row'), groupBy: !!document.querySelector('.d-toolbar [data-k="group-by"]') } })()`)
+    check(`workspace (${label}): one select in the tabs row naming the focused workspace; equal names show the host; empty workspace offered`,
+      ws0.label === 'Workspace' && ws0.inTabsRow && ws0.groupBy && ws0.text === 'Paper Studio · Local Orca' && JSON.stringify(ws0.options) === JSON.stringify(['All workspaces', 'Paper Studio · Local Orca', 'Seed Catalogue', 'Paper Studio · paired', 'Quiet Annex']), ws0)
+    await evalJs(`(() => { const s = document.querySelector('[data-k="ws-select"]'); s.value = [...s.options].find((o) => o.textContent === 'Quiet Annex').value; s.dispatchEvent(new Event('change', { bubbles: true })) })()`); await wait(500)
+    const empty = await evalJs(`({ rows: document.querySelectorAll('tr.d-row').length, empty: document.querySelector('.d-empty')?.textContent, value: document.querySelector('[data-k="ws-select"]').selectedOptions[0].textContent })`)
+    files.push(await shot(`workspace-${label}-empty`))
+    check(`workspace (${label}): an empty workspace is a normal empty state and stays selected`, empty.rows === 0 && /Nothing needs you in Quiet Annex/.test(empty.empty ?? '') && empty.value === 'Quiet Annex', empty)
+  }
   // Grouping: a labelled Group by control in the toolbar; groups as clear bands, title closer to its own rows.
   for (const [w, h, label] of [[1600, 900, 'wide-1600'], [820, 900, 'wide-820'], [390, 844, 'narrow-390']]) {
     await open('?ref=dashboard&history=1', w, h)

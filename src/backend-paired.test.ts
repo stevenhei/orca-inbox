@@ -1,4 +1,4 @@
-import { assert, mockHost, mount, mountWorker, test } from 'orca/testing'
+import { assert, hostError, mockHost, mount, mountWorker, test } from 'orca/testing'
 import type { Decision, Result } from './contract.ts'
 import { nativeDetail, nativePage } from './backend-orca.ts'
 import { registerDesktopWorker } from './worker.ts'
@@ -128,10 +128,11 @@ test('paired native reads isolate equal host IDs, verify attribution, preserve s
   const view = await mount(panel, { host: mockHost({ capabilities: ['storage:own', 'workspace:read'], requests: {
     listDecisionPage: input => worker.request('listDecisionPage', input, caller),
     getDecision: input => worker.request('getDecision', input, caller),
+    'workspace.options': input => worker.request('workspace.options', input, caller),
     'workspace.resolve': input => worker.request('workspace.resolve', input, caller)
   } }) })
   try {
-    await view.select({ label: 'Scope' }, 'all')
+    await view.select({ label: 'Workspace' }, 'all')
     for (let i = 0; i < 10 && !view.find({ label: 'Paired question' }); i++) await new Promise(resolve => setTimeout(resolve, 30))
     assert.ok(view.find({ label: 'Local question' }))
     assert.ok(view.find({ label: 'Paired question' }))
@@ -217,4 +218,60 @@ test('workspace scope preserves a unique host-qualified focus and rejects a coll
   assert.deepEqual(value(await worker.request('workspace.resolve', { workspaceId: focused }, caller)),
     { workspaceId: bound, hostId: 'runtime:paired-a' })
   await worker.deactivate()
+})
+
+test('workspace options expose the authorized host inventory, including empty and same-name workspaces', async () => {
+  const row = { kind: 'worktree', name: 'Studio', path: '/private/workspace', branch: 'private-branch' }
+  const workspaces = [
+    { ...row, id: localWorkspace.workspaceId, hostId: localWorkspace.hostId },
+    { ...row, id: pairedWorkspace.workspaceId, hostId: pairedWorkspace.hostId },
+    { ...row, id: 'folder:empty', hostId: null, kind: 'folder', name: 'Empty folder' }
+  ]
+  const host = mockHost({ capabilities: ['storage:own', 'workspace:read'], results: {
+    'workspace.list': { workspaces, truncated: false },
+    'workspace.readContext': { workspaceId: 'folder:empty', branch: '', displayName: 'Empty folder', terminals: [] }
+  } })
+  const worker = await mountWorker({ default(orca) {
+    registerDesktopWorker(orca, {
+      async cli(args) {
+        if (args.join(' ') === 'bot list') return { bots: [] }
+        throw new Error('Options must not discover hosts or list decisions.')
+      },
+      hints: async () => [], removeHint: async () => {}
+    })
+  } }, { host })
+  try {
+    const options = () => worker.request('workspace.options', undefined, caller)
+    const denied = await worker.request('workspace.options', undefined, { panel: 'unrelated' })
+    assert.ok(!denied.ok && denied.code === 'forbidden')
+    assert.equal(host.callsOf('workspace.list').length, 0)
+    assert.deepEqual(value(await options()), { workspaces: [
+      { ...localWorkspace, name: 'Studio', hostLabel: 'Local Orca' },
+      { ...pairedWorkspace, name: 'Studio' },
+      { hostId: 'local', workspaceId: 'folder:empty', name: 'Empty folder', hostLabel: 'Local Orca' }
+    ] })
+    assert.equal(host.callsOf('workspace.list').length, 1)
+    assert.equal(host.callsOf('workspace.readContext').length, 0)
+    const emptyScope = { kind: 'workspace' as const, workspace: { hostId: 'local', workspaceId: 'folder:empty' } }
+    const list = () => worker.request('listDecisionPage', { scope: emptyScope, includeHistory: false }, caller)
+    assert.deepEqual(value(await list()).rows, [])
+
+    host.respond('workspace.list', { workspaces: [workspaces[2]], truncated: true })
+    assert.deepEqual(value(await options()), { workspaces: [
+      { ...emptyScope.workspace, name: 'Empty folder', hostLabel: 'Local Orca' }
+    ], truncated: true })
+    assert.deepEqual(value(await worker.request('workspace.resolve', { workspaceId: 'folder:empty' }, caller)), emptyScope.workspace)
+    assert.deepEqual(value(await list()).rows, [])
+
+    host.respond('workspace.list', { workspaces: [], truncated: false })
+    assert.deepEqual(value(await options()), { workspaces: [] })
+    const stale = await list()
+    assert.ok(!stale.ok && stale.code === 'forbidden')
+    host.respond('workspace.list', () => { throw hostError('not_permitted', 'private inventory denial') })
+    const unavailable = await options()
+    assert.ok(!unavailable.ok && unavailable.code === 'unavailable')
+    assert.ok(!JSON.stringify(unavailable).includes('private inventory denial'))
+  } finally {
+    await worker.deactivate()
+  }
 })

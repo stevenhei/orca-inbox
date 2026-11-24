@@ -44,7 +44,7 @@ Run everything: `npm test` (typecheck, `orca plugin test`, `orca plugin check`, 
 | Topic | Decision |
 | --- | --- |
 | Flow | The panel is a scan list. Selecting a row opens the wide review tab. No inline answering in the panel. **0.1.1 hotfix (needs owner confirmation):** because Orca may refuse to open the wide tab, a row now opens its detail inside the panel (Bot Items read-only with options and where to answer; Chat decisions with options, reply text, drafts and the same reply-ID and first-answer rules), the gear opens settings inside the panel, **← Back to list** returns, and **Open wide review** / **Open in a wide tab** is optional. A wide-tab failure is shown as "The wide tab did not open … Only the wide tab failed", separately from read failures ("Could not read this decision", "Decision not found", "No access to this decision"). |
-| Scope | Segmented control: **This workspace** / **All workspaces**. Opens on This workspace. An explicit All workspaces choice survives focus changes. Scope identity is `hostId` plus `workspaceId`, never `workspaceId` alone. |
+| Scope | One **Workspace** choice: **All workspaces** or one named authorized workspace. Opens on the focused workspace; an explicit choice survives focus changes; ambiguous focus or a vanished choice asks, never widens. Scope identity is `hostId` plus `workspaceId`, never `workspaceId` alone. |
 | Actionable rows | Shown by default: **Awaiting answer** and **Undelivered**. **Submitted / awaiting confirmation** and **Agent received** appear only with **Include history**. |
 | One row per question | A package is not one row. Each question is its own row, sorted on its own. Rows from the same package carry a "Package · N questions" badge. |
 | Deadlines in the list | Relative text only ("Overdue 21h", "Due in 3h", "Due in 2d"). The full timestamp belongs to the wide review. |
@@ -68,7 +68,7 @@ Proposed by design and **not explicitly confirmed** by the owner: keeping the si
 
 `+` menu / command palette → **Decision Inbox dashboard** (`newFiles` template `templates/dashboard.orca-decision`, content `{"view":"dashboard"}`) opens in the existing `review` editor.
 
-**List.** Tabs **Pending** (actionable) / **Answered** / **All** with counts (arrow keys move between tabs), and the **Workspace** picker at the top right of the same row (This workspace, All workspaces, or one workspace seen in the rows; it adds no filter chip). The toolbar has **Priority**, **Status**, **Search** (sent to the worker, debounced), **Reset**, and, set apart from the filters, a labelled **Group by** control (Urgency, Priority, Status, Workspace). Below 900px Priority and Status sit behind a **Filters** toggle. Active filters show as removable chips. Source and mail notices appear once above the table; **Load more** pages the worker.
+**List.** Tabs **Pending** (actionable) / **Answered** / **All** with counts (arrow keys move between tabs), and the **Workspace** select at the top right of the same row: **All workspaces** or exactly one authorized workspace from `workspace.options` (empty ones included; equal names show the host). It starts on the focused workspace by name, stays fixed once chosen, asks instead of widening when focus is ambiguous or the chosen workspace disappears, and sends one host-qualified scope to `listDecisionPage` (see [frontend-plugin-contract.md](frontend-plugin-contract.md)); it adds no filter chip. The toolbar has **Priority**, **Status**, **Search** (sent to the worker, debounced), **Reset**, and, set apart from the filters, a labelled **Group by** control (Urgency, Priority, Status, Workspace). Below 900px Priority and Status sit behind a **Filters** toggle. Active filters show as removable chips. Source and mail notices appear once above the table; **Load more** pages the worker.
 
 **Table.** Columns: Question (the title button only: no tags, badges, counts or "Question x/N"), Background snippet, Priority, Status, Source (Chat / Bot Item), Workspace, Due. Each group has a full-width heading band with its name and a count badge, more space above it than below, so it sits with its own rows. The selected row has `aria-current="true"` on its title, a tint, a 4px bar and a bold title. Arrow keys move between row titles. Below 900px rows become cards and the source and workspace show inline.
 
@@ -76,7 +76,7 @@ Proposed by design and **not explicitly confirmed** by the owner: keeping the si
 
 ## Narrow panel
 
-Top to bottom: title and "N need you" badge with the settings gear; scope (`RadioGroup`, so the selected scope is exposed); search (sent to the worker, debounced); Include history; source and load notices; the list; **Load more** while pages remain. Invalidations refresh the loaded pages in place.
+Top to bottom: title and "N need you" badge with the settings gear; the same single **Workspace** choice as the dashboard (Orca `Select`; shared rules in [workspace-scope.ts](../src/workspace-scope.ts)); search (sent to the worker, debounced); Include history; source and load notices; the list; **Load more** while pages remain. Invalidations refresh the loaded pages in place.
 
 Each row shows: question title; project and workspace; priority badge (P0 danger, P1 warning, others neutral); relative deadline badge (danger when overdue); a state badge when the state is not Awaiting answer; a package badge; and `Blocks: …` text. Row press opens the review for that `questionId`.
 
@@ -85,7 +85,7 @@ Sort: P0 first; then overdue or due the same UTC day; then everything else. Insi
 | State | Representation |
 | --- | --- |
 | Loading | `Skeleton` block, label "Loading decisions". |
-| Empty (This workspace) | `EmptyState` "Nothing needs you in this workspace" with a **Show all workspaces** button. |
+| Empty (one workspace) | `EmptyState` "Nothing needs you in <workspace name>" with a **Show all workspaces** button (an explicit choice). |
 | Empty (All workspaces) | "You are all caught up." |
 | No search match | "No matches. Try another word, or turn on Include history." |
 | Refresh failed | Warning `Callout` "Showing the last loaded list" with the reason, "Nothing is sent from this list", and **Retry loading**. |
@@ -136,7 +136,7 @@ The panel uses Orca's built-in keyboard handling. In the editor: arrow keys move
 
 Covered by tests today:
 - Sort across scopes: `room-route`, `room-reset`, `stage`, `layout`, `image-review`, `schedule` (`inbox.test.tsx`).
-- This workspace on local `studio` shows only `image-review` and `schedule`; paired `studio` is excluded (`inbox.test.tsx`).
+- The local `studio` workspace shows only `image-review` and `schedule`; paired `studio` is excluded (`inbox.test.tsx`).
 - Search: `layout` by ID, `contrast` by background, `Fold-out` by option, `錄音` by recommendation; `matte sample` finds `layout` only with the history fixture and history on.
 - `historyExample` is Agent received and hidden by default.
 - Seven-image review, notes, expired snapshot, submit, and the current state; answered thread, appended follow-up and undelivered retry; settings validation, exceptions, preview and save; not-found alert (`dom-smoke.mjs`).

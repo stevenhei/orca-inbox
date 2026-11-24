@@ -105,6 +105,11 @@ export function registerWorker(orca: OrcaWorkerApi, boundary: WorkerBoundary) {
     })
   }
 
+  orca.panels.handle('workspace.options', (_input, context) => withOwner(context, caller => result(() => {
+    if (!caller.workspaceOptions) throw missing('Workspace choices')
+    return caller.workspaceOptions
+  })))
+
   orca.panels.handle('workspace.resolve', input => result(async () => {
     const workspaceId = id(object(input).workspaceId, 'workspaceId', 1024)
     // Both host calls use Orca's canonical workspace ID. Confirm focus around

@@ -23,12 +23,19 @@ export async function desktopOwner(orca: OrcaWorkerApi, context: PanelRequestCon
     !(surface === 'panel' && contributionId === 'inbox' || surface === 'editor' && contributionId === 'review')) {
     throw new InboxError('forbidden', 'Use the Decision Inbox desktop panel or editor.')
   }
-  const { workspaces } = await orca.host.call('workspace.list')
+  const { workspaces, truncated } = await orca.host.call('workspace.list')
   const scoped = workspaces.map(w => ({ ...w, hostId: w.hostId ?? 'local' }))
     .filter((w, _, all) => all.filter(other => other.id === w.id && other.hostId === w.hostId).length === 1)
   const local = scoped.filter(w => w.hostId === 'local')
-  return { kind: 'owner', id: localOwner, workspaces: scoped.map(w => ({ hostId: w.hostId, workspaceId: w.id })),
-    repos: [...new Set(local.flatMap(w => w.projectId ? [w.projectId] : []))] }
+  return {
+    kind: 'owner', id: localOwner, workspaces: scoped.map(w => ({ hostId: w.hostId, workspaceId: w.id })),
+    repos: [...new Set(local.flatMap(w => w.projectId ? [w.projectId] : []))],
+    workspaceOptions: {
+      workspaces: scoped.map(w => ({ hostId: w.hostId, workspaceId: w.id,
+        name: w.name.trim() || 'Unnamed workspace', ...(w.hostId === 'local' ? { hostLabel: 'Local Orca' } : {}) })),
+      ...(truncated || scoped.length !== workspaces.length ? { truncated: true } : {})
+    }
+  }
 }
 
 export function localInboxBoundary(cli: Cli): InboxBoundary {

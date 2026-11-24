@@ -4,6 +4,7 @@ import * as panel from './panel'
 import { decisions, historyExample, clock as fixtureClock, origins } from '../fixtures/decisions'
 import { actionsOf, dayKey, deadlineLabel, group, isActionable, nativeStatusLabel, order, receiptMatches, searchText, shownState, visible, workspaceKey } from './model'
 import { clock, reconcile } from './client'
+import { workspaceValue } from './workspace-scope'
 import type { Decision, ListDecisions, Result, SubmitReply } from './contract'
 import type { DecisionPage, DraftRecord, InboxSettings, SourceAvailability } from './backend-protocol'
 
@@ -95,6 +96,12 @@ function worker(list: Decision[] = decisions, extra: MockRequests = {}, size = 5
   return {
     'workspace.resolve': ({ workspaceId }: { workspaceId: string }) =>
       workspaces[workspaceId] ? ok(workspaces[workspaceId]) : { ok: false, code: 'not-found', message: 'Unknown workspace.' },
+    // Authorized inventory: two "studio" workspaces on different hosts, and an empty "archive".
+    'workspace.options': () => ok({ workspaces: [
+      { hostId: 'local', workspaceId: 'studio', name: 'studio', hostLabel: 'Local Orca' },
+      { hostId: 'local', workspaceId: 'library', name: 'library', hostLabel: 'Local Orca' },
+      { hostId: 'paired', workspaceId: 'studio', name: 'studio' },
+      { hostId: 'local', workspaceId: 'archive', name: 'archive', hostLabel: 'Local Orca' }] }),
     listDecisionPage: ({ scope, query, includeHistory, cursor, timeZone }: PageInput) => {
       const t = (query ?? '').toLocaleLowerCase()
       const all = order(list.filter((d) => (scope.kind === 'all' ||
@@ -137,21 +144,22 @@ test('panel: This workspace resolves host + workspace through the worker and lis
   assert.ok(view.find({ text: '2 need you' }))
 }))
 
-test('panel: All workspaces survives focus changes; This workspace follows focus', () => withPanel(worker(), async (view) => {
+test('panel: an explicit Workspace choice survives focus changes; choosing one workspace lists only it', () => withPanel(worker(), async (view) => {
   await view.emit('workspace.changed', ctx('studio-local'))
-  await view.select({ label: 'Scope' }, 'all')
+  await view.select({ label: 'Workspace' }, 'all')
   assert.deepEqual(requestsOf(view, 'listDecisionPage').at(-1), { scope: { kind: 'all' }, includeHistory: false, timeZone: 'UTC' })
   assert.deepEqual(titles(view), ALL_ORDER)
   await view.emit('workspace.changed', ctx('library-local'))
   assert.equal(titles(view).length, 6, 'All workspaces stays selected after a focus change')
-  await view.select({ label: 'Scope' }, 'workspace')
+  await view.select({ label: 'Workspace' }, workspaceValue(workspaces['library-local']))
+  assert.deepEqual(requestsOf(view, 'listDecisionPage').at(-1), { scope: { kind: 'workspace', workspace: workspaces['library-local'] }, includeHistory: false, timeZone: 'UTC' })
   assert.deepEqual(titles(view), ['Approve the reading room route', 'Approve the reading room reset window', 'Choose the catalogue layout'])
   assert.ok(view.find({ text: /Overdue 25h/ }), 'relative deadline from the injected clock')
   assert.equal(view.findAll({ text: 'Package · 2 shown' }).length, 2, 'package badge says "shown" while history is filtered')
 }))
 
 test('panel: bounded pages load more in server order without duplicates', () => withPanel(worker(decisions, {}, 4), async (view) => {
-  await view.select({ label: 'Scope' }, 'all')
+  await view.select({ label: 'Workspace' }, 'all')
   assert.deepEqual(titles(view), ALL_ORDER.slice(0, 4))
   assert.ok(view.find({ text: '4+ need you' }), 'count marked partial while more pages exist')
   await view.press({ text: 'Load more' })
@@ -161,16 +169,70 @@ test('panel: bounded pages load more in server order without duplicates', () => 
   assert.ok(view.find({ text: '6 need you' }))
 }))
 
-test('panel: the scope control exposes its selected value (radio group)', () => withPanel(worker(), async (view) => {
+test('panel: one Workspace select names the focused workspace; equal names show the host; empty workspaces are offered', () => withPanel(worker(), async (view) => {
   await view.emit('workspace.changed', ctx('studio-local'))
-  assert.equal(view.find({ label: 'Scope' })?.type, 'RadioGroup')
-  assert.equal(view.valueOf({ label: 'Scope' }), 'workspace')
-  await view.select({ label: 'Scope' }, 'all')
-  assert.equal(view.valueOf({ label: 'Scope' }), 'all')
+  const sel = view.find({ label: 'Workspace' }) as unknown as { type: string; props: { options: { value: string; label: string }[] } }
+  assert.equal(sel?.type, 'Select')
+  assert.equal(view.valueOf({ label: 'Workspace' }), workspaceValue(studio))
+  assert.deepEqual(sel.props.options.map((o) => o.label), ['All workspaces', 'studio · Local Orca', 'library', 'studio · paired', 'archive'])
+  assert.ok(!sel.props.options.some((o) => /This workspace/.test(o.label)), 'no separate "This workspace" choice')
+  await view.select({ label: 'Workspace' }, workspaceValue({ hostId: 'local', workspaceId: 'archive' }))
+  assert.deepEqual(requestsOf(view, 'listDecisionPage').at(-1), { scope: { kind: 'workspace', workspace: { hostId: 'local', workspaceId: 'archive' } }, includeHistory: false, timeZone: 'UTC' })
+  assert.ok(view.find({ label: 'Nothing needs you in archive' }), 'an empty workspace is a normal empty state')
+  await view.select({ label: 'Workspace' }, workspaceValue({ hostId: 'paired', workspaceId: 'studio' }))
+  assert.deepEqual(requestsOf(view, 'listDecisionPage').at(-1), { scope: { kind: 'workspace', workspace: { hostId: 'paired', workspaceId: 'studio' } }, includeHistory: false, timeZone: 'UTC' })
+  assert.deepEqual(titles(view), ['Approve the first lantern trial'], 'paired studio, not local studio')
+  await view.select({ label: 'Workspace' }, 'all')
+  assert.equal(view.valueOf({ label: 'Workspace' }), 'all')
 }))
 
+test('panel: a late answer for the previous workspace never replaces the new one, and its cursor is not reused', () => {
+  let release: (() => void) | null = null
+  const base = worker(decisions, {}, 4)
+  type Page = (x: PageInput) => Result<DecisionPage>
+  const page = base.listDecisionPage as Page
+  const slow: MockRequests = { ...base, listDecisionPage: (i: PageInput) => i.scope.kind === 'all' && !i.cursor && release === null
+    ? new Promise<Result<DecisionPage>>((r) => { release = () => r(page(i)) }) : page(i) }
+  return withPanel(slow, async (view) => {
+    await view.emit('workspace.changed', ctx('studio-local'))
+    // Never await an action while a request is held: start both, then release the slow one.
+    const first = view.select({ label: 'Workspace' }, 'all'); await wait(20)
+    const second = view.select({ label: 'Workspace' }, workspaceValue(workspaces['library-local'])); await wait(20)
+    release!(); await Promise.all([first, second]); await wait(20)
+    assert.deepEqual(titles(view), ['Approve the reading room route', 'Approve the reading room reset window', 'Choose the catalogue layout'])
+    assert.ok(!view.find({ text: 'Load more' }), 'no cursor carried over from the all-workspaces page')
+    assert.ok(requestsOf(view, 'listDecisionPage').every((i) => !(i as PageInput).cursor), 'no request reused another query\'s cursor')
+  })
+})
+
+test('panel: ambiguous focus or a chosen workspace that disappears asks; it never widens to All workspaces', async () => {
+  await withPanel(worker(), async (view) => {
+    await view.emit('workspace.changed', ctx('nowhere'))
+    assert.equal(requestsOf(view, 'listDecisionPage').length, 0, 'nothing listed without a workspace')
+    assert.equal(view.valueOf({ label: 'Workspace' }), '')
+    assert.ok(view.find({ label: 'Could not identify the focused workspace' }))
+    assert.ok(!view.findAll({ type: 'ListItem' }).length)
+  })
+  let gone = false
+  const w = worker()
+  await withPanel({ ...w, listDecisionPage: (i: PageInput): Result<DecisionPage> => (gone && i.scope.kind === 'workspace' ? { ok: false, code: 'forbidden', message: 'Not authorized for that workspace.' } : (w.listDecisionPage as (x: PageInput) => Result<DecisionPage>)(i)) }, async (view) => {
+    await view.emit('workspace.changed', ctx('studio-local'))
+    await view.select({ label: 'Workspace' }, workspaceValue(workspaces['library-local']))
+    gone = true
+    await view.type({ label: 'Search' }, 'route'); await wait(400)
+    // The worker refuses the chosen workspace; a focus change (studio) must not replace the choice.
+    await view.emit('workspace.changed', ctx('studio-local')); await wait(50)
+    assert.ok(view.find({ label: 'library is no longer available' }), 'asks; focus does not override the explicit choice')
+    assert.ok(requestsOf(view, 'listDecisionPage').every((i) => (i as PageInput).scope.kind === 'workspace'), 'never widened to All workspaces')
+    assert.ok(!view.findAll({ type: 'ListItem' }).length, 'no rows from the refused workspace')
+    await view.select({ label: 'Workspace' }, 'all')
+    assert.deepEqual(requestsOf(view, 'listDecisionPage').at(-1), { scope: { kind: 'all' }, query: 'route', includeHistory: false, timeZone: 'UTC' })
+    assert.ok(titles(view).includes('Approve the reading room route'), 'a deliberate choice recovers')
+  })
+})
+
 test('panel: invalidations keep pages loaded with Load more and leave unchanged rows alone', () => withPanel(worker(decisions, {}, 4), async (view) => {
-  await view.select({ label: 'Scope' }, 'all')
+  await view.select({ label: 'Workspace' }, 'all')
   await view.press({ text: 'Load more' })
   assert.equal(titles(view).length, 6)
   const before = requestsOf(view, 'listDecisionPage').length
@@ -183,7 +245,7 @@ test('panel: invalidations keep pages loaded with Load more and leave unchanged 
 }))
 
 test('panel: while searching, the count says it covers matches only', () => withPanel(worker(), async (view) => {
-  await view.select({ label: 'Scope' }, 'all')
+  await view.select({ label: 'Workspace' }, 'all')
   await view.type({ label: 'Search' }, 'reading room')
   await wait(300); await view.settled()
   assert.ok(view.find({ text: '2 matching need you' }))
@@ -214,7 +276,7 @@ test('panel: rows from the worker are trusted, not re-filtered by search text', 
   // A projected row has no searchable body text; the worker says it matched.
   listDecisionPage: () => ok({ rows: [{ ...decisions[0], background: '', recommendation: '', options: [] }] })
 }), async (view) => {
-  await view.select({ label: 'Scope' }, 'all')
+  await view.select({ label: 'Workspace' }, 'all')
   await view.type({ label: 'Search' }, 'Tuesday')
   await wait(300)
   await view.settled()
@@ -262,7 +324,7 @@ test('panel: no focused workspace or an unresolvable host shows a state, never a
   await view.emit('workspace.changed', ctx(undefined))
   assert.ok(view.find({ label: 'No workspace is focused' }))
   await view.emit('workspace.changed', ctx('ambiguous'))
-  assert.ok(view.find({ label: 'Could not identify this workspace' }))
+  assert.ok(view.find({ label: 'Could not identify the focused workspace' }))
   assert.equal(requestsOf(view, 'listDecisionPage').length, 0, 'nothing listed for an unresolved workspace')
   await view.press({ text: 'Show all workspaces' })
   assert.equal(titles(view).length, 6)
@@ -279,7 +341,7 @@ test('panel: worker failures show truthfully, with no fixture fallback', async (
     assert.ok(view.find({ text: /You do not have access\. Owner only\./ }))
   })
   await withPanel({}, async (view) => {
-    await view.select({ label: 'Scope' }, 'all')
+    await view.select({ label: 'Workspace' }, 'all')
     assert.ok(view.find({ text: /does not provide “listDecisionPage”/ }), 'missing handler reported')
     assert.equal(titles(view).length, 0)
   })
@@ -290,7 +352,7 @@ test('panel: a failed refresh keeps and labels the last loaded list', async () =
   const w = worker()
   const page = w.listDecisionPage as (i: PageInput) => Result<DecisionPage>
   await withPanel({ ...w, listDecisionPage: (i: PageInput): Result<DecisionPage> => up ? page(i) : { ok: false, code: 'unavailable', message: 'Disconnected.' } }, async (view) => {
-    await view.select({ label: 'Scope' }, 'all')
+    await view.select({ label: 'Workspace' }, 'all')
     up = false
     await view.post('inbox.changed', {})
     await wait(200); await view.settled()
@@ -345,7 +407,7 @@ test('panel: a Bot Item card shows its details and options in the panel; a faile
     options: [{ optionId: 'a', label: 'Ship it' }, { optionId: 'b', label: 'Hold', detail: 'Wait for the next build' }], background: 'Release bot asks whether build 42 can ship.' })
   const item2 = nativeRow({ id: 'bot-item:u2:e20:0', title: 'Item #2 question', status: 'needs-you', attributed: false })
   await withPanel(worker([item2, item7], { 'review.open': masked }, 50, allAvailable), async (view) => {
-    await view.select({ label: 'Scope' }, 'all')
+    await view.select({ label: 'Workspace' }, 'all')
     await view.press({ label: 'Item #7 question' })
     assert.ok(view.find({ role: 'heading', text: 'Item #7 question' }), 'detail heading')
     assert.ok(view.find({ text: /^Answer in Orca's Bot Items/ }), 'native footer says where to answer')
@@ -534,7 +596,7 @@ test('panel: stale answers from an earlier click never land on the current view'
     'settings.get': () => new Promise((r) => { releaseSettings = () => r(masked) }),
     'settings.repos': ok([])
   }, 50, allAvailable), async (view) => {
-    await view.select({ label: 'Scope' }, 'all')
+    await view.select({ label: 'Workspace' }, 'all')
     const p7 = view.press({ label: 'Item #7 question' }) // slow
     await wait(10)
     const pBack = view.press({ text: '← Back to list' })
@@ -587,7 +649,7 @@ test('panel: a failed read is truthful and Try again recovers; not-found and for
   let fails = 1
   const item7 = nativeRow({ id: 'bot-item:u7:e20:0', title: 'Item #7 question', attributed: false })
   await withPanel(worker([item7], { getDecision: () => fails-- > 0 ? masked : ok(item7) }, 50, allAvailable), async (view) => {
-    await view.select({ label: 'Scope' }, 'all')
+    await view.select({ label: 'Workspace' }, 'all')
     await view.press({ label: 'Item #7 question' })
     assert.ok(view.find({ label: 'Could not read this decision' }), 'a read failure is a read failure, not a wide-tab one')
     await view.press({ text: 'Try again' })
@@ -595,7 +657,7 @@ test('panel: a failed read is truthful and Try again recovers; not-found and for
   })
   for (const [code, title] of [['not-found', 'Decision not found'], ['forbidden', 'No access to this decision']] as const) {
     await withPanel(worker([item7], { getDecision: { ok: false, code, message: 'Decision is missing or inaccessible.' } }, 50, allAvailable), async (view) => {
-      await view.select({ label: 'Scope' }, 'all')
+      await view.select({ label: 'Workspace' }, 'all')
       await view.press({ label: 'Item #7 question' })
       assert.ok(view.find({ label: title }))
       assert.ok(!view.find({ text: 'Try again' }))
@@ -649,7 +711,7 @@ test('panel: one queue labels each source; unattributed Bot Items appear only in
   assert.ok(view.find({ text: 'Needs you' }), 'native status from Orca')
   assert.ok(!titles(view).includes('Rotate the signing key?'), 'unattributed item not in This workspace')
   assert.ok(view.find({ text: '3 need you' }))
-  await view.select({ label: 'Scope' }, 'all')
+  await view.select({ label: 'Workspace' }, 'all')
   assert.ok(titles(view).includes('Rotate the signing key?'))
   assert.ok(view.find({ label: 'Rotate the signing key?' })?.props.description === 'Release bot · item #12 · No workspace attribution')
   assert.ok(!titles(view).includes('Archive old builds?'), 'done native item is history')
@@ -674,7 +736,7 @@ test('panel: Chat decisions unavailable still shows read-only Bot Items', () => 
 
 test('panel: partial Bot Items and an empty list say only what could be checked', () => withPanel(worker([], {}, 50,
   [{ source: 'plugin', state: 'available' }, { source: 'native-item', state: 'partial', message: 'One bot could not be read.' }]), async (view) => {
-  await view.select({ label: 'Scope' }, 'all')
+  await view.select({ label: 'Workspace' }, 'all')
   assert.ok(view.find({ label: 'Some Bot Items could not be read' }))
   assert.ok(view.find({ label: 'Nothing found in all workspaces from the sources that could be read' }), 'no "all caught up" claim')
   assert.ok(!view.find({ label: /^Nothing needs you/ }), 'no "nothing needs you" title while a source is degraded')
@@ -695,7 +757,7 @@ test('panel: all Chat decisions read but mail unavailable: a neutral saved-not-d
   }))
 
 test('panel: mail unavailable does not make an empty list look degraded', () => withPanel(worker([], {}, 50, allAvailable, mailOff), async (view) => {
-  await view.select({ label: 'Scope' }, 'all')
+  await view.select({ label: 'Workspace' }, 'all')
   assert.ok(view.find({ label: 'Nothing needs you in all workspaces' }))
   assert.ok(!view.summary().some((line) => /sources that could be read/.test(line)), 'not shown as degraded')
 }))
@@ -721,7 +783,7 @@ test('panel: a needs_you Bot Item without workspace is visible by default in All
   const item = nativeRow({ id: 'bot-item:native-uid:e42:0', title: 'Approve release notes?', status: 'needs_you', attributed: false })
   const progress = nativeRow({ id: 'bot-item:native-uid:e43:0', title: 'Tag the release?', status: 'in_progress', attributed: false })
   await withPanel(worker([...decisions, item, progress], {}, 50, allAvailable), async (view) => {
-    await view.select({ label: 'Scope' }, 'all')
+    await view.select({ label: 'Workspace' }, 'all')
     assert.ok(titles(view).includes('Approve release notes?'), 'visible with history off')
     assert.ok(!titles(view).includes('Tag the release?'), 'in_progress is history')
     assert.ok(view.find({ text: 'Needs you' }))
@@ -770,7 +832,7 @@ const plainTexts = (view: TestPanel) => {
 
 test('reader: a native Item reads as question, Markdown sections and one set of options, with details on demand', async () => {
   await withPanel(worker([nativeQ(0, 1)], {}, 50, allAvailable), async (view) => {
-    await view.select({ label: 'Scope' }, 'all')
+    await view.select({ label: 'Workspace' }, 'all')
     await view.press({ label: '第 1 題：是否發佈？' })
     assert.ok(view.find({ role: 'heading', text: '第 1 題：是否發佈？' }), 'the active question is the heading')
     assert.ok(view.find({ text: 'Release bot: 第 42 版發佈' }), 'item context above it')
@@ -792,14 +854,14 @@ test('reader: a native Item reads as question, Markdown sections and one set of 
 test('reader: bare URLs reach Orca\'s Markdown as <url> autolinks with CJK-safe boundaries', async () => {
   const item = nativeQ(0, 1, { background: '見 https://example.invalid/run/42。下一句，與 [維基](https://en.wikipedia.org/wiki/A_(b))。' })
   await withPanel(worker([item], {}, 50, allAvailable), async (view) => {
-    await view.select({ label: 'Scope' }, 'all')
+    await view.select({ label: 'Workspace' }, 'all')
     await view.press({ label: '第 1 題：是否發佈？' })
     const contents = view.findAll({ type: 'Markdown' }).map((m) => String(m.props.content))
     assert.ok(contents.includes('見 <https://example.invalid/run/42>。下一句，與 [維基](https://en.wikipedia.org/wiki/A_(b))。'), contents.join(' | '))
   })
   const d1 = nativeQ(0, 1, { background: 'see [https://example.invalid/x] here, [https://ok.invalid](javascript:alert(1)) and http://[::1]:8080/a.' })
   await withPanel(worker([d1], {}, 50, allAvailable), async (view) => {
-    await view.select({ label: 'Scope' }, 'all')
+    await view.select({ label: 'Workspace' }, 'all')
     await view.press({ label: '第 1 題：是否發佈？' })
     const contents = view.findAll({ type: 'Markdown' }).map((m) => String(m.props.content))
     assert.ok(contents.includes('see [<https://example.invalid/x>] here, `https://ok.invalid (javascript:alert(1))` and <http://[::1]:8080/a>.'), contents.join(' | '))
@@ -847,13 +909,13 @@ test('reader: Question i / N pages within the package, keeps each draft, and sho
   })
   // Unknown total: the package page has more.
   await withPanel(worker([nativeQ(0, undefined as unknown as null), nativeQ(1, undefined as unknown as null)], {}, 1, allAvailable), async (view) => {
-    await view.select({ label: 'Scope' }, 'all')
+    await view.select({ label: 'Workspace' }, 'all')
     await view.press({ label: '第 1 題：是否發佈？' })
     assert.ok(view.find({ text: /^Question 1 \/ \d\+$/ }), 'unknown total marked with +')
   })
   // Declared size from the worker wins: 2 of 5.
   await withPanel(worker([nativeQ(1, 5)], {}, 50, allAvailable), async (view) => {
-    await view.select({ label: 'Scope' }, 'all')
+    await view.select({ label: 'Workspace' }, 'all')
     await view.press({ label: '第 2 題：是否發佈？' })
     assert.ok(view.find({ text: 'Question 2 / 5' }))
   })
@@ -885,7 +947,7 @@ function heldWorker(size = 4) {
 test('panel: a refresh during Load more keeps the requested page and clears the loading state', async () => {
   const h = heldWorker(2) // three pages, so Load more stays available afterwards
   await withPanel(h.requests, async (view) => {
-    await view.select({ label: 'Scope' }, 'all')
+    await view.select({ label: 'Workspace' }, 'all')
     h.holdNext((i) => !!i.cursor)
     const more = view.press({ text: 'Load more' }) // in flight, held
     await wait(10)
@@ -905,7 +967,7 @@ test('panel: a refresh during Load more keeps the requested page and clears the 
 test('panel: Load more during a refresh wins, then the refresh re-runs', async () => {
   const h = heldWorker()
   await withPanel(h.requests, async (view) => {
-    await view.select({ label: 'Scope' }, 'all')
+    await view.select({ label: 'Workspace' }, 'all')
     h.holdNext((i) => !i.cursor) // the refresh's first page is held
     const inval = view.post('inbox.changed', {})
     await wait(200)
@@ -930,7 +992,7 @@ test('panel: a failing refresh that supersedes Retry loading leaves Retry availa
     if (holdRetry) { holdRetry = false; return new Promise<Result<DecisionPage>>((r) => { release = () => r(page(i)) }) }
     return up ? page(i) : { ok: false, code: 'unavailable', message: 'Disconnected.' }
   } }, async (view) => {
-    await view.select({ label: 'Scope' }, 'all')
+    await view.select({ label: 'Workspace' }, 'all')
     up = false
     await view.post('inbox.changed', {}); await wait(200); await view.settled()
     assert.ok(view.find({ text: 'Retry loading' }))

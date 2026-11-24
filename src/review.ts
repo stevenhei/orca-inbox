@@ -1,7 +1,8 @@
 import type { Annotation, Answer, Decision, Delivery, Evidence, RecordedReply, SubmitReply, VisibleInlineImage, Workspace } from './contract.ts'
-import type { DecisionPage, EffectivePolicy, InboxSettings } from './backend-protocol.ts'
+import type { DecisionPage, EffectivePolicy, InboxSettings, WorkspaceOptions } from './backend-protocol.ts'
 import { variantDCss } from './dashboard-style.ts'
 import { tokenizeInline, type InlineToken } from './markdown-inline.ts'
+import { effectiveScope, missing, queueInput, sameScope, scopeFromValue, scopeValue, workspaceChoices, workspaceLabel, type Scope } from './workspace-scope.ts'
 import { STATE_LABEL, actionsOf, deadlineLabel, group, isActionable, nativeOf, nativeStatusLabel, order, replyState, shownState, type NativeSource, type ShownState } from './model.ts'
 import {
   call, clock, draftIsEmpty, emptyDraft, failureText, formatInstant, newReplyId, reconcile, replies,
@@ -1779,13 +1780,22 @@ let dashTimer: ReturnType<typeof setTimeout> | null = null
 const sheetNarrow = matchMedia('(max-width: 899px)')
 type Tab = 'pending' | 'answered' | 'all'
 const dash = {
-  tab: 'pending' as Tab, scope: 'workspace' as 'workspace' | 'all', wsFilter: '', priority: '', status: '', group: 'urgency', term: '',
+  // Workspace: `chosen` is the owner's explicit choice (kept for the life of this view); until then
+  // the focused workspace applies. `inv` is the authorized inventory from workspace.options.
+  tab: 'pending' as Tab, chosen: undefined as Scope | undefined, inv: null as WorkspaceOptions | null, invFail: null as Failure | null, scopeLost: null as Failure | null, priority: '', status: '', group: 'urgency', term: '',
   focus: undefined as Workspace | null | undefined, focusFail: null as Failure | null,
   rows: [] as Decision[], next: undefined as string | undefined, sources: [] as SourceStatus[], mail: undefined as { state: 'available' | 'unavailable'; message?: string } | undefined,
   loading: false as false | 'first' | 'more', fail: null as Failure | null, loaded: false, filtersOpen: false
 }
 let shell: { el: HTMLElement; list: HTMLElement; tabs: HTMLElement; wsSel: HTMLSelectElement; status: HTMLSelectElement; sheet: HTMLElement; side: HTMLElement } | null = null
 
+async function loadInventory() {
+  if (dash.inv) return
+  const r = await call(req, 'workspace.options')
+  if (r.ok) { dash.inv = r.value; dash.invFail = null } else dash.invFail = r
+}
+/** The scope the queue lists now, or null when the owner must choose (see workspace-scope.ts). */
+const dashScope = () => (dash.scopeLost ? null : effectiveScope(dash.chosen, dash.focus, dash.inv))
 async function resolveFocus() {
   if (dash.focus !== undefined) return
   const host = (orca as unknown as { host?: { call?: (m: string, p?: unknown) => Promise<{ workspaceId?: string } | null> } }).host
@@ -1796,21 +1806,21 @@ async function resolveFocus() {
   if (r.ok) dash.focus = r.value
   else { dash.focus = null; dash.focusFail = r }
 }
-function pageInput(cursor?: string) {
-  return {
-    scope: dash.scope === 'all' || !dash.focus ? { kind: 'all' as const } : { kind: 'workspace' as const, workspace: { hostId: dash.focus.hostId, workspaceId: dash.focus.workspaceId } },
-    // Every view reads history too: Pending / Answered / All split the same rows.
-    ...(dash.term.trim() ? { query: dash.term.trim() } : {}), includeHistory: true, timeZone: clock.zone(), ...(cursor ? { cursor } : {})
-  }
-}
+// Every tab reads history too: Pending / Answered / All split the same rows.
+const pageInput = (scope: Scope, cursor?: string) => queueInput(scope, { query: dash.term, includeHistory: true, timeZone: clock.zone(), cursor })
 async function loadQueue(more = false) {
-  if (dash.scope === 'workspace') await resolveFocus()
-  if (dash.scope === 'workspace' && !dash.focus) { dash.loaded = true; dash.rows = []; paintQueue(); return }
+  if (!more) { dash.next = undefined; if (dashScopeKey !== currentKey()) dash.rows = [] } // a new query never reuses another query's cursor or rows
+  await Promise.all([resolveFocus(), loadInventory()])
+  const scope = dashScope()
+  if (!scope) { ++dashSeq; dash.loading = false; dash.loaded = true; dash.rows = []; dash.next = undefined; paintQueue(); return }
   const mine = ++dashSeq
   dash.loading = more ? 'more' : 'first'; paintQueue()
-  const r = await call(req, 'listDecisionPage', pageInput(more ? dash.next : undefined))
-  if (mine !== dashSeq) return
+  const r = await call(req, 'listDecisionPage', pageInput(scope, more ? dash.next : undefined))
+  if (mine !== dashSeq) return // a newer query or scope won
   dash.loading = false; dash.loaded = true
+  dashScopeKey = scopeValue(scope)
+  // A chosen workspace the worker no longer lets us read: ask, never widen.
+  if (!r.ok && scope.kind === 'workspace' && dash.chosen?.kind === 'workspace' && (r.code === 'forbidden' || r.code === 'not-found')) { dash.scopeLost = r; dash.rows = []; dash.next = undefined; paintQueue(); return }
   if (r.ok) {
     const seen = new Set(more ? dash.rows.map((x) => x.questionId) : [])
     dash.rows = more ? [...dash.rows, ...r.value.rows.filter((x) => !seen.has(x.questionId))] : r.value.rows
@@ -1819,14 +1829,17 @@ async function loadQueue(more = false) {
   } else dash.fail = r
   paintQueue()
 }
+let dashScopeKey = ''
+const currentKey = () => { const sc = dashScope(); return sc ? scopeValue(sc) : '' }
 async function refreshQueue() {
-  if (dash.scope === 'workspace' && !dash.focus) return
+  const scope = dashScope()
+  if (!scope || dashScopeKey !== scopeValue(scope)) return
   const want = dash.rows.length
   const mine = ++dashSeq
   const rows: Decision[] = []; const seen = new Set<string>()
   let cursor: string | undefined; let pages = 0; let first: DecisionPage | null = null
   do {
-    const r = await call(req, 'listDecisionPage', pageInput(cursor))
+    const r = await call(req, 'listDecisionPage', pageInput(scope, cursor))
     if (mine !== dashSeq) return
     if (!r.ok) { dash.fail = r; paintQueue(); return }
     if (!first) first = r.value
@@ -1859,12 +1872,10 @@ function closeDashSheet() {
 
 // ---- list model ----
 const statusOf = (x: Decision) => { const n = nativeOf(x); return n ? nativeStatusLabel(n.itemStatus) : STATE_LABEL[shownState(x)] }
-const wsKeyOf = (x: Decision) => { const n = nativeOf(x); return n && !n.workspaceAttributed ? '' : `${x.origin.hostId}:${x.origin.workspaceId}` }
 const wsLabel = (x: Decision) => { const n = nativeOf(x); return n && !n.workspaceAttributed ? 'No workspace attribution' : `${x.projectName} · ${x.workspaceName}` }
 function inTab(x: Decision, tab: Tab) { return tab === 'all' || (tab === 'pending') === isActionable(x) }
 function visibleRows(tab: Tab = dash.tab) {
-  return dash.rows.filter((x) => inTab(x, tab) && (!dash.priority || x.priority === dash.priority) && (!dash.status || statusOf(x) === dash.status) &&
-    (!dash.wsFilter || wsKeyOf(x) === dash.wsFilter))
+  return dash.rows.filter((x) => inTab(x, tab) && (!dash.priority || x.priority === dash.priority) && (!dash.status || statusOf(x) === dash.status))
 }
 function grouped(rows: Decision[]): [string, Decision[]][] {
   const now = clock.now(), zone = clock.zone()
@@ -1916,10 +1927,12 @@ function paintQueue() {
     el('button', { type: 'button', class: 'd-tab', role: 'tab', id: `tab-${k}`, 'data-k': `tab-${k}`, 'aria-selected': dash.tab === k ? 'true' : 'false', tabindex: dash.tab === k ? 0 : -1,
       onclick: () => { dash.tab = k; paintQueue(); shell?.tabs.querySelector<HTMLElement>(`#tab-${k}`)?.focus() } }, l, el('span', { class: 'd-n' }, `${visibleRows(k).length}${more}`))))
   // Workspace selector options: this workspace, all workspaces, and each workspace seen in the rows.
-  const seen = new Map<string, string>()
-  for (const x of dash.rows) { const k = wsKeyOf(x); if (k && !seen.has(k)) seen.set(k, wsLabel(x)) }
-  const value = dash.scope === 'workspace' ? 'this' : dash.wsFilter || 'all'
-  shell.wsSel.replaceChildren(...[['this', 'This workspace'], ['all', 'All workspaces'], ...[...seen.entries()]].map(([v, l]) => el('option', { value: v, selected: v === value }, l)))
+  // One Workspace choice: All workspaces or one authorized workspace, from the worker's inventory.
+  const scope = dashScope()
+  const intended = dash.chosen ?? (dash.focus ? { kind: 'workspace' as const, workspace: dash.focus } : null)
+  const shownValue = scope ? scopeValue(scope) : ''
+  shell.wsSel.replaceChildren(...workspaceChoices(dash.inv, scope, scope ? null : dash.focus).map((o) =>
+    el('option', { value: o.value, selected: o.value === shownValue, ...(o.disabled ? { disabled: true } : {}) }, o.label)))
   const statuses = [...new Set(dash.rows.map(statusOf))].sort()
   shell.status.replaceChildren(el('option', { value: '', selected: !dash.status }, 'All'), ...statuses.map((st) => el('option', { value: st, selected: st === dash.status }, st)))
 
@@ -1937,17 +1950,23 @@ function paintQueue() {
   if (dash.term.trim()) chips.push(['search', `Search: “${dash.term.trim()}”`, () => { dash.term = ''; const f = shell!.el.querySelector<HTMLInputElement>('[data-k="dash-search"]'); if (f) f.value = ''; void loadQueue() }])
   if (chips.length) kids.push(el('div', { class: 'd-chips', 'aria-label': 'Active filters' }, ...chips.map(([k, t, clear]) =>
     el('span', { class: 'd-chip' }, t, el('button', { type: 'button', 'aria-label': `Remove filter ${t}`, 'data-k': `chip-${k}`, onclick: () => { clear(); paintQueue(); say('Filter removed') } }, '✕')))))
-  const label = dash.scope === 'all' ? 'all workspaces' : 'this workspace'
+  const label = !scope ? 'no workspace' : scope.kind === 'all' ? 'all workspaces' : workspaceLabel(scope.workspace, dash.inv?.workspaces ?? [])
   kids.push(el('div', { class: 'd-meta-line' },
     el('span', { role: 'status' }, dash.loading === 'first' ? 'Loading decisions…' : `${rows.length}${more} ${dash.term.trim() ? 'matching ' : ''}decision${rows.length === 1 ? '' : 's'} · ${label}`)))
   const degraded = dash.sources.some((x) => x.state !== 'available')
-  if (dash.scope === 'workspace' && dash.focus === null) {
-    kids.push(el('div', { class: 'd-empty' }, el('b', {}, dash.focusFail ? `Could not identify this workspace. ${failureText(dash.focusFail)}` : 'No workspace is focused.'),
-      el('button', { type: 'button', class: 'd-btn', onclick: () => setScope('all') }, 'Show all workspaces')))
+  if (dash.invFail) kids.push(el('div', { class: 'callout warn' }, `Could not list your workspaces. ${failureText(dash.invFail)} The Workspace list shows only the current choice.`))
+  else if (dash.inv?.truncated) kids.push(el('div', { class: 'callout info' }, 'Some workspaces could not be listed. The Workspace list shows the ones Orca reported.'))
+  if (!scope && dash.focus !== undefined) {
+    // Ask; never widen to All workspaces by ourselves.
+    const lost = intended?.kind === 'workspace' && (dash.scopeLost || missing(intended.workspace, dash.inv))
+    kids.push(el('div', { class: 'd-empty', role: 'status' },
+      el('b', {}, lost ? `${workspaceLabel((intended as { workspace: Workspace }).workspace, dash.inv?.workspaces ?? [])} is no longer available.`
+        : dash.focusFail ? `Could not identify the focused workspace. ${failureText(dash.focusFail)}` : 'No workspace is focused.'),
+      'Choose a workspace or All workspaces in the Workspace list.',
+      el('button', { type: 'button', class: 'd-btn', 'data-k': 'choose-ws', onclick: () => shell?.wsSel.focus() }, 'Choose workspace')))
   } else if (dash.loaded && !rows.length && !dash.loading) {
     kids.push(el('div', { class: 'd-empty' }, el('b', {}, chips.length || dash.term.trim() ? 'No decisions match these filters.' : degraded ? `Nothing found in ${label} from the sources that could be read.` : dash.tab === 'pending' ? `Nothing needs you in ${label}.` : 'Nothing here yet.'),
-      chips.length ? 'Remove a filter chip or reset to see more.' : dash.scope === 'workspace' ? '' : 'New questions from agents appear here.',
-      ...(dash.scope === 'workspace' && !chips.length ? [el('button', { type: 'button', class: 'd-btn', onclick: () => setScope('all') }, 'Show all workspaces')] : [])))
+      chips.length ? 'Remove a filter chip or reset to see more.' : scope?.kind === 'workspace' ? 'Choose All workspaces in the Workspace list to see other workspaces. Bot Items without a workspace appear only there.' : 'New questions from agents appear here.'))
   } else if (rows.length) {
     kids.push(el('div', { class: 'd-table-wrap', id: 'panel', role: 'tabpanel', 'aria-labelledby': `tab-${dash.tab}`, 'data-k': 'table-wrap', tabindex: -1 },
       el('table', {}, el('caption', { class: 'sr' }, `Decisions, grouped by ${dash.group}`),
@@ -1961,9 +1980,13 @@ function paintQueue() {
   shell.list.replaceChildren(...kids)
   if (focusedKey) shell.list.querySelector<HTMLElement>(`[data-k="${CSS.escape(focusedKey)}"]`)?.focus({ preventScroll: true })
 }
-function setScope(scope: 'workspace' | 'all', wsFilter = '') {
-  dash.scope = scope; dash.wsFilter = wsFilter
+/** An explicit Workspace choice: fixed for this view; the queue starts a new first-page query. */
+function chooseWorkspace(v: string) {
+  const sc = scopeFromValue(v, dash.inv?.workspaces ?? [], [dash.chosen?.kind === 'workspace' ? dash.chosen.workspace : null, dash.focus ?? null].filter((w): w is Workspace => !!w))
+  if (!sc || (sameScope(sc, dashScope()) && !dash.scopeLost)) return
+  dash.chosen = sc; dash.scopeLost = null; dash.rows = []; dash.next = undefined; dash.fail = null; dash.loaded = false
   void loadQueue()
+  say(`Showing ${sc.kind === 'all' ? 'all workspaces' : workspaceLabel(sc.workspace, dash.inv?.workspaces ?? [])}`)
 }
 function buildShell() {
   const tabs = el('div', { class: 'd-tabs', role: 'tablist', 'aria-label': 'View' })
@@ -1973,7 +1996,7 @@ function buildShell() {
     dash.tab = ks[(i + (ev.key === 'ArrowRight' ? 1 : 2)) % 3]; paintQueue(); tabs.querySelector<HTMLElement>(`#tab-${dash.tab}`)?.focus()
   })
   const wsSel = el<HTMLSelectElement>('select', { 'aria-label': 'Workspace', 'data-k': 'ws-select', class: 'd-ws-select',
-    onchange: (ev: Event) => { const v = (ev.target as HTMLSelectElement).value; v === 'this' ? setScope('workspace') : v === 'all' ? setScope('all') : setScope('all', v) } })
+    onchange: (ev: Event) => chooseWorkspace((ev.target as HTMLSelectElement).value) })
   const sel = (label: string, k: string, opts: [string, string][], onchange: (v: string) => void) =>
     el('label', { class: 'd-field d-sel' }, el('span', {}, label), el('select', { 'data-k': k, onchange: (ev: Event) => onchange((ev.target as HTMLSelectElement).value) }, ...opts.map(([v, l]) => el('option', { value: v }, l))))
   const priority = sel('Priority', 'f-priority', [['', 'All'], ['P0', 'P0'], ['P1', 'P1'], ['P2', 'P2'], ['P3', 'P3']], (v) => { dash.priority = v; paintQueue() })
@@ -1990,7 +2013,7 @@ function buildShell() {
     priority, statusLabel, el('label', { class: 'd-field d-grow' }, el('span', {}, 'Search'), search),
     el('button', { type: 'button', class: 'd-btn d-ghost', 'data-k': 'reset', onclick: () => {
       dash.priority = ''; dash.status = ''; dash.term = ''; search.value = ''
-      toolbar.querySelectorAll('select').forEach((s) => { (s as HTMLSelectElement).value = '' }); void loadQueue(); say('Filters reset')
+      toolbar.querySelectorAll('select:not([data-k="group-by"])').forEach((s) => { (s as HTMLSelectElement).value = '' }); void loadQueue(); say('Filters reset')
     } }, 'Reset'), filtersBtn, groupBy)
   const list = el('div', { class: 'd-results' })
   const side = el('section', { class: 'd-list-side', 'aria-label': 'Decisions' },

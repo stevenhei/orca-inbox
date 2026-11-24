@@ -22,7 +22,7 @@ const LINKEDOM = '0.18.5'
 const TYPESCRIPT = '5.9.3'
 const here = path.dirname(fileURLToPath(import.meta.url))
 const root = path.join(here, '..')
-const SCENARIOS = ['review', 'quiet', 'ime', 'restart', 'ambiguous', 'inflight', 'durable', 'draftcas', 'winner', 'noreceipt', 'bind', 'followup', 'receipt', 'package', 'narrow', 'errors', 'offline', 'settings', 'settings2', 'native', 'mail', 'noactions', 'race', 'racebtn', 'localonly', 'reader', 'dashboard', 'dashnarrow', 'dashfocus', 'rich', 'sections']
+const SCENARIOS = ['review', 'quiet', 'ime', 'restart', 'ambiguous', 'inflight', 'durable', 'draftcas', 'winner', 'noreceipt', 'bind', 'followup', 'receipt', 'package', 'narrow', 'errors', 'offline', 'settings', 'settings2', 'native', 'mail', 'noactions', 'race', 'racebtn', 'localonly', 'reader', 'dashboard', 'dashnarrow', 'dashfocus', 'dashscope', 'rich', 'sections']
 const scenario = process.argv[2]
 
 if (!scenario) {
@@ -158,6 +158,12 @@ const base = {
   getSnapshot: () => okR({ mimeType: 'image/png', base64: PNG }),
   'review.open': () => okR(null),
   'workspace.resolve': ({ workspaceId }) => workspaceId === 'studio-local' ? okR({ hostId: 'local', workspaceId: 'studio' }) : errR('not-found', 'Unknown workspace.'),
+  // Authorized inventory: "studio" on two hosts (same name), "library", and an empty "archive".
+  'workspace.options': () => okR({ workspaces: [
+    { hostId: 'local', workspaceId: 'studio', name: 'studio', hostLabel: 'Local Orca' },
+    { hostId: 'local', workspaceId: 'library', name: 'library', hostLabel: 'Local Orca' },
+    { hostId: 'paired', workspaceId: 'studio', name: 'studio' },
+    { hostId: 'local', workspaceId: 'archive', name: 'archive', hostLabel: 'Local Orca' }] }),
   submitReply: (input) => {
     const d = db.get(input.questionId)
     const rec = { ...clone(input), acceptedAt: '2030-06-14T12:03:00Z', delivery: { state: 'submitted' } }
@@ -184,7 +190,7 @@ const files = {
   settings: '{"view":"settings"}', settings2: '{"view":"settings"}', quiet: '{"questionId":"image-review"}', ime: '{"questionId":"schedule"}',
   native: '{"questionId":"native-x"}', mail: '{"questionId":"layout"}', noactions: '{"questionId":"schedule"}',
   reader: '{"questionId":"pkg-a-1"}', dashboard: '{"view":"dashboard"}', dashnarrow: '{"view":"dashboard"}', dashfocus: '{"view":"dashboard"}', race: '{"questionId":"schedule"}', racebtn: '{"questionId":"schedule"}', localonly: '{"questionId":"schedule"}',
-  rich: '{"questionId":"rich-context-question"}', sections: '{"questionId":"sections"}', ambiguous: '{"questionId":"schedule"}', inflight: '{"questionId":"schedule"}', noreceipt: '{"questionId":"schedule"}', narrow: '{"questionId":"image-review"}'
+  dashscope: '{"view":"dashboard"}', rich: '{"questionId":"rich-context-question"}', sections: '{"questionId":"sections"}', ambiguous: '{"questionId":"schedule"}', inflight: '{"questionId":"schedule"}', noreceipt: '{"questionId":"schedule"}', narrow: '{"questionId":"image-review"}'
 }
 const opened = []
 globalThis.orca = {
@@ -211,6 +217,13 @@ const click = async (e, init = {}) => {
 /** Writes a note in the open note composer and adds it. */
 const draft0 = () => last('draft.save').draft.annotations
 const addNote = async (t) => { await setValue(byLabel('New note'), t, 'input'); await click(document.querySelector('[data-k="nc-add"]')); await sleep(30); await settle() }
+/** Chooses a Workspace in the dashboard's select (linkedom: by the selected attribute). */
+const chooseWs = async (value) => {
+  const sel = document.querySelector('[data-k="ws-select"]')
+  for (const o of sel.querySelectorAll('option')) o.toggleAttribute('selected', o.getAttribute('value') === value)
+  sel.dispatchEvent(new window.Event('change', { bubbles: true })); await settle()
+}
+const wsVal = (hostId, workspaceId) => `ws:${encodeURIComponent(hostId)}:${encodeURIComponent(workspaceId)}`
 const key = async (init) => { const ev = new window.Event('keydown', { bubbles: true }); Object.assign(ev, init); document.dispatchEvent(ev); await settle() }
 const byLabel = (l) => document.querySelector(`[aria-label="${l}"]`)
 const step = () => document.querySelector('.step[aria-current="step"]')?.textContent.trim()
@@ -727,9 +740,7 @@ if (scenario === 'review') {
   releaseOld(); await settle()
   assert.deepEqual(rows(), ['Compare seven paper model views', 'Pick a rehearsal slot']); ok('a stale search answer is dropped')
   delete handlers.listDecisionPage
-  const wsSel = document.querySelector('[data-k="ws-select"]')
-  for (const o of wsSel.querySelectorAll('option')) o.toggleAttribute('selected', o.getAttribute('value') === 'all')
-  wsSel.dispatchEvent(new window.Event('change', { bubbles: true })); await settle()
+  await chooseWs('all')
   assert.deepEqual(last('listDecisionPage').scope, { kind: 'all' }); assert.ok(rows().includes('Approve the first lantern trial')); ok('All workspaces scope')
   // Keyboard: arrow keys move between rows.
   const first = all('.qrow')[0]; first.focus()
@@ -761,9 +772,10 @@ if (scenario === 'review') {
   await click(find('.qrow .qt', 'Pick a rehearsal slot').parentElement)
   assert.equal(byLabel('Reply text').value, 'Thursday'); ok('draft still there when reopened')
 } else if (scenario === 'dashfocus') {
-  assert.match(text(), /Could not identify this workspace\. The Decision Inbox is unavailable\. Two workspaces on different hosts use this ID\./); ok('ambiguous focus is explained')
+  assert.match(text(), /Could not identify the focused workspace\. The Decision Inbox is unavailable\. Two workspaces on different hosts use this ID\./); ok('ambiguous focus is explained')
   assert.equal(callsOf('listDecisionPage').length, 0); assert.ok(!/Nothing needs you/.test(text())); ok('no list is read and no "nothing needs you" claim')
-  await click(find('button', 'Show all workspaces'))
+  assert.equal(document.querySelector('[data-k="ws-select"] option[selected]').getAttribute('value'), ''); assert.match(text(), /Choose a workspace or All workspaces/); ok('the Workspace list asks for a choice')
+  await chooseWs('all')
   assert.equal(callsOf('listDecisionPage').filter((c) => !c.query).every((c) => c.scope.kind === 'all'), true)
   assert.ok(callsOf('listDecisionPage').some((c) => !c.query && c.scope.kind === 'all')); ok('All workspaces only on the explicit action')
   await click(find('.qrow .qt', 'Approve the first lantern trial').parentElement)
@@ -772,6 +784,50 @@ if (scenario === 'review') {
   assert.match(document.querySelector('.d-sheet-slot').textContent, /You do not have access to decision "layout"/); ok('no access is distinct')
   await click(find('.qrow .qt', 'Pick a rehearsal slot').parentElement)
   assert.match(document.querySelector('.d-sheet-slot').textContent, /Decision "schedule" was not found/); ok('missing record is distinct')
+} else if (scenario === 'dashscope') {
+  const sel = () => document.querySelector('[data-k="ws-select"]')
+  const opts = () => [...sel().querySelectorAll('option')].filter((o) => !o.hasAttribute('disabled')).map((o) => o.textContent)
+  const chosen = () => sel().querySelector('option[selected]')?.getAttribute('value')
+  assert.ok(sel().closest('.d-tabs-row') && sel().closest('.d-tabs-row').querySelector('.d-tabs')); assert.equal(sel().getAttribute('aria-label'), 'Workspace'); ok('one labelled Workspace select in the tabs row')
+  assert.deepEqual(opts(), ['All workspaces', 'studio · Local Orca', 'library', 'studio · paired', 'archive']); ok('All workspaces plus every authorized workspace, empty ones included; equal names show the host')
+  assert.ok(!opts().some((t) => /This workspace/.test(t)) && !document.querySelector('[data-k="chip-workspace"]')); ok('no "This workspace" duplicate and no workspace chip')
+  assert.equal(chosen(), wsVal('local', 'studio')); assert.deepEqual(last('listDecisionPage').scope, { kind: 'workspace', workspace: { hostId: 'local', workspaceId: 'studio' } }); ok('starts on the focused workspace, named; request is host-qualified')
+  assert.ok(document.querySelector('[data-k="group-by"]').closest('.d-toolbar')); ok('Group by stays a separate control')
+  // Empty authorized workspace.
+  await chooseWs(wsVal('local', 'archive'))
+  assert.deepEqual(last('listDecisionPage').scope, { kind: 'workspace', workspace: { hostId: 'local', workspaceId: 'archive' } }); assert.match(text(), /Nothing needs you in archive\./); assert.equal(all('tr.d-row').length, 0); ok('an empty workspace is an ordinary empty state')
+  // Same name on another host.
+  await chooseWs(wsVal('paired', 'studio'))
+  assert.deepEqual(last('listDecisionPage').scope, { kind: 'workspace', workspace: { hostId: 'paired', workspaceId: 'studio' } })
+  assert.deepEqual(all('.qrow .qt').map((e) => e.textContent), ['Approve the first lantern trial']); ok('paired studio lists only its own rows, not local studio')
+  // A slow answer for the previous scope never lands; a new scope never reuses a cursor.
+  let release = () => {}
+  const paged = (i) => { const r = base.listDecisionPage(i); const start = i.cursor ? Number(i.cursor) : 0; const rows = r.value.rows.slice(start, start + 2); return okR({ rows, ...(start + 2 < r.value.rows.length ? { nextCursor: String(start + 2) } : {}) }) }
+  handlers.listDecisionPage = (i) => i.scope.kind === 'all' && !i.cursor ? new Promise((r) => { release = () => r(paged(i)) }) : paged(i)
+  const slow = chooseWs('all'); await settle()
+  await chooseWs(wsVal('local', 'studio'))
+  release(); await slow; await settle()
+  assert.equal(chosen(), wsVal('local', 'studio')); assert.deepEqual(all('.qrow .qt').map((e) => e.textContent).sort(), ['Compare seven paper model views', 'Pick a rehearsal slot']); ok('a late answer for the previous scope is dropped')
+  handlers.listDecisionPage = paged
+  await chooseWs('all')
+  assert.ok(find('button', 'Load more')); await click(find('button', 'Load more'))
+  assert.deepEqual(last('listDecisionPage'), { scope: { kind: 'all' }, includeHistory: true, timeZone: 'UTC', cursor: '2' }); ok('Load more keeps the scope and uses the page cursor')
+  await chooseWs(wsVal('local', 'library'))
+  assert.deepEqual(last('listDecisionPage'), { scope: { kind: 'workspace', workspace: { hostId: 'local', workspaceId: 'library' } }, includeHistory: true, timeZone: 'UTC' }); ok('changing the scope starts a first page (stale cursor cleared)')
+  delete handlers.listDecisionPage
+  // Drafts stay bound to their question across workspace changes.
+  await click(find('.qrow .qt', 'Approve the reading room route').parentElement)
+  await setValue(byLabel('Reply text'), 'East entrance', 'input')
+  await chooseWs(wsVal('local', 'studio'))
+  assert.equal(document.querySelector('.d-sheet h1').textContent, 'Approve the reading room route'); assert.equal(byLabel('Reply text').value, 'East entrance'); ok('the open decision and its draft survive a workspace change')
+  await sleep(450); assert.equal(drafts.get('room-route').draft.text, 'East entrance'); ok('the draft is saved under its own question')
+  // A chosen workspace the worker refuses: ask; never widen.
+  await chooseWs(wsVal('local', 'library'))
+  handlers.listDecisionPage = (i) => i.scope.kind === 'workspace' ? errR('forbidden', 'Not authorized for that workspace.') : base.listDecisionPage(i)
+  const before = callsOf('listDecisionPage').length
+  await setValue(byLabel('Search decisions'), 'room', 'input'); await sleep(300); await settle()
+  assert.match(text(), /library is no longer available\./); assert.equal(all('tr.d-row').length, 0)
+  assert.ok(callsOf('listDecisionPage').slice(before).every((c) => c.scope.kind === 'workspace')); ok('a refused workspace asks for a choice and is never widened')
 } else if (scenario === 'reader') {
   assert.equal(document.querySelector('h1').textContent, '第一題：是否發佈？'); ok('active question first')
   assert.equal(document.querySelector('.pager span').textContent, '1 / 2'); assert.equal(document.querySelector('.pager span').getAttribute('aria-label'), 'Question 1 of 2'); assert.ok(document.querySelector('.d-dock .pager')); ok('pager 1 / 2 in the reply card')
