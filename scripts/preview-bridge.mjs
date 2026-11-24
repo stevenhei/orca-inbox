@@ -23,7 +23,7 @@ const nativeBase = (i, title) => ({
   source: { kind: 'native-item', workspaceAttributed: false, botName: 'Release bot', itemLabel: '#2', itemStatus: 'needs-you', observedAt: '2030-06-14T11:30:00Z' }
 })
 const chatLong = { ...clone(decisions.find((d) => d.questionId === 'schedule')), questionId: 'preview-long', packageId: 'preview-pkg', title: '長篇中文問題：要在週二還是週四排練？',
-  background: longZh, recommendation: '**週二**，因為 [場地表](https://example.invalid/rooms) 顯示較少衝突。', createdAt: '2030-06-10T08:00:00Z' }
+  background: longZh, recommendation: '**週二**，因為 [場地表](https://example.invalid/rooms) 顯示較少衝突。\n\n參考 https://a.invalid/1、https://b.invalid/2 與 [C 文件](https://en.wikipedia.org/wiki/A_(b))，另見 https://example.invalid/run/42。下一句不是連結。', createdAt: '2030-06-10T08:00:00Z' }
 const chatLong2 = { ...clone(chatLong), questionId: 'preview-long-2', title: '第二題：排練需要多久？', background: '- 一小時\n- 兩小時', recommendation: '', createdAt: '2030-06-10T08:05:00Z',
   options: [{ optionId: 'one', label: '一小時' }, { optionId: 'two', label: '兩小時' }] }
 

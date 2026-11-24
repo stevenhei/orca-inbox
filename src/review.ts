@@ -1,5 +1,6 @@
 import type { Annotation, Answer, Decision, Delivery, Evidence, RecordedReply, SubmitReply, Workspace } from './contract.ts'
 import type { DecisionPage, EffectivePolicy, InboxSettings } from './backend-protocol.ts'
+import { tokenizeInline } from './markdown-inline.ts'
 import { STATE_LABEL, actionsOf, deadlineLabel, isActionable, nativeOf, nativeStatusLabel, order, replyState, shownState, type NativeSource, type ShownState } from './model.ts'
 import {
   call, clock, draftIsEmpty, emptyDraft, failureText, formatInstant, newReplyId, reconcile, replies,
@@ -151,26 +152,17 @@ const rawOffset = new WeakMap<Node, number>()
 const textAt = (s: string, at: number) => { const n = document.createTextNode(s); rawOffset.set(n, at); return n }
 const LIST = /^(\s*)([-*+]|\d+[.)])\s+/
 function inline(parent: HTMLElement, raw: string, start: number, end: number) {
-  const re = /\*\*([^*]+?)\*\*|\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)|`([^`\n]+)`|(https?:\/\/[^\s<>()\[\]「」（）]+)/g
-  const part = raw.slice(start, end)
-  let last = 0; let m: RegExpExecArray | null
-  while ((m = re.exec(part))) {
-    if (m.index > last) parent.append(textAt(part.slice(last, m.index), start + last))
-    const at = start + m.index
-    if (m[1] !== undefined) parent.append(el('strong', {}, textAt(m[1], at + 2)))
-    else if (m[2] !== undefined) {
-      const url = m[3]
-      parent.append(el('a', { href: url, onclick: (ev: Event) => { ev.preventDefault(); void openLink(url) } }, textAt(m[2], at + 1)))
-    } else if (m[4] !== undefined) parent.append(el('code', {}, textAt(m[4], at + 1)))
+  // Boundaries (bare URLs, CJK punctuation, balanced parentheses, http(s) only) come from the shared
+  // tokenizer; every node keeps its offset in the raw string.
+  for (const t of tokenizeInline(raw, start, end)) {
+    if (t.kind === 'text') parent.append(textAt(t.text, t.at))
+    else if (t.kind === 'strong') parent.append(el('strong', {}, textAt(t.text, t.at)))
+    else if (t.kind === 'code') parent.append(el('code', {}, textAt(t.text, t.at)))
     else {
-      // A bare URL: trailing punctuation (. , ; : ! ? 。 ， 、) stays text, not part of the link.
-      const url = m[5].replace(/[.,;:!?。，、；：！？]+$/u, '')
-      parent.append(el('a', { href: url, onclick: (ev: Event) => { ev.preventDefault(); void openLink(url) } }, textAt(url, at)))
-      last = m.index + url.length; re.lastIndex = last; continue
+      const href = t.href
+      parent.append(el('a', { href, onclick: (ev: Event) => { ev.preventDefault(); void openLink(href) } }, textAt(t.text, t.at)))
     }
-    last = m.index + m[0].length
   }
-  if (last < part.length) parent.append(textAt(part.slice(last), start + last))
 }
 function rich(raw: string, attrs: K = {}): HTMLElement {
   const box = el('div', { class: 'rich', ...attrs })

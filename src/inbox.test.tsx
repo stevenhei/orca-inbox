@@ -789,6 +789,16 @@ test('reader: a native Item reads as question, Markdown sections and one set of 
   })
 })
 
+test('reader: bare URLs reach Orca\'s Markdown as <url> autolinks with CJK-safe boundaries', async () => {
+  const item = nativeQ(0, 1, { background: '見 https://example.invalid/run/42。下一句，與 [維基](https://en.wikipedia.org/wiki/A_(b))。' })
+  await withPanel(worker([item], {}, 50, allAvailable), async (view) => {
+    await view.select({ label: 'Scope' }, 'all')
+    await view.press({ label: '第 1 題：是否發佈？' })
+    const contents = view.findAll({ type: 'Markdown' }).map((m) => String(m.props.content))
+    assert.ok(contents.includes('見 <https://example.invalid/run/42>。下一句，與 [維基](https://en.wikipedia.org/wiki/A_(b))。'), contents.join(' | '))
+  })
+})
+
 test('reader: the reply area is the last, non-scrolling block; the question scrolls above it', async () => {
   const long = Array.from({ length: 40 }, (_, i) => `第 ${i + 1} 段：這是一段很長的中文背景說明，用來確認回覆區不會被推到看不見的位置。`).join('\n\n')
   const d = { ...decisions.find((x) => x.questionId === 'schedule')!, background: long }

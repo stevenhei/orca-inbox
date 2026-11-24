@@ -6,6 +6,7 @@ import {
 import type { PanelContext } from 'orca'
 import type { Answer, Decision, Delivery, RecordedReply, SubmitReply, Workspace } from './contract.ts'
 import type { InboxSettings } from './backend-protocol.ts'
+import { autolinkForMarkdown } from './markdown-inline.ts'
 import { STATE_LABEL, actionsOf, deadlineLabel, replyState, isActionable, nativeNeedsYou, nativeOf, nativeStatusLabel, order, sameWorkspace, shownState, siblings, undeliveredReplies } from './model.ts'
 import { call, clock, draftIsEmpty, emptyDraft, failureText, formatInstant, newReplyId, reconcile, replies, sourcesOf, transportOf, type Draft, type Failure, type Requester, type SourceStatus } from './client.ts'
 import type { DecisionPage } from './backend-protocol.ts'
@@ -610,7 +611,9 @@ const NOTICE_TITLE: Record<Notice['tone'], string> = { neutral: 'Recorded', warn
 
 /** Sanitized GitHub-flavoured Markdown (Orca's own renderer): paragraphs, bold, links and lists. */
 function Rich(props: { text: string }) {
-  return <Markdown content={props.text} />
+  // Bare URLs are wrapped as <url> with the shared boundaries, so Orca's own autolinking cannot
+  // run into the following text (for example a Chinese sentence after 。).
+  return <Markdown content={autolinkForMarkdown(props.text)} />
 }
 function Section(props: { title: string; text?: string }) {
   if (!props.text?.trim()) return null

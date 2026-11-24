@@ -190,6 +190,14 @@ async function runShots(dir, wsUrl) {
     const ge = await geometry(); geometryLog[`chat-long-${label}-expanded`] = ge
     check(`Expand reply (${label}) by keyboard opens the full composer`, open1.open && open1.expanded === 'true' && open1.focus === 'reply' && open1.rows === 6, { ...open1, dockShare: ge.dockShare })
   }
+  // Real Chrome anchors for the multi-link CJK sentence (in the long decision's recommendation).
+  await open('?ref=preview-long', 820, 900)
+  const anchors = await evalJs(`(() => { const p = [...document.querySelectorAll('[data-field="recommendation"] p')].at(-1); return { links: [...p.querySelectorAll('a')].map((a) => [a.href, a.textContent]), texts: [...p.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent) } })()`)
+  check('link boundaries in Chrome: hrefs, link text and following CJK text', JSON.stringify(anchors) === JSON.stringify({
+    links: [['https://a.invalid/1', 'https://a.invalid/1'], ['https://b.invalid/2', 'https://b.invalid/2'], ['https://en.wikipedia.org/wiki/A_(b)', 'C 文件'], ['https://example.invalid/run/42', 'https://example.invalid/run/42']],
+    texts: ['參考 ', '、', ' 與 ', '，另見 ', '。下一句不是連結。'] }), anchors)
+  await evalJs(`[...document.querySelectorAll('[data-field="recommendation"] p')].at(-1).scrollIntoView({ block: 'center' })`); await wait(200)
+  files.push(await shot('links-820'))
   // Draft survives an editor source change (reload).
   await open('?ref=preview-long', 820, 900)
   await evalJs(`(() => { const t = document.querySelector('[aria-label="Reply text"]'); t.value = 'Tuesday after 3pm'; t.dispatchEvent(new Event('input', { bubbles: true })); window.__beforeReload = true })()`)
