@@ -1,0 +1,47 @@
+{
+  "catalogVersion": 2,
+  "name": "Decision Inbox development releases",
+  "owner": "stevenhei",
+  "plugins": [
+    {
+      "id": "stevenhei.decision-inbox",
+      "source": {
+        "kind": "git",
+        "url": "https://github.com/stevenhei/orca-inbox.git",
+        "ref": "main"
+      },
+      "description": "Private development builds of Decision Inbox",
+      "releases": [
+        {
+          "version": "0.1.0",
+          "commit": "5a3b541eb165f72e14abc2dad1b8cbcb89e1f2b5",
+          "contentHash": "c260b78875435540761f1d70dafdd6a49b2964e831b51f2aee4bd05ad80dd543",
+          "execution": "trusted-worker",
+          "minimumOrca": "1.4.248",
+          "name": "Decision Inbox",
+          "contributes": [
+            {
+              "kind": "panels",
+              "name": "Decision Inbox"
+            },
+            {
+              "kind": "customEditors",
+              "name": "Decision Review",
+              "detail": ".orca-decision"
+            }
+          ],
+          "capabilities": [
+            "storage:own",
+            "workspace:read"
+          ],
+          "fileTypes": [
+            "orca-decision"
+          ],
+          "editorFileTypes": [
+            "orca-decision"
+          ]
+        }
+      ]
+    }
+  ]
+}
